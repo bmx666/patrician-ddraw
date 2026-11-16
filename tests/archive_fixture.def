@@ -1,0 +1,7 @@
+EXPORTS
+    arc_CreateMemMapped
+    arc_ReleaseMemMapped
+    arc_CreateFile
+    arc_FileLength
+    arc_Read
+    arc_ReleaseFile

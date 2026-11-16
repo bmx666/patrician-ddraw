@@ -1,0 +1,916 @@
+{
+  "executable_sha256": "fe436dc5f8addc4d3aa437eb48a8bc6415d9ba5577c1027d06db9bb915eddece",
+  "sgl_sha256": "694497deddb53faa915007cf088ad1cd119dcf45068f04498cfe1b1d4292901c",
+  "capture": "original SGL call capture",
+  "exports": [
+    {
+      "name": "sgl_2dPoly",
+      "rva": 63888,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_2dPoly_COL",
+      "rva": 63952,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_2dPoly_COLUV",
+      "rva": 63984,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_2dPoly_COLUV_indexed_dw",
+      "rva": 64112,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_2dPoly_COL_indexed_dw",
+      "rva": 64080,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_2dPoly_UV",
+      "rva": 63920,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_2dPoly_UV_indexed_dw",
+      "rva": 64048,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_2dPoly_indexed_dw",
+      "rva": 64016,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_3dLine",
+      "rva": 63536,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_3dLine_COL",
+      "rva": 63568,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_3dPoly",
+      "rva": 63632,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_3dPoly_COL",
+      "rva": 63696,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_3dPoly_COLUV",
+      "rva": 63728,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_3dPoly_COLUV_indexed_dw",
+      "rva": 63856,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_3dPoly_COL_indexed_dw",
+      "rva": 63824,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_3dPoly_UV",
+      "rva": 63664,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_3dPoly_UV_indexed_dw",
+      "rva": 63792,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_3dPoly_indexed_dw",
+      "rva": 63760,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_3dTrans_FromObject",
+      "rva": 127920,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_3dTrans_LoadIdentityMatrix",
+      "rva": 123728,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_3dTrans_LoadMatrix",
+      "rva": 126752,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_3dTrans_SetLightMatrix",
+      "rva": 127824,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_3dTrans_SetPivotPoint",
+      "rva": 125760,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_3dTrans_SetTranslation",
+      "rva": 124752,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_AddChildObject",
+      "rva": 95696,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_AddClipRect_4i",
+      "rva": 5856,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_AddClipRect_r",
+      "rva": 5920,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_AddDirectionalLight",
+      "rva": 96176,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_AddNullObject",
+      "rva": 95520,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_AddPointLight",
+      "rva": 96432,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_AddZObjectToObject",
+      "rva": 94736,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_Begin3D",
+      "rva": 63504,
+      "classification": "no_op",
+      "instructions": "ret"
+    },
+    {
+      "name": "sgl_Blt",
+      "rva": 62272,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_Blt_RC",
+      "rva": 62336,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_ChangePalette",
+      "rva": 120336,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_ChangeTextureFlags",
+      "rva": 120320,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_CheckWindowSize",
+      "rva": 106528,
+      "classification": "no_op",
+      "instructions": "ret"
+    },
+    {
+      "name": "sgl_CleanUp",
+      "rva": 11568,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_CleanupSorttable",
+      "rva": 105168,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_ClearBuffer",
+      "rva": 63472,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_CloneObject",
+      "rva": 94912,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_CopyClipper",
+      "rva": 6048,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_CreateClipper",
+      "rva": 5712,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_CreateHardwareTexture",
+      "rva": 119312,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_CreateMemoryTexture",
+      "rva": 119328,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_CreateTexture",
+      "rva": 119632,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_CreateTextureFinish",
+      "rva": 116336,
+      "classification": "no_op",
+      "instructions": "ret"
+    },
+    {
+      "name": "sgl_CreateTextureStart",
+      "rva": 116320,
+      "classification": "no_op",
+      "instructions": "ret"
+    },
+    {
+      "name": "sgl_CreateWorld",
+      "rva": 93552,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_DestroyActiveScreen",
+      "rva": 106288,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_DisableSortFlags",
+      "rva": 105248,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_DrawBackdrop",
+      "rva": 62368,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_DrawBitmapRect",
+      "rva": 62112,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_DrawBitmapRectWithAlphaMask",
+      "rva": 62208,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_DrawHardwareText",
+      "rva": 61904,
+      "classification": "no_op",
+      "instructions": "ret"
+    },
+    {
+      "name": "sgl_DrawIndexedTriangleListVB",
+      "rva": 25136,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_DrawLine",
+      "rva": 62464,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_DrawMesh",
+      "rva": 30160,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_DrawOdinMesh",
+      "rva": 27136,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_DrawScene",
+      "rva": 104816,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_DrawSingleObject",
+      "rva": 64336,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_DrawText",
+      "rva": 61760,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_DrawText_Rect",
+      "rva": 61696,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_DrawTriangleListVB",
+      "rva": 26032,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_EnableBackfaceCulling",
+      "rva": 63152,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_EnableFog",
+      "rva": 56800,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_EnableSortFlags",
+      "rva": 105216,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_FillSolidRect",
+      "rva": 62496,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_Finish3D",
+      "rva": 63520,
+      "classification": "no_op",
+      "instructions": "ret"
+    },
+    {
+      "name": "sgl_Flip",
+      "rva": 106784,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_FreeAllObjects",
+      "rva": 94400,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_FreeAllTextures",
+      "rva": 118944,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_FreeClipper",
+      "rva": 5760,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_FreeFont",
+      "rva": 62816,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_FreeHardwareTexture",
+      "rva": 118784,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_FreeMemoryTexture",
+      "rva": 118896,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_FreeObject",
+      "rva": 94288,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_FreeOdinMesh",
+      "rva": 26800,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_FreeRectClipper",
+      "rva": 5808,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_FreeTexture",
+      "rva": 118848,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_FreeTextureImage",
+      "rva": 117184,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_FreeWorld",
+      "rva": 93680,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_FreeZObject",
+      "rva": 94688,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_Get2dClippingMode",
+      "rva": 5088,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_GetActiveClipperInfo",
+      "rva": 5200,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_GetAdapterInfos",
+      "rva": 106544,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_GetCharInfo",
+      "rva": 62944,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_GetClipRect_4i",
+      "rva": 5152,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_GetClipRect_r",
+      "rva": 5104,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_GetColorKey",
+      "rva": 118240,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_GetConstantColor",
+      "rva": 63440,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_GetCursorData",
+      "rva": 107312,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_GetDllInfo",
+      "rva": 11664,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_GetLocalTextureList",
+      "rva": 26976,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_GetProjectionData",
+      "rva": 104288,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_GetRectClipper",
+      "rva": 5744,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_GetState",
+      "rva": 114048,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_GetTexture",
+      "rva": 116352,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_GetTextureInfo",
+      "rva": 116464,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_GrabScreen",
+      "rva": 107408,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_InitHardware",
+      "rva": 105808,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_InitHardware_vid",
+      "rva": 105632,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_InitScreen",
+      "rva": 105968,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_InitSorttable",
+      "rva": 105120,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_IsBBoxVisible",
+      "rva": 24176,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_IsRectInClippingRegion",
+      "rva": 5568,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_IsRectInClippingRegion_4i",
+      "rva": 5424,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_IsRectInClippingRegion_r",
+      "rva": 5312,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_LoadMemoryTexture",
+      "rva": 118272,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_LoadObject",
+      "rva": 93888,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_LoadOdinMesh",
+      "rva": 26672,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_LoadTexture",
+      "rva": 117712,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_LoadTextureFromMem",
+      "rva": 117392,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_LoadTextureImage",
+      "rva": 116512,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_LoadZObject",
+      "rva": 94416,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_LockTexture",
+      "rva": 120368,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_MemoryFont_CreateFixed",
+      "rva": 62528,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_MemoryFont_CreateKerning",
+      "rva": 62720,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_MemoryFont_CreateProportional",
+      "rva": 62624,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_MessageBox",
+      "rva": 89392,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_OffscreenToFront",
+      "rva": 106592,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_OffscreenToFront_RC",
+      "rva": 106704,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_PrefetchTexture",
+      "rva": 120304,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_ReLoadMemoryTexture",
+      "rva": 118544,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_ReLoadTexture",
+      "rva": 118144,
+      "classification": "no_op",
+      "instructions": "xor eax,eax; ret"
+    },
+    {
+      "name": "sgl_RecalcHirarchy",
+      "rva": 105088,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_RemoveChildObject",
+      "rva": 95824,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_RemoveLight",
+      "rva": 96640,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_RemoveZObject",
+      "rva": 94848,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_ReportUnfreedTextures",
+      "rva": 120096,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_ResetClipper",
+      "rva": 6080,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_RotatePointBuffer",
+      "rva": 105104,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SaveTexture",
+      "rva": 120432,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_Set2dClippingMode",
+      "rva": 5056,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_Set3DOrigin",
+      "rva": 104256,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetActiveClipper",
+      "rva": 5680,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetActiveWorld",
+      "rva": 93664,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetArchive",
+      "rva": 11648,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetBlendMode",
+      "rva": 64272,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetCharInfo",
+      "rva": 62976,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetClipRect",
+      "rva": 5008,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetClipRect_4i",
+      "rva": 4960,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetClipRect_r",
+      "rva": 4912,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetColorKey",
+      "rva": 118208,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetConstantColor",
+      "rva": 63376,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetConstantZVal",
+      "rva": 64224,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetFogColor",
+      "rva": 56848,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetFogExp",
+      "rva": 56928,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetFogExp2",
+      "rva": 56960,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetFogLinear",
+      "rva": 56880,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetFont",
+      "rva": 60816,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetHardwareTextScale",
+      "rva": 61888,
+      "classification": "no_op",
+      "instructions": "ret"
+    },
+    {
+      "name": "sgl_SetIndexedVertexBuffer",
+      "rva": 24544,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetLightColor",
+      "rva": 95952,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetLightColorAmbient",
+      "rva": 95936,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetLightDirection",
+      "rva": 96032,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetLightPosition",
+      "rva": 96128,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetMaxMipMapCount",
+      "rva": 116384,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetPolygonDrawMode",
+      "rva": 64160,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetRenderDest",
+      "rva": 120032,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetRenderSource",
+      "rva": 119968,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetScreenDimensions",
+      "rva": 104176,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetSortScaleValue",
+      "rva": 105200,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetTextMode",
+      "rva": 60832,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetTextureDetail",
+      "rva": 116448,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetVertexBuffer_COLUV",
+      "rva": 24208,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetYAxis",
+      "rva": 104080,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetZBufferMode",
+      "rva": 63088,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetZWrite",
+      "rva": 63040,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SetZoomFactor",
+      "rva": 104128,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_ShotDown",
+      "rva": 11584,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_StrLen",
+      "rva": 61920,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_StretchBitmapRect",
+      "rva": 62400,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SubClipRect_4i",
+      "rva": 5952,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SubClipRect_r",
+      "rva": 6016,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SwapBuffer",
+      "rva": 106928,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SwitchActiveScreen",
+      "rva": 106336,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_SwitchScreenMode",
+      "rva": 106384,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_UnlockTexture",
+      "rva": 120400,
+      "classification": "hooked"
+    },
+    {
+      "name": "sgl_Wait",
+      "rva": 107296,
+      "classification": "no_op",
+      "instructions": "ret"
+    }
+  ]
+}

@@ -1,0 +1,2143 @@
+#include "archive_reader.hpp"
+#include "archive_state.hpp"
+#include "color_key.hpp"
+#include "image_decoder.hpp"
+#include "game_resolution.hpp"
+#include "unimplemented.hpp"
+#include "mouse_input_transform.hpp"
+#include "screen_transform.hpp"
+#include "surface_renderer.hpp"
+
+#include <array>
+#include <algorithm>
+#include <climits>
+#include <cctype>
+#include <cmath>
+#include <cstddef>
+#include <cstring>
+#include <cstdio>
+#include <fstream>
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+namespace {
+struct Texture {
+    std::array<std::uint8_t, 0x48> header{};
+    sgl::DecodedImage image;
+    std::string name;
+    std::vector<std::uint8_t> encoded;
+    std::vector<std::uint8_t> locked_palette;
+    unsigned locks = 0;
+    unsigned external_locks = 0;
+    bool external_write_pending = false;
+    bool pending_write = false;
+    bool initial_color_key_pending = false;
+    bool externally_modified = false;
+    std::uint32_t key = 0;
+    bool keyed = false;
+};
+struct LockOutput {
+    void* pixels;
+    void* palette;
+    std::uint32_t width, height, pitch;
+};
+enum class LockIntent { CpuPixels, GpuResource };
+std::mutex textures_mutex;
+std::unordered_map<void*, std::unique_ptr<Texture>> textures;
+void* render_source = nullptr;
+void* render_destination = nullptr;
+std::array<std::int32_t, 4> clip_rectangle{};
+std::int32_t clipping_mode = 0;
+
+void report_screen_init_failure(const char* stage, const char* detail) noexcept {
+    OutputDebugStringA("Patrician III D3D11: ");
+    OutputDebugStringA(stage);
+    OutputDebugStringA(": ");
+    OutputDebugStringA(detail);
+    OutputDebugStringA("\n");
+}
+
+struct Clipper {
+    std::vector<RECT> rectangles;
+};
+std::unordered_map<void*, std::unique_ptr<Clipper>> clippers;
+std::unique_ptr<Clipper> default_clipper;
+Clipper* active_clipper = nullptr;
+Clipper* get_active_clipper() {
+    if (!default_clipper) {
+        try { default_clipper = std::make_unique<Clipper>(); }
+        catch (const std::bad_alloc&) { sgl::unimplemented("clipper allocation"); }
+    }
+    if (!active_clipper) active_clipper = default_clipper.get();
+    return active_clipper;
+}
+
+bool nonempty(const RECT& rectangle) {
+    return rectangle.left < rectangle.right && rectangle.top < rectangle.bottom;
+}
+
+bool intersects(const RECT& first, const RECT& second) {
+    return nonempty(first) && nonempty(second) && first.left < second.right &&
+        first.right > second.left && first.top < second.bottom && first.bottom > second.top;
+}
+
+void append_rectangle(std::vector<RECT>& rectangles, const RECT& rectangle) {
+    if (nonempty(rectangle)) rectangles.push_back(rectangle);
+}
+
+void subtract_rectangle(const RECT& source, const RECT& cut, std::vector<RECT>& output) {
+    if (!intersects(source, cut)) {
+        append_rectangle(output, source);
+        return;
+    }
+
+    const LONG left = std::max(source.left, cut.left);
+    const LONG top = std::max(source.top, cut.top);
+    const LONG right = std::min(source.right, cut.right);
+    const LONG bottom = std::min(source.bottom, cut.bottom);
+    append_rectangle(output, {source.left, source.top, source.right, top});
+    append_rectangle(output, {source.left, bottom, source.right, source.bottom});
+    append_rectangle(output, {source.left, top, left, bottom});
+    append_rectangle(output, {right, top, source.right, bottom});
+}
+
+std::vector<RECT> combine_clip_rectangles(const std::vector<RECT>& current,
+    const RECT& rectangle, int operation) {
+    std::vector<RECT> result;
+    if (operation == RGN_OR) {
+        result = current;
+        std::vector<RECT> additions{rectangle};
+        for (const auto& existing : current) {
+            std::vector<RECT> remaining;
+            for (const auto& addition : additions) subtract_rectangle(addition, existing, remaining);
+            additions.swap(remaining);
+            if (additions.empty()) break;
+        }
+        result.insert(result.end(), additions.begin(), additions.end());
+        return result;
+    }
+    if (operation == RGN_DIFF) {
+        for (const auto& existing : current) subtract_rectangle(existing, rectangle, result);
+        return result;
+    }
+    sgl::unimplemented("clip rectangle operation");
+}
+
+std::uint32_t constant_color = 0;
+std::uint8_t active_blend_mode = 1;
+const std::uint8_t* active_font = nullptr;
+int text_mode = 0;
+struct Font {
+    std::array<std::uint8_t, 0x128> header{};
+    std::vector<std::uint8_t> widths;
+    std::vector<std::uint8_t> kerning;
+};
+std::unordered_map<void*, std::unique_ptr<Font>> fonts;
+sgl::SurfaceRenderer surface_renderer;
+struct Screen {
+    void* offscreen = nullptr;
+    void* display = nullptr;
+};
+std::unique_ptr<Screen> screen;
+std::filesystem::path display_config_path;
+std::unique_ptr<Texture> wide_menu_background;
+std::string wide_menu_background_name;
+std::unordered_set<std::string> unavailable_wide_menu_backgrounds;
+struct ViewState {
+    int logical_width = 640;
+    int logical_height = 480;
+    float near_plane = 0.1f;
+    float far_plane = 100.0f;
+    int zoom_x = 256;
+    int zoom_y = 256;
+    float constant_z = 0.0f;
+};
+ViewState view_state;
+bool fast_forward_overlay = false;
+HMODULE aim_library = nullptr;
+HMODULE archive_library = nullptr;
+bool hardware_initialized = false;
+
+std::pair<unsigned, unsigned> screen_logical_size() noexcept {
+    return {static_cast<unsigned>(view_state.logical_width), static_cast<unsigned>(view_state.logical_height)};
+}
+
+template<typename T> void set_field(Texture& texture, std::size_t offset, T value) {
+    std::memcpy(texture.header.data() + offset, &value, sizeof(value));
+}
+
+constexpr std::uint32_t texture_flag_toggle_mask = 0x07018197u;
+
+void apply_color_key(sgl::DecodedImage& image, std::uint32_t key, bool keyed) {
+    if (!keyed || image.format != sgl::ImageFormat::Bgra32) return;
+    for (std::uint32_t y = 0; y < image.height; ++y) {
+        auto* row = image.pixels.data() + static_cast<std::size_t>(y) * image.pitch;
+        for (std::uint32_t x = 0; x < image.width; ++x) {
+            std::uint32_t pixel;
+            std::memcpy(&pixel, row + x * 4, sizeof(pixel));
+            pixel &= 0x00ffffff;
+            if (pixel != key) pixel |= 0xff000000;
+            std::memcpy(row + x * 4, &pixel, sizeof(pixel));
+        }
+    }
+}
+
+void apply_palette_color_key(void* palette, std::size_t size, std::uint32_t key, bool keyed) {
+    if (!keyed || !palette || size < 1024) return;
+    auto* bytes = static_cast<std::uint8_t*>(palette);
+    for (std::size_t offset = 0; offset < 1024; offset += 4) {
+        std::uint32_t color;
+        std::memcpy(&color, bytes + offset, sizeof(color));
+        if ((color & 0x00ffffff) == key) {
+            color &= 0x00ffffff;
+            std::memcpy(bytes + offset, &color, sizeof(color));
+        }
+    }
+}
+
+HRESULT normalize_loaded_image(sgl::DecodedImage& image) noexcept {
+    if (image.format == sgl::ImageFormat::Indexed8) {
+        if (!image.width || !image.height || image.width > UINT_MAX - 3u || image.pitch < image.width ||
+            (!image.pixels.empty() && static_cast<std::uint64_t>(image.pitch) * image.height > image.pixels.size())) {
+            return E_INVALIDARG;
+        }
+        const auto pitch = (image.width + 3u) & ~3u;
+        const auto size = static_cast<std::uint64_t>(pitch) * image.height;
+        if (size > SIZE_MAX) return E_OUTOFMEMORY;
+        if (!image.pixels.empty() && image.pitch != pitch) {
+            std::vector<std::uint8_t> aligned;
+            try {
+                aligned.resize(static_cast<std::size_t>(size));
+            } catch (const std::bad_alloc&) {
+                return E_OUTOFMEMORY;
+            } catch (const std::length_error&) {
+                return E_OUTOFMEMORY;
+            }
+            for (std::uint32_t y = 0; y < image.height; ++y) {
+                const auto* source = image.pixels.data() + static_cast<std::size_t>(y) * image.pitch;
+                auto* target = aligned.data() + static_cast<std::size_t>(y) * pitch;
+                std::memcpy(target, source, image.width);
+            }
+            image.pixels = std::move(aligned);
+        }
+        image.pitch = pitch;
+        return S_OK;
+    }
+    if (image.format != sgl::ImageFormat::Bgr24) return S_OK;
+    if (image.width > UINT_MAX / 4 ||
+        image.pitch < static_cast<std::uint64_t>(image.width) * 3 ||
+        (!image.pixels.empty() && static_cast<std::uint64_t>(image.pitch) * image.height > image.pixels.size())) {
+        return E_INVALIDARG;
+    }
+    const auto pitch = image.width * 4;
+    const auto size = static_cast<std::uint64_t>(pitch) * image.height;
+    if (size > SIZE_MAX) return E_OUTOFMEMORY;
+    if (!image.pixels.empty()) {
+        std::vector<std::uint8_t> converted;
+        try {
+            converted.resize(static_cast<std::size_t>(size));
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        } catch (const std::length_error&) {
+            return E_OUTOFMEMORY;
+        }
+        for (std::uint32_t y = 0; y < image.height; ++y) {
+            const auto* source_row = image.pixels.data() + static_cast<std::size_t>(y) * image.pitch;
+            auto* target_row = converted.data() + static_cast<std::size_t>(y) * pitch;
+            for (std::uint32_t x = 0; x < image.width; ++x) {
+                const auto* source_pixel = source_row + static_cast<std::size_t>(x) * 3;
+                auto* target_pixel = target_row + static_cast<std::size_t>(x) * 4;
+                std::memcpy(target_pixel, source_pixel, 3);
+                target_pixel[3] = 0xff;
+            }
+        }
+        image.pixels = std::move(converted);
+    }
+    image.pitch = pitch;
+    image.format = sgl::ImageFormat::Bgra32;
+    return S_OK;
+}
+
+std::filesystem::path game_directory();
+
+constexpr std::string_view fast_forward_map_name = "images/Vollansichtskarte1280.bmp";
+
+bool is_fast_forward_map(const char* name) noexcept {
+    return name && _stricmp(name, fast_forward_map_name.data()) == 0;
+}
+
+bool decode_wide_fast_forward_map(const char* name, sgl::ImageDecoder& decoder,
+    sgl::DisplaySize size, bool pixels, sgl::DecodedImage& image) noexcept {
+    if (!is_fast_forward_map(name) || size.width <= 1280) return false;
+    try {
+        const auto directory = game_directory();
+        if (directory.empty()) return false;
+        const bool wqhd = size.width == 2560;
+        const auto asset_path = directory / L"renderer-assets" / L"fast-forward-map" /
+            (wqhd ? L"Vollansichtskarte2560.bmp" :
+                size.width == 1600 ? L"Vollansichtskarte1600.bmp" : L"Vollansichtskarte1920.bmp");
+        std::error_code error;
+        const auto asset_size = std::filesystem::file_size(asset_path, error);
+        constexpr std::uintmax_t maximum_asset_size = 32u * 1024u * 1024u;
+        if (error || asset_size == 0 || asset_size > maximum_asset_size || asset_size > LONG_MAX) return false;
+
+        std::vector<std::uint8_t> encoded(static_cast<std::size_t>(asset_size));
+        std::ifstream input(asset_path, std::ios::binary);
+        if (!input || !input.read(reinterpret_cast<char*>(encoded.data()), static_cast<std::streamsize>(encoded.size())) ||
+            static_cast<std::size_t>(input.gcount()) != encoded.size()) return false;
+
+        const auto result = pixels ? decoder.decode(name, encoded, image) : decoder.inspect(name, encoded, image);
+        const auto expected_format = wqhd ? (pixels ? sgl::ImageFormat::Bgr24 : sgl::ImageFormat::Bgra32) : sgl::ImageFormat::Indexed8;
+        const auto source_width = size.width;
+        const auto source_height = size.height;
+        if (FAILED(result) || image.width != source_width || image.height != source_height ||
+            image.format != expected_format ||
+            (!image.palette.empty() && image.palette.size() != 1024)) return false;
+
+        const auto pixel_size = sgl::bytes_per_pixel(image.format);
+        if (pixels && (image.pitch < static_cast<std::uint64_t>(source_width) * pixel_size ||
+            static_cast<std::uint64_t>(image.pitch) * source_height > image.pixels.size())) return false;
+        if (!pixels) {
+            image.pitch = (size.width * pixel_size + 3u) & ~3u;
+        }
+        image.width = size.width;
+        image.height = size.height;
+        return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::filesystem::filesystem_error&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
+}
+
+void reserve_fast_forward_map_capacity(sgl::DecodedImage& image) {
+    if (image.pixels.empty()) return;
+    image.pixels.reserve(2560u * 1440u * sgl::bytes_per_pixel(sgl::ImageFormat::Bgra32));
+}
+
+void* register_texture(std::unique_ptr<Texture> texture) {
+    void* handle = texture->header.data();
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    textures.emplace(handle, std::move(texture));
+    return handle;
+}
+
+std::filesystem::path game_directory() {
+    const HMODULE archiver = GetModuleHandleW(L"archiver.dll");
+    if (!archiver) return {};
+    std::array<wchar_t, 32768> path{};
+    const DWORD length = GetModuleFileNameW(archiver, path.data(), static_cast<DWORD>(path.size()));
+    if (!length || length == path.size()) return {};
+    return std::filesystem::path(path.data()).parent_path();
+}
+
+std::string wide_menu_background_filename(const std::string& resource_name) {
+    constexpr std::string_view resource_prefix = "images/background/";
+    constexpr std::array<const char*, 11> filenames{
+        "credits.jpg", "ladescreen.jpg", "mehrspielerhaupt.jpg", "mehrspielersammeln.jpg",
+        "mehrspielerspielsuchen.jpg", "optionen.jpg", "spieleinstellungen.jpg", "spielende.jpg",
+        "spielladen.jpg", "spielspeichern.jpg", "tutorial.jpg"
+    };
+
+    std::string normalized;
+    normalized.reserve(resource_name.size());
+    for (const unsigned char character : resource_name) {
+        normalized.push_back(character == '\\' ? '/' : static_cast<char>(std::tolower(character)));
+    }
+    if (normalized.compare(0, resource_prefix.size(), resource_prefix) != 0) return {};
+    const auto filename = normalized.substr(resource_prefix.size());
+    if (filename.find('/') != std::string::npos ||
+        std::none_of(filenames.begin(), filenames.end(), [&filename](const char* known) {
+            return filename == known;
+        })) return {};
+    return filename;
+}
+
+void report_unavailable_wide_menu_background(const std::string& filename, const char* reason) noexcept {
+    try {
+        if (!unavailable_wide_menu_backgrounds.emplace(filename).second) return;
+        char message[512] = {};
+        std::snprintf(message, sizeof(message),
+            "Wide menu background unavailable; using original: %s (%s)\n", filename.c_str(), reason);
+        OutputDebugStringA(message);
+    } catch (...) {
+    }
+}
+
+Texture* load_wide_menu_background(const Texture& original, const std::string& filename) {
+    if (wide_menu_background && wide_menu_background_name == filename) return wide_menu_background.get();
+    if (unavailable_wide_menu_backgrounds.find(filename) != unavailable_wide_menu_backgrounds.end()) return nullptr;
+
+    try {
+        const auto directory = game_directory();
+        if (directory.empty()) {
+            report_unavailable_wide_menu_background(filename, "cannot locate game directory");
+            return nullptr;
+        }
+        const auto asset_path = directory / L"renderer-assets" / L"wqhd-side-fill" / L"images" /
+            L"Background" / std::filesystem::path(filename);
+        std::error_code error;
+        const auto asset_size = std::filesystem::file_size(asset_path, error);
+        constexpr std::uintmax_t maximum_asset_size = 32u * 1024u * 1024u;
+        if (error || asset_size == 0 || asset_size > maximum_asset_size || asset_size > LONG_MAX) {
+            report_unavailable_wide_menu_background(filename, "missing or invalid file size");
+            return nullptr;
+        }
+
+        std::vector<std::uint8_t> encoded(static_cast<std::size_t>(asset_size));
+        std::ifstream input(asset_path, std::ios::binary);
+        if (!input || !input.read(reinterpret_cast<char*>(encoded.data()), static_cast<std::streamsize>(encoded.size())) ||
+            static_cast<std::size_t>(input.gcount()) != encoded.size()) {
+            report_unavailable_wide_menu_background(filename, "cannot read asset");
+            return nullptr;
+        }
+
+        sgl::ImageDecoder decoder;
+        if (FAILED(decoder.initialize(directory / L"AIM.dll"))) {
+            report_unavailable_wide_menu_background(filename, "cannot initialize AIM decoder");
+            return nullptr;
+        }
+        sgl::DecodedImage image;
+        if (FAILED(decoder.decode(filename.c_str(), encoded, image)) ||
+            FAILED(normalize_loaded_image(image)) || image.width != 4268 || image.height != 2400 ||
+            image.format != sgl::ImageFormat::Bgra32 ||
+            image.pitch < static_cast<std::uint64_t>(image.width) * 4 ||
+            static_cast<std::uint64_t>(image.pitch) * image.height > image.pixels.size()) {
+            report_unavailable_wide_menu_background(filename, "unsupported image data or dimensions");
+            return nullptr;
+        }
+
+        auto replacement = std::make_unique<Texture>();
+        replacement->header = original.header;
+        replacement->image = std::move(image);
+        replacement->name = original.name;
+        replacement->key = original.key;
+        replacement->keyed = original.keyed;
+        set_field(*replacement, 0x08, replacement->key);
+        set_field(*replacement, 0x18, replacement->image.pixels.data());
+        set_field(*replacement, 0x1c, replacement->image.palette.empty()
+            ? nullptr : replacement->image.palette.data());
+        set_field(*replacement, 0x20, static_cast<std::uint16_t>(replacement->image.width));
+        set_field(*replacement, 0x22, static_cast<std::uint16_t>(replacement->image.height));
+        set_field(*replacement, 0x24, static_cast<std::uint8_t>(sgl::bytes_per_pixel(replacement->image.format)));
+        set_field(*replacement, 0x25, static_cast<std::uint8_t>(sgl::bytes_per_pixel(replacement->image.format)));
+        set_field(*replacement, 0x28, replacement->image.pitch);
+
+        if (wide_menu_background) surface_renderer.forget(wide_menu_background->header.data());
+        wide_menu_background = std::move(replacement);
+        wide_menu_background_name = filename;
+        return wide_menu_background.get();
+    } catch (const std::bad_alloc&) {
+        report_unavailable_wide_menu_background(filename, "out of memory");
+    } catch (const std::filesystem::filesystem_error&) {
+        report_unavailable_wide_menu_background(filename, "filesystem error");
+    } catch (const std::length_error&) {
+        report_unavailable_wide_menu_background(filename, "invalid asset length");
+    }
+    return nullptr;
+}
+}
+
+extern "C" void* __cdecl sgl_LoadMemoryTexture(const char* name, std::uint32_t flags) {
+    if (!name || !*name) return nullptr;
+    try {
+        const auto directory = game_directory();
+        if (directory.empty()) sgl::unimplemented("sgl_LoadMemoryTexture archiver");
+        sgl::ArchiveReader archive;
+        sgl::ImageDecoder decoder;
+        if (FAILED(archive.initialize(directory / L"archiver.dll")) || FAILED(decoder.initialize(directory / L"AIM.dll"))) {
+            sgl::unimplemented("sgl_LoadMemoryTexture dependencies");
+        }
+        auto texture = std::make_unique<Texture>();
+        void* archive_handle = sgl::active_archive();
+        if (FAILED(archive.read(archive_handle, name, texture->encoded))) return nullptr;
+        texture->name = name;
+        const bool load_pixels = (flags & 0x00010040u) != 0;
+        const bool replaced_map = decode_wide_fast_forward_map(name, decoder,
+            sgl::current_game_resolution(), load_pixels, texture->image);
+        HRESULT result = S_OK;
+        if (!replaced_map) {
+            texture->image = {};
+            auto decoder_input = texture->encoded;
+            result = load_pixels ? decoder.decode(name, decoder_input, texture->image)
+                : decoder.inspect(name, decoder_input, texture->image);
+        }
+        if (FAILED(result)) {
+            char message[512];
+            std::snprintf(message, sizeof(message),
+                "SGL texture load failed: AIM %s, resource=%s flags=0x%08lx bytes=%zu hr=0x%08lx\n",
+                (flags & 0x00010040u) != 0 ? "decode" : "inspect", name,
+                static_cast<unsigned long>(flags), texture->encoded.size(), static_cast<unsigned long>(result));
+            OutputDebugStringA(message);
+            if (result == E_NOTIMPL) sgl::unimplemented(message);
+            return nullptr;
+        }
+        if (FAILED(normalize_loaded_image(texture->image))) sgl::unimplemented("sgl_LoadMemoryTexture pixel format conversion");
+        if (is_fast_forward_map(name)) {
+            if (load_pixels) reserve_fast_forward_map_capacity(texture->image);
+            sgl::set_fast_forward_map_source_size({texture->image.width, texture->image.height});
+        }
+        sgl::adapt_game_chrome(name, texture->image);
+        const auto& image = texture->image;
+        const auto width = static_cast<std::uint16_t>(image.width);
+        const auto height = static_cast<std::uint16_t>(image.height);
+        const bool indexed = image.format == sgl::ImageFormat::Indexed8;
+        texture->key = sgl::color_key() & 0x00ffffff;
+        texture->keyed = (flags & 7u) == 7u;
+        if ((flags & 0x00010040u) != 0) {
+            set_field(*texture, 0x18, image.pixels.data());
+            if (!image.palette.empty()) set_field(*texture, 0x1c, image.palette.data());
+        }
+        set_field(*texture, 0x08, texture->key);
+        set_field(*texture, 0x20, width);
+        set_field(*texture, 0x22, height);
+        set_field(*texture, 0x24, static_cast<std::uint8_t>(sgl::bytes_per_pixel(image.format)));
+        set_field(*texture, 0x25, static_cast<std::uint8_t>(sgl::bytes_per_pixel(image.format)));
+        set_field(*texture, 0x28, image.pitch);
+        const auto texture_flags = flags | (indexed ? 0x20u : 0u);
+        set_field(*texture, 0x34, texture_flags);
+        if (texture->header[0x37] == 0 && (texture_flags & 1u) != 0)
+            set_field(*texture, 0x37, std::uint8_t{1});
+        return register_texture(std::move(texture));
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    } catch (const std::filesystem::filesystem_error&) {
+        return nullptr;
+    }
+}
+
+static std::unique_ptr<Texture> make_memory_texture(std::uint16_t width, std::uint16_t height, std::uint32_t flags) {
+    if (!width || !height) sgl::unimplemented("sgl_CreateMemoryTexture dimensions");
+    try {
+        auto texture = std::make_unique<Texture>();
+        auto& image = texture->image;
+        const bool indexed = (flags & 0x20) != 0;
+        const std::uint32_t bytes_per_pixel = sgl::bytes_per_pixel(indexed ? sgl::ImageFormat::Indexed8 : sgl::ImageFormat::Bgra32);
+        image.width = width;
+        image.height = height;
+        image.pitch = (static_cast<std::uint32_t>(width) * bytes_per_pixel + 3) & ~3u;
+        image.format = indexed ? sgl::ImageFormat::Indexed8 : sgl::ImageFormat::Bgra32;
+        const std::uint64_t size = static_cast<std::uint64_t>(image.pitch) * height;
+        if (size > SIZE_MAX) return nullptr;
+        image.pixels.resize(static_cast<std::size_t>(size));
+        texture->key = sgl::color_key() & 0x00ffffff;
+        texture->keyed = (flags & 7) == 7;
+        texture->initial_color_key_pending = texture->keyed;
+        if (indexed) {
+            image.palette.resize(1024);
+            for (std::uint32_t i = 0; i < 256; ++i) {
+                std::uint32_t color = 0xff000000 | (i * 0x010101);
+                if (texture->keyed && (color & 0xffffff) == texture->key) color &= 0xffffff;
+                std::memcpy(image.palette.data() + i * 4, &color, sizeof(color));
+            }
+        }
+        set_field(*texture, 0x08, texture->key);
+        set_field(*texture, 0x18, image.pixels.data());
+        set_field(*texture, 0x1c, indexed ? image.palette.data() : nullptr);
+        set_field(*texture, 0x20, width);
+        set_field(*texture, 0x22, height);
+        set_field(*texture, 0x24, static_cast<std::uint8_t>(bytes_per_pixel));
+        set_field(*texture, 0x25, static_cast<std::uint8_t>(bytes_per_pixel));
+        set_field(*texture, 0x28, image.pitch);
+        set_field(*texture, 0x34, flags | 0x40u);
+        if ((flags & 0xff000000u) == 0 && (flags & 1u) != 0) {
+            set_field(*texture, 0x37, std::uint8_t{1});
+        }
+        return texture;
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    } catch (const std::length_error&) {
+        return nullptr;
+    }
+}
+
+extern "C" void* __cdecl sgl_CreateMemoryTexture(std::uint16_t width, std::uint16_t height, std::uint32_t flags) {
+    auto texture = make_memory_texture(width, height, flags);
+    return texture ? register_texture(std::move(texture)) : nullptr;
+}
+
+static int lock_texture(Texture& texture, LockOutput* output, int flags, bool external_access = false,
+    LockIntent intent = LockIntent::CpuPixels) {
+    auto& image = texture.image;
+    if (texture.initial_color_key_pending) {
+        if (texture.keyed && image.format == sgl::ImageFormat::Bgra32) {
+            if (FAILED(surface_renderer.synchronize_to_cpu(texture.header.data(), image))) return 0;
+        }
+        apply_color_key(image, texture.key, texture.keyed);
+        if (texture.keyed && image.format == sgl::ImageFormat::Bgra32)
+            surface_renderer.mark_cpu_modified(texture.header.data());
+        texture.initial_color_key_pending = false;
+    }
+    if (image.pixels.empty()) {
+        try {
+            const auto directory = game_directory();
+            if (directory.empty()) sgl::unimplemented("sgl_LockTexture archiver");
+            sgl::ImageDecoder decoder;
+            if (FAILED(decoder.initialize(directory / L"AIM.dll"))) sgl::unimplemented("sgl_LockTexture dependencies");
+            sgl::DecodedImage decoded;
+            const bool replaced_map = decode_wide_fast_forward_map(texture.name.c_str(), decoder,
+                sgl::current_game_resolution(), true, decoded);
+            HRESULT result = S_OK;
+            if (!replaced_map) {
+                decoded = {};
+                auto decoder_input = texture.encoded;
+                result = decoder.decode(texture.name.c_str(), decoder_input, decoded);
+            }
+            if (result == E_NOTIMPL) sgl::unimplemented("sgl_LockTexture format");
+            if (FAILED(result)) return 0;
+            if (FAILED(normalize_loaded_image(decoded))) sgl::unimplemented("sgl_LockTexture pixel format conversion");
+            if (is_fast_forward_map(texture.name.c_str())) {
+                reserve_fast_forward_map_capacity(decoded);
+                sgl::set_fast_forward_map_source_size({decoded.width, decoded.height});
+            }
+            sgl::adapt_game_chrome(texture.name.c_str(), decoded);
+            if (decoded.width != image.width || decoded.height != image.height || decoded.pitch != image.pitch || decoded.format != image.format) {
+                char message[512];
+                std::snprintf(message, sizeof(message),
+                    "sgl_LockTexture metadata mismatch: resource=%s expected=%ux%u pitch=%u format=%u; decoded=%ux%u pitch=%u format=%u; bytes=%zu pixels=%zu palette=%zu",
+                    texture.name.c_str(), image.width, image.height, image.pitch, static_cast<unsigned>(image.format),
+                    decoded.width, decoded.height, decoded.pitch, static_cast<unsigned>(decoded.format),
+                    texture.encoded.size(), decoded.pixels.size(), decoded.palette.size());
+                sgl::unimplemented(message);
+            }
+            image = std::move(decoded);
+            if (image.format == sgl::ImageFormat::Indexed8)
+                apply_palette_color_key(image.palette.data(), image.palette.size(), texture.key, texture.keyed);
+            apply_color_key(image, texture.key, texture.keyed);
+        } catch (const std::bad_alloc&) { return 0; }
+        catch (const std::filesystem::filesystem_error&) { return 0; }
+    }
+    if (external_access || (intent == LockIntent::CpuPixels && (flags & 1))) {
+        if (FAILED(surface_renderer.synchronize_to_cpu(texture.header.data(), image))) return 0;
+    }
+    if (output && !image.palette.empty() && texture.locked_palette.empty()) {
+        try { texture.locked_palette = image.palette; }
+        catch (const std::bad_alloc&) { return 0; }
+    }
+    set_field(texture, 0x18, image.pixels.data());
+    set_field(texture, 0x1c, image.palette.empty() ? nullptr : image.palette.data());
+    texture.pending_write = texture.pending_write || (flags & 2) != 0;
+    ++texture.locks;
+    if (output) {
+        *output = {image.pixels.data(), texture.locked_palette.empty() ? nullptr : texture.locked_palette.data(),
+            image.width, image.height, image.pitch};
+    }
+    return 1;
+}
+
+static void unlock_texture(Texture& texture) {
+    --texture.locks;
+    if (!texture.locks && texture.pending_write) {
+        if (texture.keyed && texture.image.format == sgl::ImageFormat::Bgra32 &&
+            FAILED(surface_renderer.synchronize_to_cpu(texture.header.data(), texture.image)))
+            sgl::unimplemented("sgl_UnlockTexture D3D11 synchronization");
+        apply_color_key(texture.image, texture.key, texture.keyed);
+        if (texture.keyed && texture.image.format == sgl::ImageFormat::Bgra32)
+            surface_renderer.mark_cpu_modified(texture.header.data());
+        texture.pending_write = false;
+    }
+}
+
+static void* screen_alias(void* handle) {
+    const auto value = reinterpret_cast<std::intptr_t>(handle);
+    if (value >= 0) return handle;
+    if (!screen) sgl::unimplemented("screen handle without screen");
+    if (value == -1 || value == -4) return screen->offscreen;
+    if (value == -3) return screen->display;
+    sgl::unimplemented("screen handle");
+}
+
+static bool resize_screen_texture(Texture& texture, sgl::DisplaySize size,
+    sgl::DecodedImage& replacement) noexcept {
+    const auto& current = texture.image;
+    if (texture.external_locks || texture.locks != (render_destination == texture.header.data() ? 1u : 0u) ||
+        current.format != sgl::ImageFormat::Bgra32 || current.pixels.empty() ||
+        current.pitch < static_cast<std::uint64_t>(current.width) * 4 ||
+        static_cast<std::uint64_t>(current.pitch) * current.height > current.pixels.size()) return false;
+    if (FAILED(surface_renderer.synchronize_to_cpu(texture.header.data(), texture.image))) return false;
+    const std::uint64_t pitch = static_cast<std::uint64_t>(size.width) * 4;
+    const std::uint64_t bytes = pitch * size.height;
+    if (pitch > UINT_MAX || bytes > SIZE_MAX) return false;
+    try {
+        replacement.width = size.width;
+        replacement.height = size.height;
+        replacement.pitch = static_cast<std::uint32_t>(pitch);
+        replacement.format = current.format;
+        replacement.pixels.assign(static_cast<std::size_t>(bytes), 0);
+        // Framebuffer pixels use the old layout coordinates and must be redrawn after a mode change.
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
+    return true;
+}
+
+struct ResolutionTextureReplacement {
+    Texture* texture;
+    sgl::DecodedImage image;
+    bool preserve_palette;
+};
+
+bool is_game_chrome(const std::string& name) noexcept {
+    return _stricmp(name.c_str(), "images/HauptscreenE1280.bmp") == 0 ||
+        _stricmp(name.c_str(), "images/HauptscreenA1280.bmp") == 0;
+}
+
+bool stage_resolution_textures(sgl::DisplaySize size,
+    std::vector<ResolutionTextureReplacement>& replacements) noexcept {
+    try {
+        const auto has_replacements = std::any_of(textures.begin(), textures.end(), [](const auto& entry) {
+            return is_game_chrome(entry.second->name) || is_fast_forward_map(entry.second->name.c_str());
+        });
+        if (!has_replacements) return true;
+        const auto directory = game_directory();
+        if (directory.empty()) return false;
+        sgl::ImageDecoder decoder;
+        if (FAILED(decoder.initialize(directory / L"AIM.dll"))) return false;
+        replacements.reserve(textures.size());
+        for (auto& entry : textures) {
+            auto& texture = *entry.second;
+            const bool map_texture = is_fast_forward_map(texture.name.c_str());
+            const bool chrome_texture = is_game_chrome(texture.name);
+            if (!map_texture && !chrome_texture) continue;
+            if (texture.external_locks || texture.locks || texture.pending_write || texture.externally_modified)
+                return false;
+            sgl::DecodedImage image;
+            const bool pixels = !texture.image.pixels.empty();
+            bool replaced_map = map_texture && decode_wide_fast_forward_map(
+                texture.name.c_str(), decoder, size, pixels, image);
+            HRESULT decoded = S_OK;
+            if (!replaced_map) {
+                image = {};
+                auto encoded = texture.encoded;
+                decoded = pixels ? decoder.decode(texture.name.c_str(), encoded, image)
+                    : decoder.inspect(texture.name.c_str(), encoded, image);
+            }
+            if (FAILED(decoded) || FAILED(normalize_loaded_image(image))) return false;
+            if (chrome_texture) sgl::adapt_game_chrome(texture.name.c_str(), image, size);
+            if (image.width > UINT16_MAX || image.height > UINT16_MAX) return false;
+            if (!map_texture && (image.format != texture.image.format ||
+                image.palette.size() != texture.image.palette.size())) return false;
+            if (pixels) {
+                const auto required = static_cast<std::uint64_t>(image.pitch) * image.height;
+                if (image.pixels.empty() || required > image.pixels.size() ||
+                    required > texture.image.pixels.capacity()) return false;
+                if (image.format == sgl::ImageFormat::Indexed8)
+                    apply_palette_color_key(image.palette.data(), image.palette.size(), texture.key, texture.keyed);
+                apply_color_key(image, texture.key, texture.keyed);
+            } else if (!image.pixels.empty()) {
+                return false;
+            }
+            if (chrome_texture) {
+                if (image.palette.size() != texture.image.palette.size() ||
+                    (!texture.locked_palette.empty() && texture.locked_palette.size() != image.palette.size()))
+                    return false;
+                if (!texture.image.palette.empty()) image.palette = texture.image.palette;
+            } else if (!image.palette.empty() && image.palette.size() != 1024) {
+                return false;
+            }
+            replacements.push_back({&texture, std::move(image), chrome_texture});
+        }
+        return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::filesystem::filesystem_error&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
+}
+
+void commit_resolution_textures(std::vector<ResolutionTextureReplacement>& replacements) noexcept {
+    for (auto& replacement : replacements) {
+        auto& texture = *replacement.texture;
+        auto& target = texture.image;
+        auto& source = replacement.image;
+        if (!target.pixels.empty()) {
+            target.pixels.resize(source.pixels.size());
+            std::memcpy(target.pixels.data(), source.pixels.data(), source.pixels.size());
+        }
+        if (source.palette.empty()) {
+            target.palette.clear();
+            texture.locked_palette.clear();
+        } else {
+            target.palette.resize(source.palette.size());
+            std::memcpy(target.palette.data(), source.palette.data(), source.palette.size());
+            if (!texture.locked_palette.empty()) {
+                texture.locked_palette.resize(source.palette.size());
+                std::memcpy(texture.locked_palette.data(), source.palette.data(), source.palette.size());
+            }
+        }
+        target.width = source.width;
+        target.height = source.height;
+        target.pitch = source.pitch;
+        target.format = source.format;
+        if (!replacement.preserve_palette && is_fast_forward_map(texture.name.c_str()))
+            sgl::set_fast_forward_map_source_size({target.width, target.height});
+        surface_renderer.forget(texture.header.data());
+        set_field(texture, 0x18, target.pixels.empty() ? nullptr : target.pixels.data());
+        set_field(texture, 0x1c, target.palette.empty() ? nullptr : target.palette.data());
+        set_field(texture, 0x20, static_cast<std::uint16_t>(target.width));
+        set_field(texture, 0x22, static_cast<std::uint16_t>(target.height));
+        const auto bytes_per_pixel = static_cast<std::uint8_t>(sgl::bytes_per_pixel(target.format));
+        set_field(texture, 0x24, bytes_per_pixel);
+        set_field(texture, 0x25, bytes_per_pixel);
+        set_field(texture, 0x28, target.pitch);
+        if (!replacement.preserve_palette) {
+            std::uint32_t flags = 0;
+            std::memcpy(&flags, texture.header.data() + 0x34, sizeof(flags));
+            flags = (flags & ~0x20u) | (target.format == sgl::ImageFormat::Indexed8 ? 0x20u : 0u);
+            set_field(texture, 0x34, flags);
+        }
+    }
+}
+
+static bool resize_screen(sgl::DisplaySize size) noexcept {
+    if (!screen || !sgl::is_supported_display_size(size)) return false;
+    auto offscreen = textures.find(screen->offscreen);
+    auto display = textures.find(screen->display);
+    if (offscreen == textures.end() || display == textures.end()) return false;
+    if (offscreen->second->image.width == size.width && offscreen->second->image.height == size.height &&
+        display->second->image.width == size.width && display->second->image.height == size.height) {
+        return surface_renderer.set_screen_size(size) == S_OK && sgl::update_game_resolution(size);
+    }
+
+    sgl::DecodedImage next_offscreen;
+    sgl::DecodedImage next_display;
+    std::vector<ResolutionTextureReplacement> next_chrome;
+    if (!resize_screen_texture(*offscreen->second, size, next_offscreen) ||
+        !resize_screen_texture(*display->second, size, next_display) ||
+        !stage_resolution_textures(size, next_chrome)) return false;
+    if (FAILED(surface_renderer.set_screen_size(size))) return false;
+
+    commit_resolution_textures(next_chrome);
+    surface_renderer.forget(screen->offscreen);
+    surface_renderer.forget(screen->display);
+    offscreen->second->image = std::move(next_offscreen);
+    display->second->image = std::move(next_display);
+    for (auto* texture : {offscreen->second.get(), display->second.get()}) {
+        set_field(*texture, 0x18, texture->image.pixels.data());
+        set_field(*texture, 0x20, static_cast<std::uint16_t>(size.width));
+        set_field(*texture, 0x22, static_cast<std::uint16_t>(size.height));
+        set_field(*texture, 0x28, texture->image.pitch);
+    }
+    return sgl::update_game_resolution(size);
+}
+
+sgl::DisplayApplyResult sgl::apply_options_display_resolution(std::string& error) {
+    error.clear();
+    const auto size = pending_game_resolution();
+    try {
+        {
+            std::lock_guard<std::mutex> lock(textures_mutex);
+            if (!screen) {
+                error = "Cannot change resolution because the game screen is not active.";
+                return DisplayApplyResult::Failed;
+            }
+            if (!resize_screen(size)) {
+                error = "The renderer could not prepare the selected resolution; the current size was kept.";
+                return DisplayApplyResult::Failed;
+            }
+        }
+        if (!save_display_config(display_config_path, size, error)) {
+            try {
+                error = "The resolution changed for this session, but high_res.ini could not be saved: " + error;
+            } catch (...) {
+                error.clear();
+            }
+            return DisplayApplyResult::AppliedNotSaved;
+        }
+        return DisplayApplyResult::Applied;
+    } catch (const std::exception& exception) {
+        try { error = std::string("The resolution could not be changed: ") + exception.what(); }
+        catch (...) { error.clear(); }
+        return DisplayApplyResult::Failed;
+    } catch (...) {
+        error.clear();
+        return DisplayApplyResult::Failed;
+    }
+}
+
+static void* external_handle(void* handle) {
+    if (screen && handle == screen->offscreen) return reinterpret_cast<void*>(-4);
+    if (screen && handle == screen->display) return reinterpret_cast<void*>(-3);
+    return handle;
+}
+
+static bool is_screen_texture(void* handle) {
+    return screen && (handle == screen->offscreen || handle == screen->display);
+}
+
+static RECT texture_bounds(void* handle, const sgl::DecodedImage& image) {
+    const auto dimension = [](std::uint32_t value) {
+        return static_cast<LONG>(std::min<std::uint32_t>(value, static_cast<std::uint32_t>(LONG_MAX)));
+    };
+    const auto [logical_width, logical_height] = screen_logical_size();
+    const LONG width = is_screen_texture(handle) ? dimension(logical_width) : dimension(image.width);
+    const LONG height = is_screen_texture(handle) ? dimension(logical_height) : dimension(image.height);
+    return {0, 0, std::max<LONG>(0, width), std::max<LONG>(0, height)};
+}
+
+static bool intersect_with(RECT& rectangle, const RECT& bounds) {
+    rectangle.left = std::max(rectangle.left, bounds.left);
+    rectangle.top = std::max(rectangle.top, bounds.top);
+    rectangle.right = std::min(rectangle.right, bounds.right);
+    rectangle.bottom = std::min(rectangle.bottom, bounds.bottom);
+    return nonempty(rectangle);
+}
+
+static bool make_screen_transform(void* handle, const sgl::DecodedImage& image,
+    sgl::ScreenTransform& transform) {
+    if (!is_screen_texture(handle)) return false;
+    const auto [logical_width, logical_height] = screen_logical_size();
+    if (!sgl::ScreenTransform::create(logical_width, logical_height, image.width, image.height, transform)) {
+        sgl::unimplemented("invalid SGL screen transform");
+    }
+    return true;
+}
+
+static std::vector<RECT> draw_clip_rectangles(const sgl::DecodedImage& target) {
+    std::vector<RECT> clips;
+    try {
+        const RECT bounds = texture_bounds(render_destination, target);
+        if (clipping_mode == 0) {
+            if (nonempty(bounds)) clips.push_back(bounds);
+            return clips;
+        }
+        if (clipping_mode == 1) {
+            RECT clip{clip_rectangle[0], clip_rectangle[1], clip_rectangle[2], clip_rectangle[3]};
+            if (intersect_with(clip, bounds)) clips.push_back(clip);
+            return clips;
+        }
+        if (clipping_mode != 2 && clipping_mode != 3)
+            sgl::unimplemented("sgl_DrawBitmapRect unsupported clipping mode");
+
+        auto* clipper = get_active_clipper();
+        clips.reserve(clipper->rectangles.size());
+        const RECT clip_bounds{clip_rectangle[0], clip_rectangle[1], clip_rectangle[2], clip_rectangle[3]};
+        for (RECT clip : clipper->rectangles) {
+            if (clipping_mode == 3 && !intersect_with(clip, clip_bounds)) continue;
+            if (intersect_with(clip, bounds)) clips.push_back(clip);
+        }
+    } catch (const std::bad_alloc&) {
+        sgl::unimplemented("sgl_DrawBitmapRect region allocation");
+    } catch (const std::length_error&) {
+        sgl::unimplemented("sgl_DrawBitmapRect region allocation");
+    }
+    return clips;
+}
+
+static HMODULE load_game_library(const wchar_t* name) {
+    std::array<wchar_t, 32768> path{};
+    const HMODULE loaded = GetModuleHandleW(name);
+    const DWORD length = GetModuleFileNameW(loaded, path.data(), static_cast<DWORD>(path.size()));
+    if (!length || length == path.size()) return nullptr;
+    const auto full_path = loaded ? std::filesystem::path(path.data()) : std::filesystem::path(path.data()).parent_path() / name;
+    return LoadLibraryExW(full_path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+}
+
+extern "C" int __cdecl sgl_InitHardware() {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    if (hardware_initialized) return 1;
+    try {
+        HMODULE aim = load_game_library(L"AIM.dll");
+        if (!aim) return 0;
+        HMODULE archive = nullptr;
+        try { archive = load_game_library(L"archiver.dll"); }
+        catch (...) { FreeLibrary(aim); throw; }
+        if (!archive) { FreeLibrary(aim); return 0; }
+        const auto aim_vendor = reinterpret_cast<int (__cdecl*)(int, int)>(GetProcAddress(aim, "?AIM_SETVENDOR@@YAHHH@Z"));
+        const auto archive_vendor = reinterpret_cast<int (__cdecl*)(int, int)>(GetProcAddress(archive, "arc_SetVendor"));
+        if (!aim_vendor || !archive_vendor || !aim_vendor(0, 0) || !archive_vendor(0, 0) || FAILED(surface_renderer.initialize())) {
+            FreeLibrary(archive);
+            FreeLibrary(aim);
+            return 0;
+        }
+        aim_library = aim;
+        archive_library = archive;
+        sgl::initialize_color_key();
+        hardware_initialized = true;
+        return 1;
+    } catch (const std::bad_alloc&) { return 0; }
+    catch (const std::filesystem::filesystem_error&) { return 0; }
+}
+
+static void destroy_screen();
+
+extern "C" void* __cdecl sgl_InitScreen(HWND window, int fullscreen, const char*, const std::uint32_t* settings) {
+    if (!window || !IsWindow(window) || (fullscreen != 0 && fullscreen != 1) ||
+        (settings && (!settings[0] || !settings[1] || settings[0] > INT_MAX || settings[1] > INT_MAX))) {
+        report_screen_init_failure("invalid SGL screen arguments", "window, fullscreen flag, or dimensions rejected");
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    if (screen) sgl::unimplemented("sgl_InitScreen multiple screens");
+    const int previous_logical_width = view_state.logical_width;
+    const int previous_logical_height = view_state.logical_height;
+    const int logical_width = settings ? static_cast<int>(settings[0]) : 640;
+    const int logical_height = settings ? static_cast<int>(settings[1]) : 480;
+    try {
+        std::array<wchar_t, 32768> path{};
+        const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+        if (!length || length == path.size()) {
+            report_screen_init_failure("locating game executable", "GetModuleFileNameW failed or truncated the path");
+            return nullptr;
+        }
+        std::string error;
+        const auto config_path = std::filesystem::path(path.data()).parent_path() / L"high_res.ini";
+        const HRESULT hr = surface_renderer.open_screen(window, config_path, error);
+        if (FAILED(hr)) {
+            report_screen_init_failure("opening D3D11 screen", error.c_str());
+            return nullptr;
+        }
+        display_config_path = config_path;
+        const auto size = surface_renderer.screen_size();
+        auto offscreen = make_memory_texture(static_cast<std::uint16_t>(size.width), static_cast<std::uint16_t>(size.height), 0);
+        auto display = make_memory_texture(static_cast<std::uint16_t>(size.width), static_cast<std::uint16_t>(size.height), 0);
+        if (!offscreen || !display) {
+            report_screen_init_failure("allocating screen buffers", "could not create both render-size buffers");
+            surface_renderer.close_screen();
+            return nullptr;
+        }
+        auto next = std::make_unique<Screen>();
+        next->offscreen = offscreen->header.data();
+        next->display = display->header.data();
+        textures.emplace(next->offscreen, std::move(offscreen));
+        try { textures.emplace(next->display, std::move(display)); }
+        catch (...) { textures.erase(next->offscreen); surface_renderer.close_screen(); throw; }
+        if (render_destination) unlock_texture(*textures.at(render_destination));
+        render_source = nullptr;
+        render_destination = next->offscreen;
+        lock_texture(*textures.at(render_destination), nullptr, 2);
+        constant_color = 0xffffffff;
+        screen = std::move(next);
+        view_state.logical_width = logical_width;
+        view_state.logical_height = logical_height;
+        const auto output_size = surface_renderer.output_size();
+        if (!sgl::install_mouse_input_transform(window, output_size.width, output_size.height,
+            size.width, size.height,
+            static_cast<unsigned>(view_state.logical_width), static_cast<unsigned>(view_state.logical_height))) {
+            char message[128];
+            std::snprintf(message, sizeof(message), "Cannot install SGL mouse coordinate transform: error=%lu\n",
+                static_cast<unsigned long>(GetLastError()));
+            report_screen_init_failure("installing mouse transform", message);
+            destroy_screen();
+            view_state.logical_width = previous_logical_width;
+            view_state.logical_height = previous_logical_height;
+            return nullptr;
+        }
+        if (!sgl::install_game_resolution(size, error)) {
+            report_screen_init_failure("installing game resolution", error.c_str());
+            destroy_screen();
+            view_state.logical_width = previous_logical_width;
+            view_state.logical_height = previous_logical_height;
+            return nullptr;
+        }
+        return screen.get();
+    } catch (const std::bad_alloc&) {
+        report_screen_init_failure("initializing SGL screen", "memory allocation failed");
+        surface_renderer.close_screen();
+        return nullptr;
+    } catch (const std::filesystem::filesystem_error&) {
+        report_screen_init_failure("initializing SGL screen", "filesystem operation failed");
+        surface_renderer.close_screen();
+        return nullptr;
+    }
+}
+
+extern "C" float __cdecl sgl_SetConstantZVal(float value) {
+    if (!std::isfinite(value)) sgl::unimplemented("sgl_SetConstantZVal parameter");
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    const float previous = view_state.constant_z;
+    view_state.constant_z = value;
+    return previous;
+}
+
+extern "C" void __cdecl sgl_SetScreenDimensions(int, int, int width, int height,
+    float near_plane, float far_plane) {
+    if (width <= 0 || height <= 0 || !std::isfinite(near_plane) || !std::isfinite(far_plane) ||
+        near_plane <= 0.0f || far_plane <= near_plane) sgl::unimplemented("sgl_SetScreenDimensions parameters");
+    {
+        std::lock_guard<std::mutex> lock(textures_mutex);
+        view_state.logical_width = width;
+        view_state.logical_height = height;
+        view_state.near_plane = near_plane;
+        view_state.far_plane = far_plane;
+    }
+    const auto render_size = surface_renderer.screen_size();
+    sgl::update_mouse_input_transform(static_cast<unsigned>(width), static_cast<unsigned>(height),
+        render_size.width, render_size.height);
+    sgl_SetConstantZVal(near_plane);
+}
+
+extern "C" int __cdecl sgl_SetZoomFactor(int x, int y) {
+    if (x <= 0 || y <= 0) sgl::unimplemented("sgl_SetZoomFactor parameters");
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    view_state.zoom_x = x;
+    view_state.zoom_y = y;
+    return 1;
+}
+
+static void destroy_screen() {
+    if (!screen) return;
+    sgl::remove_mouse_input_transform();
+    if (render_destination) {
+        const auto entry = textures.find(render_destination);
+        if (entry == textures.end() || entry->second->locks != 1) sgl::unimplemented("sgl_DestroyActiveScreen locked destination");
+        unlock_texture(*entry->second);
+    }
+    render_source = render_destination = nullptr;
+    surface_renderer.forget(screen->offscreen);
+    surface_renderer.forget(screen->display);
+    textures.erase(screen->offscreen);
+    textures.erase(screen->display);
+    surface_renderer.close_screen();
+    screen.reset();
+}
+
+extern "C" void __cdecl sgl_DestroyActiveScreen() {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    destroy_screen();
+}
+
+extern "C" int __cdecl sgl_SwitchScreenMode(const std::uint32_t* requested_mode) {
+    // Legacy SGL callers use 16 as a mode tag; presentation and surfaces stay 32-bit.
+    if (!requested_mode || (requested_mode[2] != 16 && requested_mode[2] != 32)) return 0;
+    const auto width = requested_mode[0], height = requested_mode[1];
+    const bool logical_layout = (width == 640 && height == 480) || (width == 800 && height == 600);
+    const sgl::DisplaySize requested_size{width, height};
+    if (!logical_layout && !sgl::is_supported_display_size(requested_size)) return 0;
+    {
+        std::lock_guard<std::mutex> lock(textures_mutex);
+        if (!screen) return 0;
+        if (!logical_layout && !resize_screen(requested_size)) return 0;
+        view_state.logical_width = static_cast<int>(width);
+        view_state.logical_height = static_cast<int>(height);
+    }
+    const auto render_size = surface_renderer.screen_size();
+    sgl::update_mouse_input_transform(width, height, render_size.width, render_size.height);
+    return 1;
+}
+
+extern "C" void __cdecl sgl_CleanUp() {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    destroy_screen();
+}
+
+extern "C" void __cdecl sgl_ShotDown() {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    destroy_screen();
+    sgl::remove_game_resolution();
+    surface_renderer.shutdown();
+    if (archive_library) FreeLibrary(archive_library);
+    if (aim_library) FreeLibrary(aim_library);
+    archive_library = aim_library = nullptr;
+    hardware_initialized = false;
+    display_config_path.clear();
+}
+
+extern "C" int __cdecl sgl_SwapBuffer(std::uint32_t flags) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    if (!screen || flags != 2) sgl::unimplemented("sgl_SwapBuffer state");
+    fast_forward_overlay = false;
+    sgl::refresh_accelerated_map_layout();
+    const auto& output = *textures.at(screen->display);
+    if (FAILED(surface_renderer.present(screen->display, output.image))) sgl::unimplemented("sgl_SwapBuffer D3D11");
+    const auto render_size = surface_renderer.screen_size();
+    sgl::update_mouse_input_transform(static_cast<unsigned>(view_state.logical_width),
+        static_cast<unsigned>(view_state.logical_height), render_size.width, render_size.height);
+    return 0;
+}
+
+extern "C" int __cdecl sgl_LockTexture(void* handle, LockOutput* output, int flags) {
+    if (flags < 1 || flags > 3) sgl::unimplemented("sgl_LockTexture flags");
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    handle = screen_alias(handle);
+    const auto entry = textures.find(handle);
+    if (entry == textures.end()) sgl::unimplemented("sgl_LockTexture object");
+    auto& texture = *entry->second;
+    if (texture.external_locks == UINT_MAX) sgl::unimplemented("sgl_LockTexture nesting");
+    const int result = lock_texture(texture, output, flags, true);
+    if (result) {
+        ++texture.external_locks;
+        texture.external_write_pending = texture.external_write_pending || (flags & 2) != 0;
+    }
+    return result;
+}
+
+extern "C" void __cdecl sgl_UnlockTexture(void* handle) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    handle = screen_alias(handle);
+    const auto entry = textures.find(handle);
+    if (entry == textures.end() || !entry->second->locks || !entry->second->external_locks ||
+        (handle == render_destination && entry->second->locks == 1)) sgl::unimplemented("sgl_UnlockTexture object");
+    auto& texture = *entry->second;
+    const bool final_external_write = texture.external_locks == 1 && texture.external_write_pending;
+    unlock_texture(texture);
+    --texture.external_locks;
+    if (final_external_write) {
+        surface_renderer.mark_cpu_modified(handle);
+        texture.external_write_pending = false;
+        texture.externally_modified = true;
+    }
+}
+
+extern "C" int __cdecl sgl_ChangePalette(void* handle, std::uint32_t* palette) {
+    if (!handle) return 0;
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    const auto entry = textures.find(handle);
+    if (entry == textures.end()) sgl::unimplemented("sgl_ChangePalette object");
+    auto& texture = *entry->second;
+    if (!lock_texture(texture, nullptr, 1)) return 0;
+    if (!texture.image.palette.empty()) {
+        if (!palette) sgl::unimplemented("sgl_ChangePalette palette");
+        if (texture.keyed) apply_palette_color_key(palette, 1024, texture.key, true);
+        std::memcpy(texture.image.palette.data(), palette, 1024);
+        surface_renderer.mark_palette_modified(handle);
+    }
+    unlock_texture(texture);
+    return 0;
+}
+
+extern "C" std::uint32_t __cdecl sgl_ChangeTextureFlags(void* handle, std::uint32_t flags) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    const auto entry = textures.find(handle);
+    if (entry == textures.end()) sgl::unimplemented("sgl_ChangeTextureFlags object");
+
+    auto& texture = *entry->second;
+    std::uint32_t current = 0;
+    std::memcpy(&current, texture.header.data() + 0x34, sizeof(current));
+    auto updated = ((current ^ flags) & texture_flag_toggle_mask) ^ current;
+    set_field(texture, 0x34, updated);
+    if (texture.header[0x37] == 0 && (updated & 1u) != 0) {
+        updated |= 0x01000000u;
+        set_field(texture, 0x34, updated);
+    }
+    return current & texture_flag_toggle_mask;
+}
+
+extern "C" std::uint32_t __cdecl sgl_GetColorKey(void* handle) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    handle = screen_alias(handle);
+    const auto entry = textures.find(handle);
+    if (entry == textures.end()) sgl::unimplemented("sgl_GetColorKey object");
+    const auto& texture = *entry->second;
+    return (texture.header[0x34] & 7) ? texture.key : 0;
+}
+
+extern "C" void __cdecl sgl_PrefetchTexture(void* handle) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    if (textures.find(handle) == textures.end()) sgl::unimplemented("sgl_PrefetchTexture object");
+}
+
+extern "C" void* __cdecl sgl_SetRenderSource(void* handle) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    handle = screen_alias(handle);
+    if (handle && textures.find(handle) == textures.end()) sgl::unimplemented("sgl_SetRenderSource object");
+    void* previous = render_source;
+    render_source = handle;
+    return external_handle(previous);
+}
+
+extern "C" void* __cdecl sgl_SetRenderDest(void* handle) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    handle = screen_alias(handle);
+    auto next = textures.end();
+    if (handle) {
+        next = textures.find(handle);
+        if (next == textures.end()) sgl::unimplemented("sgl_SetRenderDest object");
+        if (next->second->image.format == sgl::ImageFormat::Indexed8) handle = nullptr;
+    }
+    void* previous = render_destination;
+    if (previous == handle) return external_handle(previous);
+    if (previous) unlock_texture(*textures.at(previous));
+    render_destination = nullptr;
+    if (handle && lock_texture(*next->second, nullptr, 2)) render_destination = handle;
+    return external_handle(previous);
+}
+
+extern "C" int __cdecl sgl_Set2dClippingMode(int mode) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    const int previous = clipping_mode;
+    clipping_mode = mode;
+    return previous;
+}
+
+extern "C" int __cdecl sgl_Get2dClippingMode() {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    return clipping_mode;
+}
+
+extern "C" void* __cdecl sgl_CreateClipper() {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    try {
+        auto clipper = std::make_unique<Clipper>();
+        void* handle = clipper.get();
+        clippers.emplace(handle, std::move(clipper));
+        return handle;
+    } catch (const std::bad_alloc&) { return nullptr; }
+}
+
+extern "C" void* __cdecl sgl_GetRectClipper() { return sgl_CreateClipper(); }
+
+extern "C" void* __cdecl sgl_SetActiveClipper(void* handle) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    auto* previous = get_active_clipper();
+    if (!handle) active_clipper = default_clipper.get();
+    else if (handle == default_clipper.get()) active_clipper = default_clipper.get();
+    else {
+        const auto found = clippers.find(handle);
+        if (found == clippers.end()) sgl::unimplemented("sgl_SetActiveClipper object");
+        active_clipper = found->second.get();
+    }
+    return previous;
+}
+
+extern "C" void __cdecl sgl_FreeClipper(void* handle) {
+    if (!handle) return;
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    if (handle == default_clipper.get()) return;
+    const auto found = clippers.find(handle);
+    if (found == clippers.end()) sgl::unimplemented("sgl_FreeClipper object");
+    if (active_clipper == handle) active_clipper = default_clipper.get();
+    clippers.erase(found);
+}
+
+extern "C" void __cdecl sgl_FreeRectClipper(void* handle) { sgl_FreeClipper(handle); }
+
+extern "C" void __cdecl sgl_CopyClipper(void* source_handle) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    auto* destination = get_active_clipper();
+    if (!source_handle) sgl::unimplemented("sgl_CopyClipper source");
+
+    Clipper* source = nullptr;
+    if (source_handle == default_clipper.get()) source = default_clipper.get();
+    else {
+        const auto found = clippers.find(source_handle);
+        if (found == clippers.end()) sgl::unimplemented("sgl_CopyClipper object");
+        source = found->second.get();
+    }
+    if (source == destination) return;
+
+    try {
+        auto rectangles = source->rectangles;
+        destination->rectangles.swap(rectangles);
+    } catch (const std::bad_alloc&) {
+        sgl::unimplemented("sgl_CopyClipper allocation");
+    } catch (const std::length_error&) {
+        sgl::unimplemented("sgl_CopyClipper allocation");
+    }
+}
+
+static void change_clip(const RECT* rectangle, int operation) {
+    if (!rectangle) sgl::unimplemented("clip rectangle");
+    if (rectangle->left >= rectangle->right || rectangle->top >= rectangle->bottom) return;
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    auto* clipper = get_active_clipper();
+    try {
+        auto combined = combine_clip_rectangles(clipper->rectangles, *rectangle, operation);
+        clipper->rectangles.swap(combined);
+    } catch (const std::bad_alloc&) {
+        sgl::unimplemented("clip rectangle allocation");
+    } catch (const std::length_error&) {
+        sgl::unimplemented("clip rectangle allocation");
+    }
+}
+
+extern "C" void __cdecl sgl_AddClipRect_r(const RECT* rect) { change_clip(rect, RGN_OR); }
+extern "C" void __cdecl sgl_SubClipRect_r(const RECT* rect) { change_clip(rect, RGN_DIFF); }
+extern "C" void __cdecl sgl_AddClipRect_4i(int l, int t, int r, int b) { const RECT rect{l, t, r, b}; change_clip(&rect, RGN_OR); }
+extern "C" void __cdecl sgl_SubClipRect_4i(int l, int t, int r, int b) { const RECT rect{l, t, r, b}; change_clip(&rect, RGN_DIFF); }
+
+extern "C" void __cdecl sgl_ResetClipper() {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    get_active_clipper()->rectangles.clear();
+}
+
+extern "C" int __cdecl sgl_IsRectInClippingRegion(const RECT* rect) {
+    if (!rect) sgl::unimplemented("sgl_IsRectInClippingRegion rectangle");
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    if (clipping_mode == 1) return rect->left < clip_rectangle[2] && rect->right > clip_rectangle[0] &&
+        rect->top < clip_rectangle[3] && rect->bottom > clip_rectangle[1];
+    if (clipping_mode == 2 || clipping_mode == 3) {
+        const auto& regions = get_active_clipper()->rectangles;
+        return std::any_of(regions.begin(), regions.end(), [&](const RECT& region) {
+            return intersects(region, *rect);
+        });
+    }
+    return 1;
+}
+
+extern "C" void __cdecl sgl_SetClipRect_4i(int left, int top, int right, int bottom) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    clip_rectangle = {left, top, right, bottom};
+}
+
+extern "C" void __cdecl sgl_SetClipRect(int left, int top, int right, int bottom) {
+    sgl_SetClipRect_4i(left, top, right, bottom);
+}
+
+extern "C" void __cdecl sgl_SetClipRect_r(const std::int32_t* rectangle) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    std::memcpy(clip_rectangle.data(), rectangle, sizeof(clip_rectangle));
+}
+
+extern "C" void __cdecl sgl_GetClipRect_r(std::int32_t* rectangle) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    std::memcpy(rectangle, clip_rectangle.data(), sizeof(clip_rectangle));
+}
+
+extern "C" void __cdecl sgl_GetClipRect_4i(std::int32_t* left, std::int32_t* top,
+    std::int32_t* right, std::int32_t* bottom) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    *left = clip_rectangle[0];
+    *top = clip_rectangle[1];
+    *right = clip_rectangle[2];
+    *bottom = clip_rectangle[3];
+}
+
+extern "C" std::uint32_t __cdecl sgl_GetConstantColor() {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    return constant_color;
+}
+
+extern "C" void __cdecl sgl_SetFont(const void* font) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    active_font = static_cast<const std::uint8_t*>(font);
+}
+
+static void* create_font(const unsigned char* characters, void* texture_handle, int glyph_width,
+    int glyph_height, int spacing, int space_width, bool kerned, int fixed_width) {
+    if (!characters || !texture_handle) return nullptr;
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    const auto entry = textures.find(texture_handle);
+    if (entry == textures.end() || glyph_width <= 0 || glyph_height <= 0)
+        sgl::unimplemented("sgl_MemoryFont_CreateProportional parameters");
+    auto& texture = *entry->second;
+    if (texture.image.format != sgl::ImageFormat::Bgra32 ||
+        static_cast<unsigned>(glyph_height) > texture.image.height)
+        sgl::unimplemented("sgl_MemoryFont_CreateProportional image");
+    try {
+        auto font = std::make_unique<Font>();
+        const auto limit = std::min<std::uint32_t>(texture.image.width / static_cast<unsigned>(glyph_width), 256);
+        if (!limit) sgl::unimplemented("sgl_MemoryFont_CreateProportional glyph width");
+        std::uint32_t count = 0;
+        while (count < limit && characters[count]) {
+            font->header[0x20 + characters[count]] = static_cast<std::uint8_t>(count);
+            ++count;
+        }
+        std::uint32_t glyph_count = 1;
+        for (std::size_t i = 0; i < 256; ++i)
+            glyph_count = std::max(glyph_count, static_cast<std::uint32_t>(font->header[0x20 + i]) + 1);
+        font->widths.resize(glyph_count);
+        if (kerned) font->kerning.resize(glyph_count * glyph_count);
+        std::vector<std::uint8_t> edges;
+        if (kerned) edges.resize(static_cast<std::size_t>(glyph_count) * glyph_height * 2);
+        if (!lock_texture(texture, nullptr, 1)) return nullptr;
+        for (std::uint32_t i = 0; i < glyph_count; ++i) {
+            if (fixed_width >= 0) {
+                font->widths[i] = static_cast<std::uint8_t>(fixed_width);
+                continue;
+            }
+            int rightmost = 0;
+            for (int y = 0; y < glyph_height; ++y) {
+                const auto* row = texture.image.pixels.data() + static_cast<std::size_t>(y) * texture.image.pitch +
+                    static_cast<std::size_t>(i) * glyph_width * 4;
+                for (int x = 0; x < glyph_width; ++x) {
+                    const auto* pixel = row + x * 4;
+                    if (static_cast<std::uint8_t>(pixel[1] + pixel[2] + pixel[3]) != 0)
+                        rightmost = std::max(rightmost, x);
+                }
+            }
+            const auto advance = static_cast<std::uint8_t>(spacing + rightmost);
+            font->widths[i] = static_cast<std::uint8_t>((advance <= spacing ? space_width : advance) + 1);
+        }
+        if (kerned) {
+            const unsigned char excluded[] = "+-*/\\#~!\"\xa7$%%&/()= ";
+            std::array<bool, 256> eligible{};
+            eligible.fill(true);
+            for (const auto* p = excluded; *p; ++p) eligible[font->header[0x20 + *p]] = false;
+            for (std::uint32_t i = 0; i < glyph_count; ++i) {
+                const auto width = static_cast<std::uint8_t>(font->widths[i] - 1);
+                if (width >= glyph_width) sgl::unimplemented("sgl_MemoryFont_CreateKerning glyph width");
+                for (int y = 0; y < glyph_height; ++y) {
+                    const auto* row = texture.image.pixels.data() + static_cast<std::size_t>(y) * texture.image.pitch +
+                        static_cast<std::size_t>(i) * glyph_width * 4;
+                    auto left = width, right = width;
+                    for (unsigned x = 0; x <= width; ++x) {
+                        const auto* pixel = row + x * 4;
+                        if (pixel[0] || pixel[1] || pixel[2] || pixel[3]) {
+                            left = std::min(left, static_cast<std::uint8_t>(x));
+                            right = std::min(right, static_cast<std::uint8_t>(width - x));
+                        }
+                    }
+                    const auto index = (static_cast<std::size_t>(i) * glyph_height + y) * 2;
+                    edges[index] = left; edges[index + 1] = right;
+                }
+            }
+            for (std::uint32_t a = 0; a < glyph_count; ++a) for (std::uint32_t b = 0; b < glyph_count; ++b) {
+                const auto width = static_cast<std::uint8_t>(font->widths[a] - 1);
+                int advance = width + spacing;
+                if (eligible[a] && eligible[b]) {
+                    auto overlap = width;
+                    for (int y = 0; y < glyph_height; ++y) {
+                        const auto left = edges[(static_cast<std::size_t>(b) * glyph_height + y) * 2];
+                        const auto right = edges[(static_cast<std::size_t>(a) * glyph_height + y) * 2 + 1];
+                        overlap = std::min(overlap, static_cast<std::uint8_t>(left + right));
+                    }
+                    advance = spacing - overlap + width + 1;
+                }
+                font->kerning[a * glyph_count + b] = static_cast<std::uint8_t>(advance);
+            }
+        }
+        unlock_texture(texture);
+        auto put = [&font](std::size_t offset, const auto& value) { std::memcpy(font->header.data() + offset, &value, sizeof(value)); };
+        const auto* widths = font->widths.data();
+        const auto* kerning = kerned ? font->kerning.data() : nullptr;
+        put(4, glyph_width); put(8, glyph_height); put(0xc, fixed_width); put(0x10, glyph_count);
+        put(0x14, widths); put(0x18, kerning); put(0x1c, texture_handle); put(0x120, spacing); put(0x124, space_width);
+        void* handle = font->header.data();
+        fonts.emplace(handle, std::move(font));
+        return handle;
+    } catch (const std::bad_alloc&) { return nullptr; }
+}
+
+extern "C" void* __cdecl sgl_MemoryFont_CreateProportional(const unsigned char* characters,
+    void* texture_handle, int glyph_width, int glyph_height, int spacing, int space_width) {
+    return create_font(characters, texture_handle, glyph_width, glyph_height, spacing, space_width, false, -1);
+}
+
+extern "C" void* __cdecl sgl_MemoryFont_CreateKerning(const unsigned char* characters,
+    void* texture_handle, int glyph_width, int glyph_height, int spacing, int space_width) {
+    return create_font(characters, texture_handle, glyph_width, glyph_height, spacing, space_width, true, -1);
+}
+
+extern "C" void* __cdecl sgl_MemoryFont_CreateFixed(const unsigned char* characters,
+    void* texture_handle, int glyph_width, int glyph_height, int advance) {
+    if (advance < 0) sgl::unimplemented("sgl_MemoryFont_CreateFixed advance");
+    return create_font(characters, texture_handle, glyph_width, glyph_height, 0, 0, false, advance);
+}
+
+extern "C" void __cdecl sgl_FreeFont(void* handle) {
+    if (!handle) return;
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    const auto entry = fonts.find(handle);
+    if (entry == fonts.end()) sgl::unimplemented("sgl_FreeFont object");
+    fonts.erase(entry);
+}
+
+extern "C" int __cdecl sgl_StrLen(const unsigned char* text) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    if (!*text || !active_font) return 0;
+    std::uint32_t glyph_count;
+    const std::uint8_t* widths;
+    const std::uint8_t* kerning;
+    std::memcpy(&glyph_count, active_font + 0x10, sizeof(glyph_count));
+    std::memcpy(&widths, active_font + 0x14, sizeof(widths));
+    std::memcpy(&kerning, active_font + 0x18, sizeof(kerning));
+    int length = 0;
+    do {
+        const auto glyph = active_font[0x20 + *text++];
+        const auto next = active_font[0x20 + *text];
+        length += kerning && next ? kerning[glyph * glyph_count + next] : widths[glyph];
+    } while (*text);
+    return length;
+}
+
+extern "C" std::uint32_t __cdecl sgl_SetConstantColor(std::uint32_t color) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    const auto previous = constant_color;
+    constant_color = color;
+    return previous;
+}
+
+extern "C" std::uint32_t __cdecl sgl_SetBlendMode(std::uint32_t mode) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    const auto previous = active_blend_mode;
+    active_blend_mode = static_cast<std::uint8_t>(mode);
+    return previous;
+}
+
+extern "C" void __cdecl sgl_ClearBuffer(std::uint32_t flags, std::uint32_t color, float) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    if (flags > 3) sgl::unimplemented("sgl_ClearBuffer flags");
+    if (!(flags & 1)) return;
+    const auto entry = textures.find(render_destination);
+    if (entry == textures.end() || entry->second->image.format == sgl::ImageFormat::Indexed8)
+        sgl::unimplemented("sgl_ClearBuffer color destination");
+    if (screen && render_destination == screen->display) return;
+    auto& image = entry->second->image;
+    const auto pixel_size = sgl::bytes_per_pixel(image.format);
+    for (std::uint32_t y = 0; y < image.height; ++y) {
+        auto* row = image.pixels.data() + static_cast<std::size_t>(y) * image.pitch;
+        for (std::uint32_t x = 0; x < image.width; ++x) std::memcpy(row + x * pixel_size, &color, pixel_size);
+    }
+    surface_renderer.mark_cpu_modified(render_destination);
+}
+
+extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    const auto entry = textures.find(render_destination);
+    if (entry == textures.end()) sgl::unimplemented("sgl_FillSolidRect destination not selected");
+    if (width <= 0 || height <= 0) return;
+
+    auto& image = entry->second->image;
+    const auto pixel_size = sgl::bytes_per_pixel(image.format);
+    const auto minimum_pitch = static_cast<std::uint64_t>(image.width) * pixel_size;
+    if ((image.format != sgl::ImageFormat::Bgra32 && image.format != sgl::ImageFormat::Bgr24) ||
+        image.pitch < minimum_pitch ||
+        static_cast<std::uint64_t>(image.pitch) * image.height > image.pixels.size()) {
+        sgl::unimplemented("sgl_FillSolidRect destination format");
+    }
+
+    const double right = static_cast<double>(x) + width;
+    const double bottom = static_cast<double>(y) + height;
+    sgl::Rect rectangle{static_cast<float>(x), static_cast<float>(y),
+        static_cast<float>(right), static_cast<float>(bottom)};
+    sgl::ScreenTransform transform;
+    const bool destination_is_screen = make_screen_transform(render_destination, image, transform);
+    if (destination_is_screen) rectangle = transform.map(rectangle);
+
+    const auto pixel_bound = [](double value, std::uint32_t extent, bool round_up) {
+        const double rounded = round_up ? std::ceil(value) : std::floor(value);
+        return static_cast<LONG>(std::clamp(rounded, 0.0, static_cast<double>(extent)));
+    };
+    RECT fill{pixel_bound(rectangle.left, image.width, false),
+        pixel_bound(rectangle.top, image.height, false),
+        pixel_bound(rectangle.right, image.width, true),
+        pixel_bound(rectangle.bottom, image.height, true)};
+    if (!nonempty(fill)) return;
+
+    if (FAILED(surface_renderer.synchronize_to_cpu(render_destination, image)))
+        sgl::unimplemented("sgl_FillSolidRect D3D11 synchronization");
+
+    const auto clips = draw_clip_rectangles(image);
+    bool modified = false;
+    const std::array<std::uint8_t, 3> color = {
+        static_cast<std::uint8_t>(constant_color),
+        static_cast<std::uint8_t>(constant_color >> 8),
+        static_cast<std::uint8_t>(constant_color >> 16)
+    };
+    const auto alpha = static_cast<std::uint8_t>(constant_color >> 24);
+    const auto inverse_alpha = static_cast<std::uint8_t>(255 - alpha);
+    const auto fill_pixel = [&](std::uint8_t* pixel) {
+        if (active_blend_mode == 2) {
+            for (std::size_t channel = 0; channel < color.size(); ++channel)
+                pixel[channel] = static_cast<std::uint8_t>((static_cast<unsigned>(pixel[channel]) * color[channel]) >> 8);
+        } else if (active_blend_mode == 3) {
+            for (std::size_t channel = 0; channel < color.size(); ++channel) {
+                const auto contribution = (static_cast<unsigned>(color[channel]) * alpha) >> 8;
+                pixel[channel] = static_cast<std::uint8_t>(std::min<unsigned>(255, pixel[channel] + contribution));
+            }
+        } else if (alpha == 0xff) {
+            std::memcpy(pixel, color.data(), color.size());
+        } else {
+            for (std::size_t channel = 0; channel < color.size(); ++channel) {
+                const auto source = (static_cast<unsigned>(color[channel]) * alpha) >> 8;
+                const auto destination = (static_cast<unsigned>(pixel[channel]) * inverse_alpha) >> 8;
+                pixel[channel] = static_cast<std::uint8_t>(source + destination);
+            }
+        }
+        if (pixel_size == 4) pixel[3] = 0xff;
+    };
+    for (RECT clip : clips) {
+        if (destination_is_screen) {
+            RECT mapped_clip{};
+            if (!transform.map_clip(clip, mapped_clip)) continue;
+            clip = mapped_clip;
+        }
+        RECT region{std::max(fill.left, clip.left), std::max(fill.top, clip.top),
+            std::min(fill.right, clip.right), std::min(fill.bottom, clip.bottom)};
+        if (!intersect_with(region, {0, 0, static_cast<LONG>(image.width), static_cast<LONG>(image.height)})) continue;
+        modified = true;
+
+        for (LONG row = region.top; row < region.bottom; ++row) {
+            auto* destination = image.pixels.data() + static_cast<std::size_t>(row) * image.pitch +
+                static_cast<std::size_t>(region.left) * pixel_size;
+            for (LONG column = region.left; column < region.right; ++column) {
+                fill_pixel(destination);
+                destination += pixel_size;
+            }
+        }
+    }
+    if (modified) surface_renderer.mark_cpu_modified(render_destination);
+}
+
+extern "C" void __cdecl sgl_DrawLine(int, int, int, int) {
+    // The original SGL backend dispatches this export to a `ret 0x10` stub.
+}
+
+static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, int dw, int dh) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    const auto source = textures.find(render_source);
+    const auto target = textures.find(render_destination);
+    if (source == textures.end()) sgl::unimplemented("sgl_DrawBitmapRect source not selected");
+    if (target == textures.end()) sgl::unimplemented("sgl_DrawBitmapRect destination not selected");
+    if (clipping_mode < 0 || clipping_mode > 3)
+        sgl::unimplemented("sgl_DrawBitmapRect unsupported clipping mode");
+    if (sx < 0 || sy < 0 || width < 0 || height < 0 || dw < 0 || dh < 0)
+        sgl::unimplemented("sgl_DrawBitmapRect invalid rectangle");
+    if (width == 0 || height == 0 || dw == 0 || dh == 0) return;
+    const bool full_map = is_fast_forward_map(source->second->name.c_str()) && is_screen_texture(render_destination) &&
+        sx == 0 && sy == 0 && width == dw && height == dh &&
+        ((width == 1280 && height == 1024) ||
+            (width == static_cast<int>(source->second->image.width) &&
+                height == static_cast<int>(source->second->image.height))) &&
+        source->second->image.width == target->second->image.width &&
+        source->second->image.height == target->second->image.height && target->second->image.width > 1280;
+    if (!full_map && (static_cast<std::uint64_t>(sx) + width > source->second->image.width ||
+        static_cast<std::uint64_t>(sy) + height > source->second->image.height)) {
+        char message[768];
+        std::snprintf(message, sizeof(message),
+            "sgl_DrawBitmapRect source bounds: resource=%s image=%ux%u source=(%d,%d,%d,%d) destination=(%d,%d,%d,%d) target=%ux%u",
+            source->second->name.c_str(), source->second->image.width, source->second->image.height,
+            sx, sy, width, height, dx, dy, dw, dh, target->second->image.width, target->second->image.height);
+        sgl::unimplemented(message);
+    }
+    auto& src = *source->second;
+    auto& dst = *target->second;
+    const auto flags = src.header[0x34];
+    const auto blend = src.header[0x37];
+    const bool indexed = src.image.format == sgl::ImageFormat::Indexed8;
+    const auto color_flags = flags & 7;
+    const bool indexed_opaque_mode2 = indexed && color_flags == 7 && blend == 2;
+    const bool opaque_mode0 = !indexed && color_flags == 0 && blend == 1 && constant_color == 0xffffffffu;
+    const bool multiply = blend == 2 && (constant_color & 0x00ffffffu) == 0x00ffffffu;
+    const bool multiply_modulated = blend == 2 && (constant_color & 0x00ffffffu) != 0x00ffffffu;
+    const bool multiply2 = !indexed && color_flags == 0 && blend == 5;
+    const bool stretched = width != dw || height != dh;
+    const bool additive = (indexed || color_flags == 3) && blend == 3 &&
+        (constant_color & 0x00ffffffu) == 0x00ffffffu;
+    const bool additive_modulated = (indexed || color_flags == 3) && blend == 3 &&
+        (constant_color & 0x00ffffffu) != 0x00ffffffu;
+    const bool supported_bgra =
+        ((color_flags == 0 || color_flags == 1 || color_flags == 3 || color_flags == 7) &&
+            blend == ((flags & 1) ? 1 : 0)) || opaque_mode0 || multiply2 || additive || additive_modulated;
+    if (indexed ? (blend > 1 && !indexed_opaque_mode2 && !multiply && !multiply_modulated && !additive && !additive_modulated) :
+        (!supported_bgra && !multiply && !multiply_modulated)) {
+        char message[128] = {};
+        std::snprintf(message, sizeof(message),
+            "sgl_DrawBitmapRect unsupported: format=%u flags=0x%02X blend=%u",
+            static_cast<unsigned>(src.image.format), static_cast<unsigned>(flags), static_cast<unsigned>(blend));
+        sgl::unimplemented(message);
+    }
+    const auto blend_mode = multiply_modulated ? sgl::BlendMode::MultiplyModulated :
+        multiply ? sgl::BlendMode::Multiply :
+        multiply2 ? sgl::BlendMode::Multiply2 :
+        additive_modulated ? sgl::BlendMode::AdditiveModulated :
+        additive ? sgl::BlendMode::Additive :
+        (color_flags == 3 && blend == 1 ? sgl::BlendMode::Alpha : sgl::BlendMode::Opaque);
+    const auto sampling = multiply2 && stretched && (flags & 0x10) != 0 && dw >= width && dh >= height
+        ? sgl::Sampling::SglBilinear : sgl::Sampling::SglFixedPoint;
+
+    Texture* draw_source = &src;
+    bool expanded_menu_background = false;
+    const auto render_size = sgl::DisplaySize{dst.image.width, dst.image.height};
+    if (blend_mode == sgl::BlendMode::Opaque && !src.keyed && is_screen_texture(render_destination) &&
+        view_state.logical_width == 800 && view_state.logical_height == 600 &&
+        src.image.width == 800 && src.image.height == 600 &&
+        sx == 0 && sy == 0 && dx == 0 && dy == 0 && width == 800 && height == 600 && dw == 800 && dh == 600 &&
+        sgl::is_supported_display_size(render_size) &&
+        static_cast<std::uint64_t>(render_size.width) * 9 == static_cast<std::uint64_t>(render_size.height) * 16) {
+        const auto filename = wide_menu_background_filename(src.name);
+        if (!filename.empty()) {
+            if (auto* replacement = load_wide_menu_background(src, filename)) {
+                draw_source = replacement;
+                expanded_menu_background = true;
+            }
+        }
+    }
+
+    if (full_map) { expanded_menu_background = true; fast_forward_overlay = true; }
+    else if (fast_forward_overlay && _stricmp(src.name.c_str(), "images/Banner_klein.tga") == 0) fast_forward_overlay = false;
+
+    const auto clips = expanded_menu_background
+        ? std::vector<RECT>{{0, 0, static_cast<LONG>(dst.image.width), static_cast<LONG>(dst.image.height)}}
+        : draw_clip_rectangles(dst.image);
+    if (clips.empty()) return;
+    sgl::Rect src_rect = expanded_menu_background
+        ? sgl::Rect{0.0f, 0.0f, static_cast<float>(draw_source->image.width),
+            static_cast<float>(draw_source->image.height)}
+        : sgl::Rect{static_cast<float>(sx), static_cast<float>(sy),
+            static_cast<float>(sx) + width, static_cast<float>(sy) + height};
+    const sgl::Rect dst_rect{static_cast<float>(dx), static_cast<float>(dy),
+        static_cast<float>(dx) + dw, static_cast<float>(dy) + dh};
+    sgl::ScreenTransform transform;
+    if (!expanded_menu_background && make_screen_transform(render_source, src.image, transform))
+        src_rect = transform.map(src_rect);
+    auto mapped_destination = dst_rect;
+    const bool destination_is_screen = make_screen_transform(render_destination, dst.image, transform);
+    if (expanded_menu_background) {
+        mapped_destination = {0.0f, 0.0f, static_cast<float>(dst.image.width), static_cast<float>(dst.image.height)};
+    } else if (destination_is_screen) {
+        mapped_destination = transform.map(dst_rect);
+    }
+    if (fast_forward_overlay && !full_map && destination_is_screen &&
+        !sgl::refresh_accelerated_map_layout()) {
+        const float x = (static_cast<float>(dx) + dw * 0.5f) * dst.image.width / 1280.0f - dw * 0.5f;
+        const float y = (static_cast<float>(dy) + dh * 0.5f) * dst.image.height / 1024.0f - dh * 0.5f;
+        mapped_destination = {x, y, x + dw, y + dh};
+    }
+    if (!lock_texture(*draw_source, nullptr, 1, false, LockIntent::GpuResource))
+        sgl::unimplemented("sgl_DrawBitmapRect source lock");
+    const auto key = draw_source->keyed && blend_mode == sgl::BlendMode::Opaque
+        ? std::optional<std::uint32_t>(draw_source->key) : std::nullopt;
+    for (RECT clip : clips) {
+        if (destination_is_screen && !expanded_menu_background) {
+            RECT mapped_clip{};
+            if (!transform.map_clip(clip, mapped_clip)) continue;
+            clip = mapped_clip;
+        }
+        if (mapped_destination.left >= static_cast<float>(clip.right) ||
+            mapped_destination.top >= static_cast<float>(clip.bottom) ||
+            mapped_destination.right <= static_cast<float>(clip.left) ||
+            mapped_destination.bottom <= static_cast<float>(clip.top)) continue;
+        const char* failure_stage = nullptr;
+        const HRESULT result = surface_renderer.draw(draw_source->header.data(), draw_source->image, render_destination,
+            dst.image, src_rect, mapped_destination, clip, key, blend_mode, &failure_stage,
+            constant_color, sampling);
+        if (FAILED(result)) {
+            unlock_texture(*draw_source);
+            char message[256] = {};
+            std::snprintf(message, sizeof(message),
+                "sgl_DrawBitmapRect %s hr=0x%08lx src=%.2f,%.2f-%.2f,%.2f dst=%.2f,%.2f-%.2f,%.2f",
+                failure_stage ? failure_stage : "D3D11", static_cast<unsigned long>(result),
+                src_rect.left, src_rect.top, src_rect.right, src_rect.bottom,
+                mapped_destination.left, mapped_destination.top, mapped_destination.right, mapped_destination.bottom);
+            sgl::unimplemented(message);
+        }
+    }
+    unlock_texture(*draw_source);
+}
+
+extern "C" void __cdecl sgl_DrawBitmapRect(int sx, int sy, int dx, int dy, int width, int height) {
+    draw_bitmap(sx, sy, dx, dy, width, height, width, height);
+}
+
+extern "C" void __cdecl sgl_StretchBitmapRect(int sx, int sy, int dx, int dy,
+    int width, int height, int dw, int dh) {
+    draw_bitmap(sx, sy, dx, dy, width, height, dw, dh);
+}
+
+extern "C" int __cdecl sgl_DrawBitmapRectWithAlphaMask(std::uint32_t mask_handle,
+    int sx, int sy, int dx, int dy, int width, int height) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    const auto source = textures.find(render_source);
+    const auto target = textures.find(render_destination);
+    const auto mask_id = reinterpret_cast<void*>(static_cast<std::uintptr_t>(mask_handle));
+    const auto mask = textures.find(mask_id);
+    if (source == textures.end()) sgl::unimplemented("sgl_DrawBitmapRectWithAlphaMask source not selected");
+    if (target == textures.end()) sgl::unimplemented("sgl_DrawBitmapRectWithAlphaMask destination not selected");
+    if (mask == textures.end()) sgl::unimplemented("sgl_DrawBitmapRectWithAlphaMask mask handle");
+    if (mask_id == render_destination) sgl::unimplemented("sgl_DrawBitmapRectWithAlphaMask mask aliases destination");
+    if (clipping_mode < 0 || clipping_mode > 3)
+        sgl::unimplemented("sgl_DrawBitmapRectWithAlphaMask unsupported clipping mode");
+    if (sx < 0 || sy < 0 || width <= 0 || height <= 0)
+        sgl::unimplemented("sgl_DrawBitmapRectWithAlphaMask invalid rectangle");
+
+    auto& src = *source->second;
+    auto& alpha = *mask->second;
+    auto& dst = *target->second;
+    if (src.image.format != sgl::ImageFormat::Indexed8 || alpha.image.format != sgl::ImageFormat::Indexed8 ||
+        src.image.width != alpha.image.width || src.image.height != alpha.image.height ||
+        src.image.pitch != alpha.image.pitch || src.image.palette.size() != 1024 ||
+        dst.image.format == sgl::ImageFormat::Indexed8 ||
+        static_cast<std::uint64_t>(sx) + width > src.image.width ||
+        static_cast<std::uint64_t>(sy) + height > src.image.height) {
+        char message[256] = {};
+        std::snprintf(message, sizeof(message),
+            "sgl_DrawBitmapRectWithAlphaMask texture contract: src=%u %ux%u p%u pal%zu; mask=%u %ux%u p%u pal%zu; dst=%u; rect=%d,%d %dx%d",
+            static_cast<unsigned>(src.image.format), src.image.width, src.image.height, src.image.pitch,
+            src.image.palette.size(), static_cast<unsigned>(alpha.image.format), alpha.image.width,
+            alpha.image.height, alpha.image.pitch, alpha.image.palette.size(),
+            static_cast<unsigned>(dst.image.format), sx, sy, width, height);
+        sgl::unimplemented(message);
+    }
+
+    const auto clips = draw_clip_rectangles(dst.image);
+    if (clips.empty()) return 1;
+    sgl::Rect source_rect{static_cast<float>(sx), static_cast<float>(sy),
+        static_cast<float>(sx) + width, static_cast<float>(sy) + height};
+    const sgl::Rect target_rect{static_cast<float>(dx), static_cast<float>(dy),
+        static_cast<float>(dx) + width, static_cast<float>(dy) + height};
+    sgl::ScreenTransform transform;
+    if (make_screen_transform(render_source, src.image, transform)) source_rect = transform.map(source_rect);
+    auto mapped_target = target_rect;
+    const bool destination_is_screen = make_screen_transform(render_destination, dst.image, transform);
+    if (destination_is_screen) mapped_target = transform.map(target_rect);
+
+    if (!lock_texture(src, nullptr, 1, false, LockIntent::GpuResource))
+        sgl::unimplemented("sgl_DrawBitmapRectWithAlphaMask source lock");
+    const bool mask_is_source = mask_id == render_source;
+    if (!mask_is_source && !lock_texture(alpha, nullptr, 1, false, LockIntent::GpuResource)) {
+        unlock_texture(src);
+        sgl::unimplemented("sgl_DrawBitmapRectWithAlphaMask mask lock");
+    }
+    for (RECT clip : clips) {
+        if (destination_is_screen) {
+            RECT mapped_clip{};
+            if (!transform.map_clip(clip, mapped_clip)) continue;
+            clip = mapped_clip;
+        }
+        if (mapped_target.left >= static_cast<float>(clip.right) ||
+            mapped_target.top >= static_cast<float>(clip.bottom) ||
+            mapped_target.right <= static_cast<float>(clip.left) ||
+            mapped_target.bottom <= static_cast<float>(clip.top)) continue;
+        const char* failure_stage = nullptr;
+        const HRESULT result = surface_renderer.draw_masked(render_source, src.image, mask_id,
+            alpha.image, render_destination, dst.image, source_rect, mapped_target, clip,
+            constant_color, &failure_stage);
+        if (FAILED(result)) {
+            if (!mask_is_source) unlock_texture(alpha);
+            unlock_texture(src);
+            char message[256] = {};
+            std::snprintf(message, sizeof(message),
+                "sgl_DrawBitmapRectWithAlphaMask %s hr=0x%08lx src=%.2f,%.2f-%.2f,%.2f dst=%.2f,%.2f-%.2f,%.2f",
+                failure_stage ? failure_stage : "D3D11", static_cast<unsigned long>(result),
+                source_rect.left, source_rect.top, source_rect.right, source_rect.bottom,
+                mapped_target.left, mapped_target.top, mapped_target.right, mapped_target.bottom);
+            sgl::unimplemented(message);
+        }
+    }
+    if (!mask_is_source) unlock_texture(alpha);
+    unlock_texture(src);
+    return 1;
+}
+
+extern "C" void __cdecl sgl_SetTextMode(int mode) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    text_mode = mode;
+}
+
+extern "C" void __cdecl sgl_DrawText(int x, int y, const unsigned char* text) {
+    if (!*text) return;
+    const std::uint8_t* font;
+    int mode, old_clipping;
+    std::array<std::int32_t, 4> old_clip;
+    std::vector<RECT> regions;
+    {
+        std::lock_guard<std::mutex> lock(textures_mutex);
+        font = active_font;
+        mode = text_mode;
+        old_clipping = clipping_mode;
+        old_clip = clip_rectangle;
+        if (old_clipping == 2 || old_clipping == 3) {
+            try {
+                regions = get_active_clipper()->rectangles;
+            } catch (const std::bad_alloc&) { sgl::unimplemented("sgl_DrawText region allocation"); }
+            catch (const std::length_error&) { sgl::unimplemented("sgl_DrawText region allocation"); }
+        }
+    }
+    if (!font) return;
+    const int length = sgl_StrLen(text);
+    int glyph_width, glyph_height;
+    std::uint32_t glyph_count;
+    const std::uint8_t *widths, *kerning;
+    void* texture;
+    std::memcpy(&glyph_width, font + 4, sizeof(glyph_width));
+    std::memcpy(&glyph_height, font + 8, sizeof(glyph_height));
+    std::memcpy(&glyph_count, font + 0x10, sizeof(glyph_count));
+    std::memcpy(&widths, font + 0x14, sizeof(widths));
+    std::memcpy(&kerning, font + 0x18, sizeof(kerning));
+    std::memcpy(&texture, font + 0x1c, sizeof(texture));
+    if (mode == 2) x -= length;
+    else if (mode == 3) x -= length / 2;
+    std::array<std::int32_t, 4> bounds{x, y, x + length, y + glyph_height};
+    if (old_clipping == 1 || old_clipping == 3) {
+        bounds[0] = std::max(bounds[0], old_clip[0]); bounds[1] = std::max(bounds[1], old_clip[1]);
+        bounds[2] = std::min(bounds[2], old_clip[2]); bounds[3] = std::min(bounds[3], old_clip[3]);
+    }
+    if (bounds[0] >= bounds[2] || bounds[1] >= bounds[3]) return;
+    if (old_clipping != 2 && old_clipping != 3)
+        regions.push_back({bounds[0], bounds[1], bounds[2], bounds[3]});
+    if (regions.empty()) return;
+    auto* previous = sgl_SetRenderSource(texture);
+    sgl_Set2dClippingMode(1);
+    for (const auto& region : regions) {
+        const std::array<std::int32_t, 4> clip{std::max(bounds[0], static_cast<std::int32_t>(region.left)),
+            std::max(bounds[1], static_cast<std::int32_t>(region.top)),
+            std::min(bounds[2], static_cast<std::int32_t>(region.right)),
+            std::min(bounds[3], static_cast<std::int32_t>(region.bottom))};
+        if (clip[0] >= clip[2] || clip[1] >= clip[3]) continue;
+        sgl_SetClipRect_r(clip.data());
+        int position = x;
+        const auto* current = text;
+        while (*current) {
+            const auto glyph = font[0x20 + *current++];
+            const auto next = font[0x20 + *current];
+            const auto width = widths[glyph];
+            const auto advance = kerning && next ? kerning[glyph * glyph_count + next] : width;
+            if (width) draw_bitmap(glyph * glyph_width, 0, position, y, width, glyph_height, width, glyph_height);
+            position += advance;
+        }
+    }
+    sgl_SetClipRect_r(old_clip.data());
+    sgl_Set2dClippingMode(old_clipping);
+    sgl_SetRenderSource(previous);
+}
+
+extern "C" void __cdecl sgl_DrawText_Rect(int x, int y, const std::int32_t* rectangle,
+    const unsigned char* text) {
+    if (!text || !*text || !rectangle) return;
+
+    const int previous_mode = sgl_Get2dClippingMode();
+    std::array<std::int32_t, 4> previous_clip;
+    sgl_GetClipRect_r(previous_clip.data());
+    std::array<std::int32_t, 4> draw_clip;
+    std::copy_n(rectangle, draw_clip.size(), draw_clip.begin());
+
+    if (previous_mode == 1 || previous_mode == 3) {
+        draw_clip[0] = std::max(draw_clip[0], previous_clip[0]);
+        draw_clip[1] = std::max(draw_clip[1], previous_clip[1]);
+        draw_clip[2] = std::min(draw_clip[2], previous_clip[2]);
+        draw_clip[3] = std::min(draw_clip[3], previous_clip[3]);
+        sgl_SetClipRect_r(draw_clip.data());
+    } else if (previous_mode == 2) {
+        sgl_Set2dClippingMode(3);
+        sgl_SetClipRect_r(draw_clip.data());
+    } else {
+        sgl_Set2dClippingMode(1);
+        sgl_SetClipRect_r(draw_clip.data());
+    }
+
+    sgl_DrawText(x, y, text);
+    sgl_SetClipRect_r(previous_clip.data());
+    sgl_Set2dClippingMode(previous_mode);
+}
+
+static void blit_bitmap(int sx, int sy, int dx, int dy, int width, int height, std::uint32_t flags) {
+    const auto source = textures.find(render_source);
+    const auto target = textures.find(render_destination);
+    char message[192]{};
+    if (source == textures.end()) {
+        std::snprintf(message, sizeof(message), "sgl_Blt missing source (handle=%p, destination=%p)",
+            render_source, render_destination);
+        sgl::unimplemented(message);
+    }
+    if (target == textures.end()) {
+        std::snprintf(message, sizeof(message), "sgl_Blt missing destination (source=%p, handle=%p)",
+            render_source, render_destination);
+        sgl::unimplemented(message);
+    }
+    if (flags != 0 && flags != 2 && flags != 4) {
+        std::snprintf(message, sizeof(message), "sgl_Blt unsupported flags=0x%08lX", static_cast<unsigned long>(flags));
+        sgl::unimplemented(message);
+    }
+    if (sx < 0 || sy < 0) {
+        std::snprintf(message, sizeof(message), "sgl_Blt negative source origin (%d,%d)", sx, sy);
+        sgl::unimplemented(message);
+    }
+    if (source->second->image.format == sgl::ImageFormat::Indexed8 || target->second->image.format == sgl::ImageFormat::Indexed8) {
+        std::snprintf(message, sizeof(message), "sgl_Blt indexed surface formats (source=%u, destination=%u)",
+            static_cast<unsigned>(source->second->image.format), static_cast<unsigned>(target->second->image.format));
+        sgl::unimplemented(message);
+    }
+    auto& src = *source->second;
+    auto& dst = *target->second;
+    const bool source_is_screen = is_screen_texture(render_source);
+    const bool target_is_screen = is_screen_texture(render_destination);
+    const auto [logical_width, logical_height] = screen_logical_size();
+    const std::int64_t source_width = source_is_screen ? logical_width : src.image.width;
+    const std::int64_t source_height = source_is_screen ? logical_height : src.image.height;
+    const std::int64_t target_width = target_is_screen ? logical_width : dst.image.width;
+    const std::int64_t target_height = target_is_screen ? logical_height : dst.image.height;
+    const std::int64_t left = std::max<std::int64_t>(0, -static_cast<std::int64_t>(dx));
+    const std::int64_t top = std::max<std::int64_t>(0, -static_cast<std::int64_t>(dy));
+    const std::int64_t right = std::min({static_cast<std::int64_t>(width), source_width - sx, target_width - dx});
+    const std::int64_t bottom = std::min({static_cast<std::int64_t>(height), source_height - sy, target_height - dy});
+    if (left >= right || top >= bottom) return;
+    if (render_source == render_destination && sx == dx && sy == dy) return;
+    const bool self_copy = render_source == render_destination;
+    if (!lock_texture(src, nullptr, 1, false,
+        self_copy ? LockIntent::CpuPixels : LockIntent::GpuResource))
+        sgl::unimplemented("sgl_Blt source lock");
+    sgl::Rect source_rect{static_cast<float>(sx + left), static_cast<float>(sy + top),
+        static_cast<float>(sx + right), static_cast<float>(sy + bottom)};
+    sgl::Rect target_rect{static_cast<float>(dx + left), static_cast<float>(dy + top),
+        static_cast<float>(dx + right), static_cast<float>(dy + bottom)};
+    sgl::ScreenTransform transform;
+    if (make_screen_transform(render_source, src.image, transform)) source_rect = transform.map(source_rect);
+    if (make_screen_transform(render_destination, dst.image, transform)) target_rect = transform.map(target_rect);
+    const RECT bounds{0, 0, static_cast<LONG>(dst.image.width), static_cast<LONG>(dst.image.height)};
+    const char* failure_stage = nullptr;
+    if (self_copy) {
+        sgl::DecodedImage source_snapshot;
+        try { source_snapshot = src.image; }
+        catch (const std::bad_alloc&) {
+            unlock_texture(src);
+            sgl::unimplemented("sgl_Blt source snapshot allocation");
+        }
+        unlock_texture(src);
+        const HRESULT self_copy_result = surface_renderer.draw(&source_snapshot, source_snapshot,
+            render_destination, dst.image, source_rect, target_rect, bounds, std::nullopt,
+            sgl::BlendMode::Opaque, &failure_stage);
+        surface_renderer.forget(&source_snapshot);
+        if (FAILED(self_copy_result)) {
+            char draw_message[160]{};
+            std::snprintf(draw_message, sizeof(draw_message), "sgl_Blt self-copy D3D11: %s failed (HRESULT 0x%08lX)",
+                failure_stage ? failure_stage : "unknown stage", static_cast<unsigned long>(self_copy_result));
+            sgl::unimplemented(draw_message);
+        }
+        return;
+    }
+    const HRESULT result = surface_renderer.draw(render_source, src.image, render_destination,
+        dst.image, source_rect, target_rect, bounds, std::nullopt, sgl::BlendMode::Opaque, &failure_stage);
+    unlock_texture(src);
+    if (FAILED(result)) {
+        char draw_message[160]{};
+        std::snprintf(draw_message, sizeof(draw_message), "sgl_Blt D3D11: %s failed (HRESULT 0x%08lX)",
+            failure_stage ? failure_stage : "unknown stage", static_cast<unsigned long>(result));
+        sgl::unimplemented(draw_message);
+    }
+}
+
+extern "C" void __cdecl sgl_Blt(int sx, int sy, int dx, int dy, int width, int height, std::uint32_t flags) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    blit_bitmap(sx, sy, dx, dy, width, height, flags);
+}
+
+extern "C" void __cdecl sgl_Blt_RC(std::uint32_t flags) {
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    if (flags != 0 && flags != 2) sgl::unimplemented("sgl_Blt_RC flags");
+    const auto source = textures.find(render_source);
+    const auto target = textures.find(render_destination);
+    if (source == textures.end() || target == textures.end()) sgl::unimplemented("sgl_Blt_RC state");
+    const RECT source_bounds = texture_bounds(render_source, source->second->image);
+    const RECT target_bounds = texture_bounds(render_destination, target->second->image);
+    const RECT copy_bounds{std::max(source_bounds.left, target_bounds.left),
+        std::max(source_bounds.top, target_bounds.top), std::min(source_bounds.right, target_bounds.right),
+        std::min(source_bounds.bottom, target_bounds.bottom)};
+    const RECT clip_bounds{clip_rectangle[0], clip_rectangle[1], clip_rectangle[2], clip_rectangle[3]};
+    for (RECT rect : get_active_clipper()->rectangles) {
+        if (clipping_mode == 3 && !intersect_with(rect, clip_bounds)) continue;
+        if (!intersect_with(rect, copy_bounds)) continue;
+        blit_bitmap(rect.left, rect.top, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, flags);
+    }
+}
+
+extern "C" void __cdecl sgl_FreeMemoryTexture(void* handle) {
+    if (!handle) return;
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    if (is_screen_texture(handle)) return;
+    const auto entry = textures.find(handle);
+    if (entry == textures.end()) sgl::unimplemented("sgl_FreeMemoryTexture object");
+    if (render_source == handle) render_source = nullptr;
+    if (render_destination == handle) render_destination = nullptr;
+    surface_renderer.forget(handle);
+    textures.erase(entry);
+}
+
+extern "C" void __cdecl sgl_FreeTexture(void* handle) {
+    sgl_FreeMemoryTexture(handle);
+}
