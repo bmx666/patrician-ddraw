@@ -1147,11 +1147,127 @@ extern "C" void __cdecl sgl_ShotDown() {
     display_config_path.clear();
 }
 
+// Diagnostic surface dump: Scroll Lock, or Ctrl+Shift+F9, writes the City Map buffer, the offscreen
+// and display surfaces and every clipper to <game>/renderer-dumps/. It changes no rendering state.
+static void* diagnostic_map_buffer = nullptr;
+struct DiagnosticMapCopy { int sx, sy, dx, dy, width, height; };
+static std::array<DiagnosticMapCopy, 8> diagnostic_map_copies{};
+static std::size_t diagnostic_map_copy_count = 0;
+static std::array<DiagnosticMapCopy, 8> diagnostic_frame_copies{};
+static std::size_t diagnostic_frame_copy_count = 0;
+static unsigned long diagnostic_frame = 0;
+static unsigned long diagnostic_frame_copies_frame = 0;
+static bool diagnostic_key_down = false;
+static unsigned diagnostic_dump_index = 0;
+
+static bool write_diagnostic_bitmap(const std::filesystem::path& path, void* handle, Texture& texture) {
+    auto& image = texture.image;
+    const std::uint32_t pixel_size = sgl::bytes_per_pixel(image.format);
+    if ((image.format != sgl::ImageFormat::Bgra32 && image.format != sgl::ImageFormat::Bgr24) ||
+        image.pixels.empty() || !image.width || !image.height || image.width > 16384u || image.height > 16384u ||
+        image.pitch < static_cast<std::uint64_t>(image.width) * pixel_size ||
+        static_cast<std::uint64_t>(image.pitch) * image.height > image.pixels.size()) return false;
+    if (FAILED(surface_renderer.synchronize_to_cpu(handle, image))) return false;
+    const std::uint32_t row_size = (image.width * 3u + 3u) & ~3u;
+    BITMAPFILEHEADER file_header{};
+    BITMAPINFOHEADER info_header{};
+    file_header.bfType = 0x4d42;
+    file_header.bfOffBits = static_cast<DWORD>(sizeof(file_header) + sizeof(info_header));
+    file_header.bfSize = file_header.bfOffBits + row_size * image.height;
+    info_header.biSize = sizeof(info_header);
+    info_header.biWidth = static_cast<LONG>(image.width);
+    info_header.biHeight = -static_cast<LONG>(image.height);
+    info_header.biPlanes = 1;
+    info_header.biBitCount = 24;
+    info_header.biCompression = BI_RGB;
+    info_header.biSizeImage = row_size * image.height;
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) return false;
+    output.write(reinterpret_cast<const char*>(&file_header), sizeof(file_header));
+    output.write(reinterpret_cast<const char*>(&info_header), sizeof(info_header));
+    std::vector<std::uint8_t> row(row_size, 0);
+    for (std::uint32_t y = 0; y < image.height; ++y) {
+        const auto* source = image.pixels.data() + static_cast<std::size_t>(y) * image.pitch;
+        for (std::uint32_t x = 0; x < image.width; ++x)
+            std::memcpy(row.data() + static_cast<std::size_t>(x) * 3, source + static_cast<std::size_t>(x) * pixel_size, 3);
+        output.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size()));
+    }
+    return static_cast<bool>(output);
+}
+
+static void write_diagnostic_clipper(std::ofstream& output, const Clipper& clipper, const char* role) {
+    output << "clipper " << static_cast<const void*>(&clipper) << ' ' << role
+        << (&clipper == active_clipper ? " active" : "") << " count=" << clipper.rectangles.size() << '\n';
+    for (const RECT& rectangle : clipper.rectangles)
+        output << "  " << rectangle.left << ' ' << rectangle.top << ' ' << rectangle.right << ' ' << rectangle.bottom << '\n';
+}
+
+static void diagnostic_dump_on_hotkey() {
+    ++diagnostic_frame;
+    if (diagnostic_map_copy_count) {
+        diagnostic_frame_copies = diagnostic_map_copies;
+        diagnostic_frame_copy_count = std::min(diagnostic_map_copy_count, diagnostic_map_copies.size());
+        diagnostic_frame_copies_frame = diagnostic_frame;
+        diagnostic_map_copy_count = 0;
+    }
+    const bool key_down = (GetAsyncKeyState(VK_SCROLL) & 0x8000) != 0 ||
+        ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 && (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 &&
+            (GetAsyncKeyState(VK_F9) & 0x8000) != 0);
+    const bool pressed = key_down && !diagnostic_key_down;
+    diagnostic_key_down = key_down;
+    if (!pressed || !screen) return;
+    try {
+        const auto directory = game_directory();
+        if (directory.empty()) return;
+        const auto folder = directory / L"renderer-dumps";
+        std::error_code error;
+        std::filesystem::create_directories(folder, error);
+        const std::wstring prefix = L"dump-" + std::to_wstring(GetTickCount()) + L"-" +
+            std::to_wstring(++diagnostic_dump_index);
+        std::ofstream output(folder / (prefix + L".txt"), std::ios::trunc);
+        if (!output) return;
+        const auto describe = [&](const char* role, const wchar_t* suffix, void* handle) {
+            const auto entry = handle ? textures.find(handle) : textures.end();
+            if (entry == textures.end()) {
+                output << role << " handle=" << handle << " missing\n";
+                return;
+            }
+            auto& texture = *entry->second;
+            const bool written = write_diagnostic_bitmap(folder / (prefix + suffix), handle, texture);
+            output << role << " handle=" << handle << " size=" << texture.image.width << 'x' << texture.image.height
+                << " pitch=" << texture.image.pitch << " format=" << static_cast<int>(texture.image.format)
+                << " locks=" << texture.locks << " external_locks=" << texture.external_locks
+                << " bitmap=" << (written ? "written" : "failed") << '\n';
+        };
+        output << "frame=" << diagnostic_frame << " logical=" << view_state.logical_width << 'x'
+            << view_state.logical_height << " clipping_mode=" << clipping_mode << " clip_rect=" << clip_rectangle[0]
+            << ' ' << clip_rectangle[1] << ' ' << clip_rectangle[2] << ' ' << clip_rectangle[3]
+            << " render_source=" << render_source << " render_destination=" << render_destination << '\n';
+        describe("map", L"-map.bmp", diagnostic_map_buffer);
+        describe("offscreen", L"-offscreen.bmp", screen->offscreen);
+        describe("display", L"-display.bmp", screen->display);
+        output << "map_to_screen_copies frame=" << diagnostic_frame_copies_frame << " count="
+            << diagnostic_frame_copy_count << " (sx sy dx dy width height)\n";
+        for (std::size_t index = 0; index < diagnostic_frame_copy_count; ++index) {
+            const auto& copy = diagnostic_frame_copies[index];
+            output << "  " << copy.sx << ' ' << copy.sy << ' ' << copy.dx << ' ' << copy.dy << ' '
+                << copy.width << ' ' << copy.height << '\n';
+        }
+        if (default_clipper) write_diagnostic_clipper(output, *default_clipper, "default");
+        for (const auto& entry : clippers) write_diagnostic_clipper(output, *entry.second, "created");
+        output.close();
+        MessageBeep(MB_OK);
+    } catch (...) {
+        OutputDebugStringA("Patrician III D3D11: diagnostic dump failed\n");
+    }
+}
+
 extern "C" int __cdecl sgl_SwapBuffer(std::uint32_t flags) {
     std::lock_guard<std::mutex> lock(textures_mutex);
     if (!screen || flags != 2) sgl::unimplemented("sgl_SwapBuffer state");
     fast_forward_overlay = false;
     sgl::refresh_accelerated_map_layout();
+    diagnostic_dump_on_hotkey();
     const auto& output = *textures.at(screen->display);
     if (FAILED(surface_renderer.present(screen->display, output.image))) sgl::unimplemented("sgl_SwapBuffer D3D11");
     const auto render_size = surface_renderer.screen_size();
@@ -1258,6 +1374,12 @@ extern "C" void* __cdecl sgl_SetRenderDest(void* handle) {
         next = textures.find(handle);
         if (next == textures.end()) sgl::unimplemented("sgl_SetRenderDest object");
         if (next->second->image.format == sgl::ImageFormat::Indexed8) handle = nullptr;
+        else if (screen && !is_screen_texture(handle)) {
+            const auto offscreen = textures.find(screen->offscreen);
+            if (offscreen != textures.end() &&
+                next->second->image.width + 284u == offscreen->second->image.width &&
+                next->second->image.height + 42u == offscreen->second->image.height) diagnostic_map_buffer = handle;
+        }
     }
     void* previous = render_destination;
     if (previous == handle) return external_handle(previous);
@@ -1689,6 +1811,10 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
     if (sx < 0 || sy < 0 || width < 0 || height < 0 || dw < 0 || dh < 0)
         sgl::unimplemented("sgl_DrawBitmapRect invalid rectangle");
     if (width == 0 || height == 0 || dw == 0 || dh == 0) return;
+    if (diagnostic_map_buffer && render_source == diagnostic_map_buffer && is_screen_texture(render_destination)) {
+        diagnostic_map_copies[diagnostic_map_copy_count % diagnostic_map_copies.size()] = {sx, sy, dx, dy, width, height};
+        ++diagnostic_map_copy_count;
+    }
     const bool full_map = is_fast_forward_map(source->second->name.c_str()) && is_screen_texture(render_destination) &&
         sx == 0 && sy == 0 && width == dw && height == dh &&
         ((width == 1280 && height == 1024) ||
@@ -2134,6 +2260,7 @@ extern "C" void __cdecl sgl_FreeMemoryTexture(void* handle) {
     if (entry == textures.end()) sgl::unimplemented("sgl_FreeMemoryTexture object");
     if (render_source == handle) render_source = nullptr;
     if (render_destination == handle) render_destination = nullptr;
+    if (diagnostic_map_buffer == handle) diagnostic_map_buffer = nullptr;
     surface_renderer.forget(handle);
     textures.erase(entry);
 }
