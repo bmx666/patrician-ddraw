@@ -20,7 +20,7 @@ int main() {
         std::ifstream input(path, std::ios::binary);
         return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
     };
-    sgl::DisplaySize size{};
+    sgl::DisplayConfig config{};
     std::string error;
     constexpr std::array<std::array<unsigned, 2>, 4> supported = {{
         {{1280, 1024}}, {{1600, 900}}, {{1920, 1080}}, {{2560, 1440}}
@@ -28,34 +28,39 @@ int main() {
     for (const auto& resolution : supported) {
         const auto configuration = "[display]\nwidth=" + std::to_string(resolution[0]) +
             "\nheight=" + std::to_string(resolution[1]) + "\n";
-        if (!write(configuration.c_str()) || !sgl::display_config(GetDesktopWindow(), path, size, error) ||
-            size.width != resolution[0] || size.height != resolution[1]) return 2;
+        if (!write(configuration.c_str()) || !sgl::display_config(GetDesktopWindow(), path, config, error) ||
+            config.size.width != resolution[0] || config.size.height != resolution[1] ||
+            config.mode != sgl::DisplayMode::Borderless) return 2;
     }
     for (const char* invalid : {"[display]\nwidth=800\nheight=600\n", "[display]\nwidth=1024\nheight=768\n",
         "[display]\nwidth=1920\n", "[display]\nwidth=1920\nheight=1081\n",
         "[display]\nwidth=1920\nwidth=1920\nheight=1080\n", "[display]\nwidth=1920x\nheight=1080\n",
         "[display]\nwidth=1920\nheight=1080\nextra=1\n", "[display]\nwidth 1920\nheight=1080\n",
-        "[display]\nwidth=\nheight=1080\n"}) {
-        if (!write(invalid) || sgl::display_config(GetDesktopWindow(), path, size, error) || error.empty()) return 3;
+        "[display]\nwidth=\nheight=1080\n", "[display]\nwidth=1920\nheight=1080\nmode=fullscreen\n",
+        "[display]\nwidth=1920\nheight=1080\nmode=windowed\nmode=borderless\n"}) {
+        if (!write(invalid) || sgl::display_config(GetDesktopWindow(), path, config, error) || error.empty()) return 3;
     }
-    if (!write("; keep this comment\n[other]\nvalue=preserved\n[display]\nheight=1080\n[tail]\nvalue=also preserved\n") ||
-        !sgl::save_display_config(path, {2560, 1440}, error)) return 13;
+    if (!write("; keep this comment\n[other]\nvalue=preserved\n[display]\nwidth=1920\nheight=1080\nmode=windowed\n[tail]\nvalue=also preserved\n") ||
+        !sgl::save_display_config(path, {2560, 1440}, sgl::DisplayMode::Borderless, error)) return 13;
     const auto saved = read();
-    if (saved.find("; keep this comment\r\n[other]\r\nvalue=preserved\r\n[display]\r\nheight=1440\r\nwidth=2560\r\n[tail]\r\nvalue=also preserved\r\n") == std::string::npos ||
-        !sgl::display_config(GetDesktopWindow(), path, size, error) || size.width != 2560 || size.height != 1440) return 14;
+    if (saved.find("; keep this comment\r\n[other]\r\nvalue=preserved\r\n[display]\r\nwidth=2560\r\nheight=1440\r\nmode=borderless\r\n[tail]\r\nvalue=also preserved\r\n") == std::string::npos ||
+        !sgl::display_config(GetDesktopWindow(), path, config, error) || config.size.width != 2560 ||
+        config.size.height != 1440 || config.mode != sgl::DisplayMode::Borderless) return 14;
     const HANDLE keep_destination_open = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (keep_destination_open == INVALID_HANDLE_VALUE) return 19;
-    const bool replaced_open_file = sgl::save_display_config(path, {1920, 1080}, error);
+    const bool replaced_open_file = sgl::save_display_config(path, {1920, 1080}, sgl::DisplayMode::Windowed, error);
     const auto unchanged = read();
     CloseHandle(keep_destination_open);
     if (replaced_open_file || error.empty() || unchanged != saved) return 20;
-    if (sgl::save_display_config(path, {1920, 1200}, error) || error.empty() || read() != saved) return 15;
-    if (sgl::save_display_config(path, {1024, 768}, error) || error.empty() || read() != saved) return 17;
-    if (sgl::save_display_config(path, {800, 600}, error) || error.empty() || read() != saved) return 18;
+    if (sgl::save_display_config(path, {1920, 1200}, sgl::DisplayMode::Windowed, error) || error.empty() || read() != saved) return 15;
+    if (sgl::save_display_config(path, {1024, 768}, sgl::DisplayMode::Windowed, error) || error.empty() || read() != saved) return 17;
+    if (sgl::save_display_config(path, {800, 600}, sgl::DisplayMode::Windowed, error) || error.empty() || read() != saved) return 18;
+    if (sgl::save_display_config(path, {1920, 1080}, static_cast<sgl::DisplayMode>(99), error) ||
+        error.empty() || read() != saved) return 21;
     auto missing_parent = path;
     missing_parent += L".missing-parent\\high_res.ini";
-    if (sgl::save_display_config(missing_parent, {1920, 1080}, error) || error.empty()) return 16;
+    if (sgl::save_display_config(missing_parent, {1920, 1080}, sgl::DisplayMode::Windowed, error) || error.empty()) return 16;
     if (!write("[display]\nwidth=1920\nheight=1080\n")) return 4;
     HWND window = CreateWindowExW(0, L"STATIC", L"", WS_OVERLAPPED, 0, 0, 8, 8,
         nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -78,11 +83,28 @@ int main() {
             output_size.height != static_cast<UINT>(output_monitor.rcMonitor.bottom - output_monitor.rcMonitor.top) ||
             desc.Width != output_size.width || desc.Height != output_size.height) return 9;
     }
+    const LONG_PTR prior_style = GetWindowLongPtrW(window, GWL_STYLE);
+    if (!write("[display]\nwidth=1280\nheight=1024\nmode=windowed\n")) return 22;
+    {
+        Microsoft::WRL::ComPtr<ID3D11Device> device;
+        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+            D3D11_SDK_VERSION, &device, nullptr, nullptr))) return 23;
+        sgl::Presentation presentation;
+        if (FAILED(presentation.initialize_configured(device.Get(), window, path, error)) ||
+            presentation.display_mode() != sgl::DisplayMode::Windowed) return 24;
+        RECT client = {};
+        if (!GetClientRect(window, &client) || client.right - client.left != 1280 ||
+            client.bottom - client.top != 1024 || (GetWindowLongPtrW(window, GWL_STYLE) & WS_POPUP) ||
+            !(GetWindowLongPtrW(window, GWL_STYLE) & WS_CAPTION) || presentation.output_size().width != 1280 ||
+            presentation.output_size().height != 1024) return 25;
+        presentation.close();
+    }
+    if (GetWindowLongPtrW(window, GWL_STYLE) != prior_style) return 26;
     DestroyWindow(window);
     std::error_code ec;
     std::filesystem::remove(path, ec);
     if (ec) return 9;
-    if (sgl::display_config(nullptr, path, size, error) || error.empty()) return 12;
+    if (sgl::display_config(nullptr, path, config, error) || error.empty()) return 12;
     MONITORINFOEXW monitor = {};
     monitor.cbSize = sizeof(monitor);
     const HMONITOR handle = MonitorFromWindow(GetDesktopWindow(), MONITOR_DEFAULTTONEAREST);
@@ -92,8 +114,9 @@ int main() {
     const bool native_supported = (mode.dmPelsWidth == 1280 && mode.dmPelsHeight == 1024) ||
         (mode.dmPelsWidth == 1600 && mode.dmPelsHeight == 900) ||
         (mode.dmPelsWidth == 1920 && mode.dmPelsHeight == 1080) || (mode.dmPelsWidth == 2560 && mode.dmPelsHeight == 1440);
-    const bool selected = sgl::display_config(GetDesktopWindow(), path, size, error);
-    if (selected != native_supported || (selected && (size.width != mode.dmPelsWidth || size.height != mode.dmPelsHeight)) ||
+    const bool selected = sgl::display_config(GetDesktopWindow(), path, config, error);
+    if (selected != native_supported || (selected && (config.size.width != mode.dmPelsWidth || config.size.height != mode.dmPelsHeight ||
+        config.mode != sgl::DisplayMode::Borderless)) ||
         (!selected && error.empty())) return 11;
     return 0;
 }

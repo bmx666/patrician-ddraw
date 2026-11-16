@@ -34,12 +34,12 @@ bool sgl::is_supported_display_size(DisplaySize size) noexcept {
         (size.width == 2560 && size.height == 1440);
 }
 
-bool sgl::display_config(HWND window, const std::filesystem::path& path, DisplaySize& size, std::string& error) {
+bool sgl::display_config(HWND window, const std::filesystem::path& path, DisplayConfig& config, std::string& error) {
     error.clear();
     std::error_code ec;
     const bool exists = std::filesystem::exists(path, ec);
     if (ec) { error = "Cannot inspect high_res.ini: " + ec.message(); return false; }
-    DisplaySize selected{};
+    DisplayConfig selected{};
     if (!exists) {
         MONITORINFOEXW monitor = {};
         monitor.cbSize = sizeof(monitor);
@@ -51,11 +51,11 @@ bool sgl::display_config(HWND window, const std::filesystem::path& path, Display
             error = "Cannot determine the window's display resolution";
             return false;
         }
-        selected = {mode.dmPelsWidth, mode.dmPelsHeight};
+        selected.size = {mode.dmPelsWidth, mode.dmPelsHeight};
     } else {
         std::ifstream file(path, std::ios::binary);
         if (!file) { error = "Cannot read high_res.ini"; return false; }
-        bool in_display = false, has_width = false, has_height = false;
+        bool in_display = false, has_width = false, has_height = false, has_mode = false;
         std::string line;
         unsigned line_number = 0;
         while (std::getline(file, line)) {
@@ -73,9 +73,16 @@ bool sgl::display_config(HWND window, const std::filesystem::path& path, Display
             const auto value = trim(text.substr(equal + 1));
             unsigned* number = nullptr;
             bool* present = nullptr;
-            if (equal_ascii(key, "width")) { number = &selected.width; present = &has_width; }
-            else if (equal_ascii(key, "height")) { number = &selected.height; present = &has_height; }
-            else { error = "high_res.ini line " + std::to_string(line_number) + ": unknown display setting"; return false; }
+            if (equal_ascii(key, "width")) { number = &selected.size.width; present = &has_width; }
+            else if (equal_ascii(key, "height")) { number = &selected.size.height; present = &has_height; }
+            else if (equal_ascii(key, "mode")) {
+                if (has_mode) { error = "high_res.ini line " + std::to_string(line_number) + ": duplicate setting"; return false; }
+                has_mode = true;
+                if (equal_ascii(value, "windowed")) selected.mode = DisplayMode::Windowed;
+                else if (equal_ascii(value, "borderless")) selected.mode = DisplayMode::Borderless;
+                else { error = "high_res.ini line " + std::to_string(line_number) + ": mode must be windowed or borderless"; return false; }
+                continue;
+            } else { error = "high_res.ini line " + std::to_string(line_number) + ": unknown display setting"; return false; }
             if (*present) { error = "high_res.ini line " + std::to_string(line_number) + ": duplicate setting"; return false; }
             *present = true;
             if (value.empty()) {
@@ -91,18 +98,19 @@ bool sgl::display_config(HWND window, const std::filesystem::path& path, Display
         if (file.bad()) { error = "Cannot read high_res.ini"; return false; }
         if (!has_width || !has_height) { error = "high_res.ini requires [display] width and height"; return false; }
     }
-    if (!is_supported_display_size(selected)) {
-        error = "Unsupported display resolution " + std::to_string(selected.width) + "x" + std::to_string(selected.height);
+    if (!is_supported_display_size(selected.size)) {
+        error = "Unsupported display resolution " + std::to_string(selected.size.width) + "x" + std::to_string(selected.size.height);
         return false;
     }
-    size = selected;
+    config = selected;
     return true;
 }
 
-bool sgl::save_display_config(const std::filesystem::path& path, DisplaySize size, std::string& error) {
+bool sgl::save_display_config(const std::filesystem::path& path, DisplaySize size, DisplayMode mode, std::string& error) {
     error.clear();
-    if (path.empty() || !is_supported_display_size(size)) {
-        error = "Cannot save unsupported display resolution";
+    if (path.empty() || !is_supported_display_size(size) ||
+        (mode != DisplayMode::Windowed && mode != DisplayMode::Borderless)) {
+        error = "Cannot save unsupported display configuration";
         return false;
     }
 
@@ -137,10 +145,12 @@ bool sgl::save_display_config(const std::filesystem::path& path, DisplaySize siz
 
         const auto width_line = "width=" + std::to_string(size.width);
         const auto height_line = "height=" + std::to_string(size.height);
+        const auto mode_line = std::string("mode=") + (mode == DisplayMode::Windowed ? "windowed" : "borderless");
         std::size_t section_end = lines.size();
         bool found_display = false;
         bool found_width = false;
         bool found_height = false;
+        bool found_mode = false;
         bool in_display = false;
         for (std::size_t i = 0; i < lines.size(); ++i) {
             const auto text = trim(lines[i]);
@@ -165,17 +175,22 @@ bool sgl::save_display_config(const std::filesystem::path& path, DisplaySize siz
             } else if (equal_ascii(key, "height")) {
                 lines[i] = height_line;
                 found_height = true;
+            } else if (equal_ascii(key, "mode")) {
+                lines[i] = mode_line;
+                found_mode = true;
             }
         }
         if (found_display) {
             auto position = lines.begin() + static_cast<std::ptrdiff_t>(section_end);
             if (!found_width) position = lines.insert(position, width_line) + 1;
-            if (!found_height) lines.insert(position, height_line);
+            if (!found_height) position = lines.insert(position, height_line) + 1;
+            if (!found_mode) lines.insert(position, mode_line);
         } else {
             if (!lines.empty() && !lines.back().empty()) lines.emplace_back();
             lines.emplace_back("[display]");
             lines.push_back(width_line);
             lines.push_back(height_line);
+            lines.push_back(mode_line);
         }
 
         std::string contents;

@@ -850,7 +850,7 @@ sgl::DisplayApplyResult sgl::apply_options_display_resolution(std::string& error
                 return DisplayApplyResult::Failed;
             }
         }
-        if (!save_display_config(display_config_path, size, error)) {
+        if (!save_display_config(display_config_path, size, surface_renderer.display_mode(), error)) {
             try {
                 error = "The resolution changed for this session, but high_res.ini could not be saved: " + error;
             } catch (...) {

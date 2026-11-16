@@ -28,6 +28,7 @@ public:
     void shutdown() noexcept;
     DisplaySize screen_size() const noexcept;
     DisplaySize output_size() const noexcept;
+    DisplayMode display_mode() const noexcept;
     HRESULT present(void* id, const DecodedImage& image) noexcept;
 
 private:

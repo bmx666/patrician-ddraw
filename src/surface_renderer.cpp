@@ -338,6 +338,10 @@ DisplaySize SurfaceRenderer::output_size() const noexcept {
     return presentation_.output_size();
 }
 
+DisplayMode SurfaceRenderer::display_mode() const noexcept {
+    return presentation_.display_mode();
+}
+
 HRESULT SurfaceRenderer::present(void* id, const DecodedImage& image) noexcept {
     if (!id || image.format != ImageFormat::Bgra32 || image.pixels.empty() || !presentation_.back_buffer()) return E_INVALIDARG;
     Surface* source = nullptr;

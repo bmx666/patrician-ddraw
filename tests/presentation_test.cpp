@@ -4,8 +4,59 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <commctrl.h>
 
 using Microsoft::WRL::ComPtr;
+
+namespace {
+
+struct FixedWindowSize {
+    LONG width;
+    LONG height;
+};
+
+LRESULT CALLBACK fixed_window_size_subclass(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
+    UINT_PTR, DWORD_PTR reference_data) {
+    if (message == WM_WINDOWPOSCHANGING && lparam && reference_data) {
+        const auto* size = reinterpret_cast<const FixedWindowSize*>(reference_data);
+        auto* position = reinterpret_cast<WINDOWPOS*>(lparam);
+        if (!(position->flags & SWP_NOSIZE)) {
+            position->cx = size->width;
+            position->cy = size->height;
+        }
+    }
+    return DefSubclassProc(window, message, wparam, lparam);
+}
+
+bool windowed_size_fits_monitor(HWND window, UINT width, UINT height) {
+    const LONG_PTR style = (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME) & ~WS_MAXIMIZEBOX;
+    const LONG_PTR extended_style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+    RECT rect{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+    if (!AdjustWindowRectEx(&rect, static_cast<DWORD>(style), GetMenu(window) != nullptr,
+        static_cast<DWORD>(extended_style))) return false;
+    const HMONITOR handle = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info = {};
+    info.cbSize = sizeof(info);
+    if (!handle || !GetMonitorInfoW(handle, &info)) return false;
+    return rect.right - rect.left <= info.rcWork.right - info.rcWork.left &&
+        rect.bottom - rect.top <= info.rcWork.bottom - info.rcWork.top;
+}
+
+bool simulate_game_style_reset(HWND window) {
+    constexpr LONG_PTR game_style = WS_VISIBLE | WS_CLIPSIBLINGS | WS_SYSMENU | WS_MINIMIZEBOX;
+    SetLastError(ERROR_SUCCESS);
+    const LONG_PTR previous = SetWindowLongPtrW(window, GWL_STYLE, game_style);
+    if (!previous && GetLastError() != ERROR_SUCCESS) return false;
+    return SetWindowPos(window, nullptr, 0, 0, 640, 480,
+        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED) != FALSE;
+}
+
+bool has_fixed_windowed_style(HWND window) {
+    const LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
+    return !(style & (WS_POPUP | WS_THICKFRAME | WS_MAXIMIZEBOX)) && (style & WS_CAPTION);
+}
+
+}
 
 int main() {
     HWND window = CreateWindowExW(0, L"STATIC", L"", WS_OVERLAPPED, 0, 0, 8, 8,
@@ -109,6 +160,81 @@ int main() {
             if (selected.width != size[0] || selected.height != size[1] ||
                 output.width != static_cast<UINT>(monitor_width) || output.height != static_cast<UINT>(monitor_height) ||
                 actual.Width != output.width || actual.Height != output.height) return 12;
+        }
+        constexpr std::array<std::array<UINT, 2>, 4> resolutions = {{
+            {1280, 1024}, {1600, 900}, {1920, 1080}, {2560, 1440}
+        }};
+        const LONG_PTR borderless_style = GetWindowLongPtrW(window, GWL_STYLE);
+        for (std::size_t i = 0; i < resolutions.size(); ++i) {
+            const auto& size = resolutions[i];
+            sgl::Presentation configured;
+            const HRESULT initialized = configured.initialize(device.Get(), window, size[0], size[1], sgl::DisplayMode::Windowed);
+            if (!windowed_size_fits_monitor(window, size[0], size[1])) {
+                RECT unchanged = {};
+                if (initialized != HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) ||
+                    GetWindowLongPtrW(window, GWL_STYLE) != borderless_style || !GetWindowRect(window, &unchanged) ||
+                    unchanged.left != monitor.rcMonitor.left || unchanged.top != monitor.rcMonitor.top ||
+                    unchanged.right != monitor.rcMonitor.right || unchanged.bottom != monitor.rcMonitor.bottom) return 21;
+                continue;
+            }
+            if (FAILED(initialized) || configured.display_mode() != sgl::DisplayMode::Windowed) return 22;
+            const auto output = configured.output_size();
+            RECT windowed_client = {};
+            D3D11_TEXTURE2D_DESC actual = {};
+            configured.back_buffer()->GetDesc(&actual);
+            const LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
+            if (!GetClientRect(window, &windowed_client) || windowed_client.right - windowed_client.left != static_cast<LONG>(size[0]) ||
+                windowed_client.bottom - windowed_client.top != static_cast<LONG>(size[1]) || output.width != size[0] ||
+                output.height != size[1] || actual.Width != size[0] || actual.Height != size[1] ||
+                (style & WS_POPUP) || !(style & WS_CAPTION) || (style & WS_THICKFRAME) || (style & WS_MAXIMIZEBOX)) return 23;
+
+            if (!simulate_game_style_reset(window) || configured.set_render_size(size[0], size[1]) != S_OK ||
+                !GetClientRect(window, &windowed_client) ||
+                windowed_client.right - windowed_client.left != static_cast<LONG>(size[0]) ||
+                windowed_client.bottom - windowed_client.top != static_cast<LONG>(size[1]) ||
+                !has_fixed_windowed_style(window)) return 32;
+
+            const auto& next = resolutions[(i + 1) % resolutions.size()];
+            if (configured.set_render_size(800, 600) != E_INVALIDARG) return 24;
+            if (!windowed_size_fits_monitor(window, next[0], next[1])) {
+                if (!simulate_game_style_reset(window)) return 33;
+                if (configured.set_render_size(next[0], next[1]) != HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) ||
+                    configured.output_size().width != size[0] || configured.output_size().height != size[1] ||
+                    configured.render_size().width != size[0] || configured.render_size().height != size[1] ||
+                    !GetClientRect(window, &windowed_client) ||
+                    windowed_client.right - windowed_client.left != static_cast<LONG>(size[0]) ||
+                    windowed_client.bottom - windowed_client.top != static_cast<LONG>(size[1]) ||
+                    !has_fixed_windowed_style(window)) return 25;
+            } else if (!simulate_game_style_reset(window) || configured.set_render_size(next[0], next[1]) != S_OK) {
+                return 26;
+            }
+            const auto resized_output = configured.output_size();
+            if (windowed_size_fits_monitor(window, next[0], next[1]) &&
+                (resized_output.width != next[0] || resized_output.height != next[1] ||
+                    configured.render_size().width != next[0] || configured.render_size().height != next[1] ||
+                    !GetClientRect(window, &windowed_client) || windowed_client.right - windowed_client.left != static_cast<LONG>(next[0]) ||
+                    windowed_client.bottom - windowed_client.top != static_cast<LONG>(next[1]) ||
+                    !has_fixed_windowed_style(window))) return 27;
+            if (windowed_size_fits_monitor(window, next[0], next[1])) {
+                RECT before_failure = {};
+                if (!GetWindowRect(window, &before_failure)) return 29;
+                const FixedWindowSize fixed_size{before_failure.right - before_failure.left,
+                    before_failure.bottom - before_failure.top};
+                constexpr UINT_PTR subclass_id = 1;
+                if (!SetWindowSubclass(window, fixed_window_size_subclass, subclass_id,
+                    reinterpret_cast<DWORD_PTR>(&fixed_size))) return 30;
+                const HRESULT rejected = configured.set_render_size(size[0], size[1]);
+                const BOOL removed = RemoveWindowSubclass(window, fixed_window_size_subclass, subclass_id);
+                RECT after_failure = {};
+                const auto unchanged_output = configured.output_size();
+                const auto unchanged_render = configured.render_size();
+                if (!removed || rejected != E_FAIL || !GetWindowRect(window, &after_failure) ||
+                    std::memcmp(&before_failure, &after_failure, sizeof(RECT)) != 0 ||
+                    unchanged_output.width != next[0] || unchanged_output.height != next[1] ||
+                    unchanged_render.width != next[0] || unchanged_render.height != next[1]) return 31;
+            }
+            configured.close();
+            if (GetWindowLongPtrW(window, GWL_STYLE) != borderless_style) return 28;
         }
     }
     DestroyWindow(window);
