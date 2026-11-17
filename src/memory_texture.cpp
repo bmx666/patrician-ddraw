@@ -147,6 +147,12 @@ struct Screen {
     void* display = nullptr;
 };
 std::unique_ptr<Screen> screen;
+// City map ring buffer handle. The game's per-tile dirty-rect calculation in
+// FUN_005869a0 misses tiles at resolutions above 800x600, leaving stale ground
+// pixels in the map buffer where building sprites should be. When this handle is
+// set and the logical resolution exceeds the original 800x600, sprite draws into
+// the map buffer bypass the clipper so every visible tile is redrawn each frame.
+static void* city_map_buffer = nullptr;
 std::filesystem::path display_config_path;
 std::unique_ptr<Texture> wide_menu_background;
 std::string wide_menu_background_name;
@@ -911,6 +917,18 @@ static std::vector<RECT> draw_clip_rectangles(const sgl::DecodedImage& target) {
     std::vector<RECT> clips;
     try {
         const RECT bounds = texture_bounds(render_destination, target);
+        // R2 fix: the game's per-tile dirty-rect calculation (FUN_005869a0) misses
+        // tiles at resolutions above 800x600. When the render destination is the
+        // city map ring buffer and we are running at higher resolution, return the
+        // full map bounds so every sprite draw covers its target region. This
+        // replaces the game's broken per-tile clipper with a single full-surface
+        // rect, which is both correct and faster (one draw call per sprite instead
+        // of one per intersecting clipper rect).
+        if (city_map_buffer && render_destination == city_map_buffer &&
+            (view_state.logical_width > 800 || view_state.logical_height > 600)) {
+            if (nonempty(bounds)) clips.push_back(bounds);
+            return clips;
+        }
         if (clipping_mode == 0) {
             if (nonempty(bounds)) clips.push_back(bounds);
             return clips;
@@ -1378,7 +1396,10 @@ extern "C" void* __cdecl sgl_SetRenderDest(void* handle) {
             const auto offscreen = textures.find(screen->offscreen);
             if (offscreen != textures.end() &&
                 next->second->image.width + 284u == offscreen->second->image.width &&
-                next->second->image.height + 42u == offscreen->second->image.height) diagnostic_map_buffer = handle;
+                next->second->image.height + 42u == offscreen->second->image.height) {
+                diagnostic_map_buffer = handle;
+                city_map_buffer = handle;
+            }
         }
     }
     void* previous = render_destination;
@@ -2261,6 +2282,7 @@ extern "C" void __cdecl sgl_FreeMemoryTexture(void* handle) {
     if (render_source == handle) render_source = nullptr;
     if (render_destination == handle) render_destination = nullptr;
     if (diagnostic_map_buffer == handle) diagnostic_map_buffer = nullptr;
+    if (city_map_buffer == handle) city_map_buffer = nullptr;
     surface_renderer.forget(handle);
     textures.erase(entry);
 }
