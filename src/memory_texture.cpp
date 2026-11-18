@@ -13,8 +13,6 @@
 #include <climits>
 #include <cctype>
 #include <cmath>
-#include <cstdarg>
-#include <intrin.h>
 #include <cstddef>
 #include <cstring>
 #include <cstdio>
@@ -949,67 +947,94 @@ static HMODULE load_game_library(const wchar_t* name) {
     return LoadLibraryExW(full_path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
 }
 
-// City Map scroll redraw (R2). Patrician3.exe (SHA-256 FE436DC5...) scrolls the City Map view in the method at
-// 0x592E60: it moves the display onto itself and then marks only the newly exposed strip and per-column tile
-// slices for redraw. Above 800x600 that partial update misses building and wall slices, which then stay on
-// screen. The patch replaces the self-move sequence at 0x592FCF with a call to the game's own full-view
-// invalidation, 0x593910(true), the path a minimap jump takes, and returns from the scroll method. The game
-// then redraws the whole view each scroll step. It is applied only when the original bytes match exactly.
 static bool city_executable_verified = false;
-static constexpr bool city_scroll_full_redraw = true;
-static void patch_city_scroll_redraw() noexcept {
+
+static void verify_city_scroll_executable() noexcept {
     static constexpr std::uintptr_t address = 0x592FCF;
     static constexpr std::uint8_t original[] = {
         0x6A, 0xFD, 0xE8, 0xEA, 0x89, 0xF2, 0xFF, 0x6A, 0xFD, 0xE8, 0xD3, 0x89, 0xF2, 0xFF, 0x8B, 0x44,
         0x24, 0x18, 0x8B, 0x4C, 0x24, 0x1C, 0x8B, 0x54, 0x24, 0x20, 0x6A, 0x04, 0x57, 0x53, 0x55, 0x50,
         0x51, 0x52, 0xE8, 0x5A, 0x83, 0xF2, 0xFF};
-    // push 1; mov ecx, esi; call 0x593910; jmp 0x592E9E
-    static constexpr std::uint8_t replacement[] = {
-        0x6A, 0x01, 0x8B, 0xCE, 0xE8, 0x38, 0x09, 0x00, 0x00, 0xE9, 0xC1, 0xFE, 0xFF, 0xFF};
-    static bool attempted = false;
-    if (attempted) return;
-    attempted = true;
-    const auto module = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
-    if (module != 0x400000) return;
-    auto* code = reinterpret_cast<std::uint8_t*>(address);
+    if (reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)) != 0x400000) return;
+    auto* code = reinterpret_cast<const std::uint8_t*>(address);
     MEMORY_BASIC_INFORMATION region{};
     if (VirtualQuery(code, &region, sizeof(region)) != sizeof(region) || region.State != MEM_COMMIT ||
         reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize < address + sizeof(original)) return;
-    if (std::memcmp(code, original, sizeof(original)) != 0) {
-        OutputDebugStringA("Patrician III D3D11: City Map scroll patch skipped (unexpected executable)\n");
-        return;
-    }
-    city_executable_verified = true;
-    if (!city_scroll_full_redraw) return;
-    DWORD protection = 0;
-    if (!VirtualProtect(code, sizeof(original), PAGE_EXECUTE_READWRITE, &protection)) return;
-    std::memcpy(code, replacement, sizeof(replacement));
-    DWORD ignored = 0;
-    VirtualProtect(code, sizeof(original), protection, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), code, sizeof(original));
+    city_executable_verified = std::memcmp(code, original, sizeof(original)) == 0;
 }
 
-// City Map object overhang (R2). The City Map object pass (Patrician3.exe 0x591C50) visits tile rows from
-// ShadowClipCorrect rows above the view to ShadowClipCorrect + 1 rows below it. The configured value, 8 rows
-// of 11 pixels, was sized for the original screen; tall buildings anchored further below a taller view are
-// skipped although their sprites reach into it, leaving cut buildings and walls along the bottom edge that
-// scrolling then moves through the picture. Above 800x600 the value in the live view object (pointer at
-// 0x6E51AC, field +0x500) is raised to cover the tallest building sprites.
-static void widen_city_object_overhang() noexcept {
-    static constexpr std::int32_t original_rows = 8;
-    static constexpr std::int32_t widened_rows = 32;
-    if (!city_executable_verified || (view_state.logical_width <= 800 && view_state.logical_height <= 600)) return;
-    __try {
-        auto* const view = *reinterpret_cast<std::uint8_t* volatile*>(0x6E51AC);
-        if (!view) return;
-        auto* const rows = reinterpret_cast<volatile std::int32_t*>(view + 0x500);
-        if (*rows == original_rows) *rows = widened_rows;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+// City Map bottom band (R2). Three City Map passes in Patrician3.exe walk tile rows, 11 pixels apart, down to
+// the bottom of the view and then through a band below it. From each band cell they also step further down to
+// cells whose sprites reach up into the view: 0x590F30 renders the ground and terrain objects into the map
+// buffer, 0x591440 draws buildings and walls, and 0x590100 is the third pass with the same structure. Each
+// band ends at view bottom + [view+0x514] = 21 pixels, which holds two rows (one of each parity) unless the
+// view height is 1 modulo 11. The 2560x1440 City Map view is 1398 = 11 * 127 + 1 pixels high, so one row
+// parity below the bottom edge was skipped: every other column of mountains, buildings and walls entering at
+// the bottom was never drawn, and scrolling carried those gaps up through the picture. Each band end, at loop
+// entry and at the loop's back edge, is widened to 22 pixels. That always covers exactly two rows, so no row
+// is visited twice at any view height. The replacements keep every register value of the original sequence
+// except the band end, which is one larger.
+static void patch_city_bottom_band() noexcept {
+    struct Site {
+        std::uintptr_t address;
+        std::size_t size;
+        std::uint8_t original[17];
+        std::uint8_t replacement[17];
+    };
+    static constexpr Site sites[] = {
+        // 0x590100 pass, entry: mov eax,[esi+18]; mov ebp,[esi+514]; mov ebx,[esi+30]; add eax,ebp; add eax,ebx
+        // -> mov ebp,[esi+514]; mov ebx,[esi+30]; lea eax,[ebp+ebx+1]; add eax,[esi+18]
+        {0x590233, 16,
+            {0x8B, 0x46, 0x18, 0x8B, 0xAE, 0x14, 0x05, 0x00, 0x00, 0x8B, 0x5E, 0x30, 0x03, 0xC5, 0x03, 0xC3},
+            {0x8B, 0xAE, 0x14, 0x05, 0x00, 0x00, 0x8B, 0x5E, 0x30, 0x8D, 0x44, 0x1D, 0x01, 0x03, 0x46, 0x18}},
+        // 0x590100 pass, back edge: mov ecx,[esi+18]; lea eax,[eax+ebx*4]; mov ebx,[esi+30]; add ecx,ebp;
+        // xor dl,1; add ecx,ebx -> lea eax,[eax+ebx*4]; mov ebx,[esi+30]; xor dl,1; lea ecx,[ebp+ebx+1];
+        // add ecx,[esi+18]
+        {0x5904D1, 16,
+            {0x8B, 0x4E, 0x18, 0x8D, 0x04, 0x98, 0x8B, 0x5E, 0x30, 0x03, 0xCD, 0x80, 0xF2, 0x01, 0x03, 0xCB},
+            {0x8D, 0x04, 0x98, 0x8B, 0x5E, 0x30, 0x80, 0xF2, 0x01, 0x8D, 0x4C, 0x1D, 0x01, 0x03, 0x4E, 0x18}},
+        // Ground pass, entry: mov edx,[esi+30]; mov ebp,[esi+514]; mov edi,[esi+18]; add edx,ebp; add edx,edi
+        // -> mov ebp,[esi+514]; mov edi,[esi+18]; lea edx,[ebp+edi+1]; add edx,[esi+30]
+        {0x591039, 16,
+            {0x8B, 0x56, 0x30, 0x8B, 0xAE, 0x14, 0x05, 0x00, 0x00, 0x8B, 0x7E, 0x18, 0x03, 0xD5, 0x03, 0xD7},
+            {0x8B, 0xAE, 0x14, 0x05, 0x00, 0x00, 0x8B, 0x7E, 0x18, 0x8D, 0x54, 0x3D, 0x01, 0x03, 0x56, 0x30}},
+        // Ground pass, back edge: mov edx,[esi+30]; lea ebx,[ebx+ecx*4]; mov cl,[esp+13]; add edx,ebp; xor cl,1;
+        // add edx,edi -> lea ebx,[ebx+ecx*4]; mov cl,[esp+13]; xor cl,1; lea edx,[ebp+edi+1]; add edx,[esi+30]
+        {0x5912BD, 17,
+            {0x8B, 0x56, 0x30, 0x8D, 0x1C, 0x8B, 0x8A, 0x4C, 0x24, 0x13, 0x03, 0xD5, 0x80, 0xF1, 0x01, 0x03, 0xD7},
+            {0x8D, 0x1C, 0x8B, 0x8A, 0x4C, 0x24, 0x13, 0x80, 0xF1, 0x01, 0x8D, 0x54, 0x3D, 0x01, 0x03, 0x56, 0x30}},
+        // Building pass, entry: mov ecx,[esi+30]; mov eax,[esi+514]; mov ebx,[esi+18]; add ecx,eax; add ecx,ebx
+        // -> mov eax,[esi+514]; mov ebx,[esi+18]; lea ecx,[eax+ebx+1]; add ecx,[esi+30]
+        {0x591611, 16,
+            {0x8B, 0x4E, 0x30, 0x8B, 0x86, 0x14, 0x05, 0x00, 0x00, 0x8B, 0x5E, 0x18, 0x03, 0xC8, 0x03, 0xCB},
+            {0x8B, 0x86, 0x14, 0x05, 0x00, 0x00, 0x8B, 0x5E, 0x18, 0x8D, 0x4C, 0x18, 0x01, 0x03, 0x4E, 0x30}},
+        // Building pass, back edge: mov eax,[esi+30]; xor dl,1; add eax,ecx; mov [esp+14],edi; add eax,ebx
+        // -> lea eax,[ecx+ebx+1]; add eax,[esi+30]; xor dl,1; mov [esp+14],edi
+        {0x591940, 14,
+            {0x8B, 0x46, 0x30, 0x80, 0xF2, 0x01, 0x03, 0xC1, 0x89, 0x7C, 0x24, 0x14, 0x03, 0xC3},
+            {0x8D, 0x44, 0x19, 0x01, 0x03, 0x46, 0x30, 0x80, 0xF2, 0x01, 0x89, 0x7C, 0x24, 0x14}},
+    };
+    static bool attempted = false;
+    if (attempted || !city_executable_verified) return;
+    attempted = true;
+    for (const Site& site : sites) {
+        if (std::memcmp(reinterpret_cast<const void*>(site.address), site.original, site.size) != 0) {
+            OutputDebugStringA("Patrician III D3D11: City Map bottom band patch skipped (unexpected executable)\n");
+            return;
+        }
+    }
+    for (const Site& site : sites) {
+        auto* const code = reinterpret_cast<std::uint8_t*>(site.address);
+        DWORD protection = 0;
+        if (!VirtualProtect(code, site.size, PAGE_EXECUTE_READWRITE, &protection)) return;
+        std::memcpy(code, site.replacement, site.size);
+        DWORD ignored = 0;
+        VirtualProtect(code, site.size, protection, &ignored);
+        FlushInstructionCache(GetCurrentProcess(), code, site.size);
     }
 }
 
 extern "C" int __cdecl sgl_InitHardware() {
-    patch_city_scroll_redraw();
     std::lock_guard<std::mutex> lock(textures_mutex);
     if (hardware_initialized) return 1;
     try {
@@ -1038,6 +1063,8 @@ extern "C" int __cdecl sgl_InitHardware() {
 static void destroy_screen();
 
 extern "C" void* __cdecl sgl_InitScreen(HWND window, int fullscreen, const char*, const std::uint32_t* settings) {
+    verify_city_scroll_executable();
+    patch_city_bottom_band();
     if (!window || !IsWindow(window) || (fullscreen != 0 && fullscreen != 1) ||
         (settings && (!settings[0] || !settings[1] || settings[0] > INT_MAX || settings[1] > INT_MAX))) {
         report_screen_init_failure("invalid SGL screen arguments", "window, fullscreen flag, or dimensions rejected");
@@ -1209,270 +1236,11 @@ extern "C" void __cdecl sgl_ShotDown() {
     display_config_path.clear();
 }
 
-// Diagnostic surface dump: Scroll Lock, or Ctrl+Shift+F9, writes the City Map buffer, the offscreen
-// and display surfaces and every clipper to <game>/renderer-dumps/. It changes no rendering state.
-static void* diagnostic_map_buffer = nullptr;
-struct DiagnosticMapCopy { int sx, sy, dx, dy, width, height; };
-static std::array<DiagnosticMapCopy, 8> diagnostic_map_copies{};
-static std::size_t diagnostic_map_copy_count = 0;
-static std::array<DiagnosticMapCopy, 8> diagnostic_frame_copies{};
-static std::size_t diagnostic_frame_copy_count = 0;
-static unsigned long diagnostic_frame = 0;
-static unsigned long diagnostic_frame_copies_frame = 0;
-static bool diagnostic_key_down = false;
-static unsigned diagnostic_dump_index = 0;
-
-// Temporary R2 scroll trace: Ctrl+Shift+F10 records every clipper, render-target and City Map draw
-// call for the next frames and snapshots the City Map buffer after each scroll step. Remove with the
-// diagnostic dump once R2 is closed.
-static bool scroll_trace_active = false;
-static int scroll_trace_frames_left = 0;
-static unsigned scroll_trace_snapshots = 0;
-static unsigned scroll_trace_index = 0;
-static bool scroll_trace_key_down = false;
-static int scroll_trace_last_sx = -1;
-static int scroll_trace_last_sy = -1;
-static unsigned long scroll_trace_other_draws = 0;
-static std::string scroll_trace_log;
-static std::wstring scroll_trace_prefix;
-
-static std::string trace_tag(void* handle) {
-    if (!handle) return "null";
-    if (handle == diagnostic_map_buffer) return "MAP";
-    if (screen && handle == screen->offscreen) return "OFF";
-    if (screen && handle == screen->display) return "DSP";
-    char buffer[24];
-    std::snprintf(buffer, sizeof(buffer), "%p", handle);
-    return buffer;
-}
-
-static void trace(const char* format, ...) {
-    if (!scroll_trace_active) return;
-    char buffer[512];
-    va_list arguments;
-    va_start(arguments, format);
-    const int length = std::vsnprintf(buffer, sizeof(buffer), format, arguments);
-    va_end(arguments);
-    if (length <= 0) return;
-    try {
-        scroll_trace_log.append(buffer, std::min<std::size_t>(static_cast<std::size_t>(length), sizeof(buffer) - 1));
-        scroll_trace_log.push_back('\n');
-    } catch (...) {}
-}
-
-static bool trace_to_map() {
-    return scroll_trace_active && render_destination &&
-        (render_destination == diagnostic_map_buffer || (screen && render_destination == screen->offscreen));
-}
-static long long scroll_trace_last_signature = -1;
-static std::unordered_set<void*> scroll_trace_textures;
-static void trace_texture(void* handle) {
-    if (!scroll_trace_textures.insert(handle).second) return;
-    const auto entry = textures.find(handle);
-    if (entry == textures.end()) return;
-    const auto& texture = *entry->second;
-    trace("TEX %p name=%s fmt=%u size=%ux%u flags=0x%02X blend=%u keyed=%d key=%06X",
-        handle, texture.name.c_str(), static_cast<unsigned>(texture.image.format), texture.image.width, texture.image.height,
-        static_cast<unsigned>(texture.header[0x34]), static_cast<unsigned>(texture.header[0x37]), texture.keyed ? 1 : 0, texture.key);
-}
-
-static bool write_diagnostic_bitmap(const std::filesystem::path& path, void* handle, Texture& texture) {
-    auto& image = texture.image;
-    const std::uint32_t pixel_size = sgl::bytes_per_pixel(image.format);
-    if ((image.format != sgl::ImageFormat::Bgra32 && image.format != sgl::ImageFormat::Bgr24) ||
-        image.pixels.empty() || !image.width || !image.height || image.width > 16384u || image.height > 16384u ||
-        image.pitch < static_cast<std::uint64_t>(image.width) * pixel_size ||
-        static_cast<std::uint64_t>(image.pitch) * image.height > image.pixels.size()) return false;
-    if (FAILED(surface_renderer.synchronize_to_cpu(handle, image))) return false;
-    const std::uint32_t row_size = (image.width * 3u + 3u) & ~3u;
-    BITMAPFILEHEADER file_header{};
-    BITMAPINFOHEADER info_header{};
-    file_header.bfType = 0x4d42;
-    file_header.bfOffBits = static_cast<DWORD>(sizeof(file_header) + sizeof(info_header));
-    file_header.bfSize = file_header.bfOffBits + row_size * image.height;
-    info_header.biSize = sizeof(info_header);
-    info_header.biWidth = static_cast<LONG>(image.width);
-    info_header.biHeight = -static_cast<LONG>(image.height);
-    info_header.biPlanes = 1;
-    info_header.biBitCount = 24;
-    info_header.biCompression = BI_RGB;
-    info_header.biSizeImage = row_size * image.height;
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    if (!output) return false;
-    output.write(reinterpret_cast<const char*>(&file_header), sizeof(file_header));
-    output.write(reinterpret_cast<const char*>(&info_header), sizeof(info_header));
-    std::vector<std::uint8_t> row(row_size, 0);
-    for (std::uint32_t y = 0; y < image.height; ++y) {
-        const auto* source = image.pixels.data() + static_cast<std::size_t>(y) * image.pitch;
-        for (std::uint32_t x = 0; x < image.width; ++x)
-            std::memcpy(row.data() + static_cast<std::size_t>(x) * 3, source + static_cast<std::size_t>(x) * pixel_size, 3);
-        output.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size()));
-    }
-    return static_cast<bool>(output);
-}
-
-static void write_diagnostic_clipper(std::ofstream& output, const Clipper& clipper, const char* role) {
-    output << "clipper " << static_cast<const void*>(&clipper) << ' ' << role
-        << (&clipper == active_clipper ? " active" : "") << " count=" << clipper.rectangles.size() << '\n';
-    for (const RECT& rectangle : clipper.rectangles)
-        output << "  " << rectangle.left << ' ' << rectangle.top << ' ' << rectangle.right << ' ' << rectangle.bottom << '\n';
-}
-
-static bool write_diagnostic_bitmap(const std::filesystem::path& path, void* handle, Texture& texture);
-
-static void scroll_trace_snapshot(const char* reason) {
-    if (scroll_trace_snapshots >= 24 || !screen) return;
-    const auto directory = game_directory();
-    if (directory.empty()) return;
-    const auto write = [&](void* handle, const wchar_t* suffix) {
-        const auto entry = handle ? textures.find(handle) : textures.end();
-        if (entry == textures.end()) return 0;
-        const auto name = scroll_trace_prefix + L"-f" + std::to_wstring(diagnostic_frame) + suffix;
-        return write_diagnostic_bitmap(directory / L"renderer-dumps" / name, handle, *entry->second) ? 1 : 0;
-    };
-    const int map = write(diagnostic_map_buffer, L"-map.bmp");
-    const int offscreen = write(screen->offscreen, L"-off.bmp");
-    const int display = write(screen->display, L"-dsp.bmp");
-    ++scroll_trace_snapshots;
-    trace("SNAP frame=%lu reason=%s map=%d off=%d dsp=%d", diagnostic_frame, reason, map, offscreen, display);
-}
-
-static void scroll_trace_on_frame() {
-    const bool key_down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 && (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 &&
-        (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-    const bool pressed = key_down && !scroll_trace_key_down;
-    scroll_trace_key_down = key_down;
-    if (scroll_trace_active) {
-        trace("F %lu map=%p copies=%zu other_draws=%lu active_clipper=%p mode=%d", diagnostic_frame,
-            diagnostic_map_buffer, diagnostic_map_copy_count, scroll_trace_other_draws, static_cast<void*>(active_clipper), clipping_mode);
-        scroll_trace_other_draws = 0;
-        const std::size_t count = std::min(diagnostic_map_copy_count, diagnostic_map_copies.size());
-        for (std::size_t index = 0; index < count; ++index) {
-            const auto& copy = diagnostic_map_copies[index];
-            trace("  COPY %d %d %d %d %d %d", copy.sx, copy.sy, copy.dx, copy.dy, copy.width, copy.height);
-        }
-        if (count) {
-            long long signature = static_cast<long long>(count);
-            for (std::size_t index = 0; index < count; ++index) {
-                const auto& copy = diagnostic_map_copies[index];
-                signature = signature * 1000003LL + copy.sx * 7919LL + copy.sy * 104729LL + copy.dx * 31LL + copy.dy;
-            }
-            if (signature != scroll_trace_last_signature) {
-                if (scroll_trace_last_signature != -1) scroll_trace_snapshot("scroll");
-                scroll_trace_last_signature = signature;
-            }
-        }
-        if (--scroll_trace_frames_left <= 0) {
-            scroll_trace_snapshot("end");
-            scroll_trace_active = false;
-            try {
-                const auto directory = game_directory();
-                if (!directory.empty()) {
-                    std::ofstream output(directory / L"renderer-dumps" / (scroll_trace_prefix + L".txt"), std::ios::binary | std::ios::trunc);
-                    output.write(scroll_trace_log.data(), static_cast<std::streamsize>(scroll_trace_log.size()));
-                }
-            } catch (...) {}
-            scroll_trace_log.clear();
-            scroll_trace_log.shrink_to_fit();
-            MessageBeep(MB_ICONASTERISK);
-        }
-        return;
-    }
-    if (!pressed || !screen) return;
-    try {
-        const auto directory = game_directory();
-        if (directory.empty()) return;
-        std::error_code error;
-        std::filesystem::create_directories(directory / L"renderer-dumps", error);
-        scroll_trace_prefix = L"trace-" + std::to_wstring(GetTickCount()) + L"-" + std::to_wstring(++scroll_trace_index);
-        scroll_trace_log.clear();
-        scroll_trace_log.reserve(8u << 20);
-    } catch (...) { return; }
-    scroll_trace_active = true;
-    scroll_trace_frames_left = 120;
-    scroll_trace_snapshots = 0;
-    scroll_trace_last_sx = scroll_trace_last_sy = -1;
-    scroll_trace_last_signature = -1;
-    scroll_trace_other_draws = 0;
-    scroll_trace_textures.clear();
-    trace("TRACE start frame=%lu logical=%dx%d map=%p offscreen=%p display=%p", diagnostic_frame,
-        view_state.logical_width, view_state.logical_height, diagnostic_map_buffer, screen->offscreen, screen->display);
-    if (diagnostic_map_buffer) {
-        const auto entry = textures.find(diagnostic_map_buffer);
-        if (entry != textures.end()) trace("MAPSIZE %u %u", entry->second->image.width, entry->second->image.height);
-    }
-    scroll_trace_snapshot("start");
-    MessageBeep(MB_OK);
-}
-
-static void diagnostic_dump_on_hotkey() {
-    ++diagnostic_frame;
-    scroll_trace_on_frame();
-    if (diagnostic_map_copy_count) {
-        diagnostic_frame_copies = diagnostic_map_copies;
-        diagnostic_frame_copy_count = std::min(diagnostic_map_copy_count, diagnostic_map_copies.size());
-        diagnostic_frame_copies_frame = diagnostic_frame;
-        diagnostic_map_copy_count = 0;
-    }
-    const bool key_down = (GetAsyncKeyState(VK_SCROLL) & 0x8000) != 0 ||
-        ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 && (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 &&
-            (GetAsyncKeyState(VK_F9) & 0x8000) != 0);
-    const bool pressed = key_down && !diagnostic_key_down;
-    diagnostic_key_down = key_down;
-    if (!pressed || !screen) return;
-    try {
-        const auto directory = game_directory();
-        if (directory.empty()) return;
-        const auto folder = directory / L"renderer-dumps";
-        std::error_code error;
-        std::filesystem::create_directories(folder, error);
-        const std::wstring prefix = L"dump-" + std::to_wstring(GetTickCount()) + L"-" +
-            std::to_wstring(++diagnostic_dump_index);
-        std::ofstream output(folder / (prefix + L".txt"), std::ios::trunc);
-        if (!output) return;
-        const auto describe = [&](const char* role, const wchar_t* suffix, void* handle) {
-            const auto entry = handle ? textures.find(handle) : textures.end();
-            if (entry == textures.end()) {
-                output << role << " handle=" << handle << " missing\n";
-                return;
-            }
-            auto& texture = *entry->second;
-            const bool written = write_diagnostic_bitmap(folder / (prefix + suffix), handle, texture);
-            output << role << " handle=" << handle << " size=" << texture.image.width << 'x' << texture.image.height
-                << " pitch=" << texture.image.pitch << " format=" << static_cast<int>(texture.image.format)
-                << " locks=" << texture.locks << " external_locks=" << texture.external_locks
-                << " bitmap=" << (written ? "written" : "failed") << '\n';
-        };
-        output << "frame=" << diagnostic_frame << " logical=" << view_state.logical_width << 'x'
-            << view_state.logical_height << " clipping_mode=" << clipping_mode << " clip_rect=" << clip_rectangle[0]
-            << ' ' << clip_rectangle[1] << ' ' << clip_rectangle[2] << ' ' << clip_rectangle[3]
-            << " render_source=" << render_source << " render_destination=" << render_destination << '\n';
-        describe("map", L"-map.bmp", diagnostic_map_buffer);
-        describe("offscreen", L"-offscreen.bmp", screen->offscreen);
-        describe("display", L"-display.bmp", screen->display);
-        output << "map_to_screen_copies frame=" << diagnostic_frame_copies_frame << " count="
-            << diagnostic_frame_copy_count << " (sx sy dx dy width height)\n";
-        for (std::size_t index = 0; index < diagnostic_frame_copy_count; ++index) {
-            const auto& copy = diagnostic_frame_copies[index];
-            output << "  " << copy.sx << ' ' << copy.sy << ' ' << copy.dx << ' ' << copy.dy << ' '
-                << copy.width << ' ' << copy.height << '\n';
-        }
-        if (default_clipper) write_diagnostic_clipper(output, *default_clipper, "default");
-        for (const auto& entry : clippers) write_diagnostic_clipper(output, *entry.second, "created");
-        output.close();
-        MessageBeep(MB_OK);
-    } catch (...) {
-        OutputDebugStringA("Patrician III D3D11: diagnostic dump failed\n");
-    }
-}
-
 extern "C" int __cdecl sgl_SwapBuffer(std::uint32_t flags) {
     std::lock_guard<std::mutex> lock(textures_mutex);
     if (!screen || flags != 2) sgl::unimplemented("sgl_SwapBuffer state");
     fast_forward_overlay = false;
     sgl::refresh_accelerated_map_layout();
-    widen_city_object_overhang();
-    diagnostic_dump_on_hotkey();
     const auto& output = *textures.at(screen->display);
     if (FAILED(surface_renderer.present(screen->display, output.image))) sgl::unimplemented("sgl_SwapBuffer D3D11");
     const auto render_size = surface_renderer.screen_size();
@@ -1568,7 +1336,6 @@ extern "C" void* __cdecl sgl_SetRenderSource(void* handle) {
     if (handle && textures.find(handle) == textures.end()) sgl::unimplemented("sgl_SetRenderSource object");
     void* previous = render_source;
     render_source = handle;
-    trace("SS %s", trace_tag(handle).c_str());
     return external_handle(previous);
 }
 
@@ -1580,15 +1347,8 @@ extern "C" void* __cdecl sgl_SetRenderDest(void* handle) {
         next = textures.find(handle);
         if (next == textures.end()) sgl::unimplemented("sgl_SetRenderDest object");
         if (next->second->image.format == sgl::ImageFormat::Indexed8) handle = nullptr;
-        else if (screen && !is_screen_texture(handle)) {
-            const auto offscreen = textures.find(screen->offscreen);
-            if (offscreen != textures.end() &&
-                next->second->image.width + 284u == offscreen->second->image.width &&
-                next->second->image.height + 42u == offscreen->second->image.height) diagnostic_map_buffer = handle;
-        }
     }
     void* previous = render_destination;
-    trace("SD %s", trace_tag(handle).c_str());
     if (previous == handle) return external_handle(previous);
     if (previous) unlock_texture(*textures.at(previous));
     render_destination = nullptr;
@@ -1600,7 +1360,6 @@ extern "C" int __cdecl sgl_Set2dClippingMode(int mode) {
     std::lock_guard<std::mutex> lock(textures_mutex);
     const int previous = clipping_mode;
     clipping_mode = mode;
-    trace("CMODE %d", mode);
     return previous;
 }
 
@@ -1615,7 +1374,6 @@ extern "C" void* __cdecl sgl_CreateClipper() {
         auto clipper = std::make_unique<Clipper>();
         void* handle = clipper.get();
         clippers.emplace(handle, std::move(clipper));
-        trace("CCREATE %p", handle);
         return handle;
     } catch (const std::bad_alloc&) { return nullptr; }
 }
@@ -1632,7 +1390,6 @@ extern "C" void* __cdecl sgl_SetActiveClipper(void* handle) {
         if (found == clippers.end()) sgl::unimplemented("sgl_SetActiveClipper object");
         active_clipper = found->second.get();
     }
-    trace("CACTIVE %p prev=%p n=%zu", static_cast<void*>(active_clipper), static_cast<void*>(previous), active_clipper->rectangles.size());
     return previous;
 }
 
@@ -1643,7 +1400,6 @@ extern "C" void __cdecl sgl_FreeClipper(void* handle) {
     const auto found = clippers.find(handle);
     if (found == clippers.end()) sgl::unimplemented("sgl_FreeClipper object");
     if (active_clipper == handle) active_clipper = default_clipper.get();
-    trace("CFREE %p", handle);
     clippers.erase(found);
 }
 
@@ -1666,7 +1422,6 @@ extern "C" void __cdecl sgl_CopyClipper(void* source_handle) {
     try {
         auto rectangles = source->rectangles;
         destination->rectangles.swap(rectangles);
-        trace("CCOPY %p->%p n=%zu", static_cast<void*>(source), static_cast<void*>(destination), destination->rectangles.size());
     } catch (const std::bad_alloc&) {
         sgl::unimplemented("sgl_CopyClipper allocation");
     } catch (const std::length_error&) {
@@ -1682,8 +1437,6 @@ static void change_clip(const RECT* rectangle, int operation) {
     try {
         auto combined = combine_clip_rectangles(clipper->rectangles, *rectangle, operation);
         clipper->rectangles.swap(combined);
-        trace("%s %ld %ld %ld %ld c=%p n=%zu", operation == RGN_OR ? "AC" : (operation == RGN_DIFF ? "SC" : "XC"),
-            rectangle->left, rectangle->top, rectangle->right, rectangle->bottom, static_cast<void*>(clipper), clipper->rectangles.size());
     } catch (const std::bad_alloc&) {
         sgl::unimplemented("clip rectangle allocation");
     } catch (const std::length_error&) {
@@ -1691,38 +1444,33 @@ static void change_clip(const RECT* rectangle, int operation) {
     }
 }
 
-extern "C" void __cdecl sgl_AddClipRect_r(const RECT* rect) { trace("RA %p", _ReturnAddress()); change_clip(rect, RGN_OR); }
-extern "C" void __cdecl sgl_SubClipRect_r(const RECT* rect) { trace("RA %p", _ReturnAddress()); change_clip(rect, RGN_DIFF); }
-extern "C" void __cdecl sgl_AddClipRect_4i(int l, int t, int r, int b) { trace("RA %p", _ReturnAddress()); const RECT rect{l, t, r, b}; change_clip(&rect, RGN_OR); }
-extern "C" void __cdecl sgl_SubClipRect_4i(int l, int t, int r, int b) { trace("RA %p", _ReturnAddress()); const RECT rect{l, t, r, b}; change_clip(&rect, RGN_DIFF); }
+extern "C" void __cdecl sgl_AddClipRect_r(const RECT* rect) { change_clip(rect, RGN_OR); }
+extern "C" void __cdecl sgl_SubClipRect_r(const RECT* rect) { change_clip(rect, RGN_DIFF); }
+extern "C" void __cdecl sgl_AddClipRect_4i(int l, int t, int r, int b) { const RECT rect{l, t, r, b}; change_clip(&rect, RGN_OR); }
+extern "C" void __cdecl sgl_SubClipRect_4i(int l, int t, int r, int b) { const RECT rect{l, t, r, b}; change_clip(&rect, RGN_DIFF); }
 
 extern "C" void __cdecl sgl_ResetClipper() {
     std::lock_guard<std::mutex> lock(textures_mutex);
     get_active_clipper()->rectangles.clear();
-    trace("CRESET %p", static_cast<void*>(active_clipper));
 }
 
 extern "C" int __cdecl sgl_IsRectInClippingRegion(const RECT* rect) {
     if (!rect) sgl::unimplemented("sgl_IsRectInClippingRegion rectangle");
     std::lock_guard<std::mutex> lock(textures_mutex);
-    int result = 1;
-    if (clipping_mode == 1) result = rect->left < clip_rectangle[2] && rect->right > clip_rectangle[0] &&
+    if (clipping_mode == 1) return rect->left < clip_rectangle[2] && rect->right > clip_rectangle[0] &&
         rect->top < clip_rectangle[3] && rect->bottom > clip_rectangle[1];
-    else if (clipping_mode == 2 || clipping_mode == 3) {
+    if (clipping_mode == 2 || clipping_mode == 3) {
         const auto& regions = get_active_clipper()->rectangles;
-        result = std::any_of(regions.begin(), regions.end(), [&](const RECT& region) {
+        return std::any_of(regions.begin(), regions.end(), [&](const RECT& region) {
             return intersects(region, *rect);
         });
     }
-    trace("IR %ld %ld %ld %ld -> %d mode=%d dst=%s", rect->left, rect->top, rect->right, rect->bottom, result, clipping_mode,
-        trace_tag(render_destination).c_str());
-    return result;
+    return 1;
 }
 
 extern "C" void __cdecl sgl_SetClipRect_4i(int left, int top, int right, int bottom) {
     std::lock_guard<std::mutex> lock(textures_mutex);
     clip_rectangle = {left, top, right, bottom};
-    trace("CRECT %d %d %d %d", left, top, right, bottom);
 }
 
 extern "C" void __cdecl sgl_SetClipRect(int left, int top, int right, int bottom) {
@@ -1913,7 +1661,6 @@ extern "C" std::uint32_t __cdecl sgl_SetBlendMode(std::uint32_t mode) {
 extern "C" void __cdecl sgl_ClearBuffer(std::uint32_t flags, std::uint32_t color, float) {
     std::lock_guard<std::mutex> lock(textures_mutex);
     if (flags > 3) sgl::unimplemented("sgl_ClearBuffer flags");
-    trace("CLEAR %s f=%u c=%08x", trace_tag(render_destination).c_str(), flags, color);
     if (!(flags & 1)) return;
     const auto entry = textures.find(render_destination);
     if (entry == textures.end() || entry->second->image.format == sgl::ImageFormat::Indexed8)
@@ -1930,7 +1677,6 @@ extern "C" void __cdecl sgl_ClearBuffer(std::uint32_t flags, std::uint32_t color
 
 extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
     std::lock_guard<std::mutex> lock(textures_mutex);
-    if (trace_to_map()) trace("FILL %d %d %d %d", x, y, width, height);
     const auto entry = textures.find(render_destination);
     if (entry == textures.end()) sgl::unimplemented("sgl_FillSolidRect destination not selected");
     if (width <= 0 || height <= 0) return;
@@ -2032,10 +1778,6 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
     if (sx < 0 || sy < 0 || width < 0 || height < 0 || dw < 0 || dh < 0)
         sgl::unimplemented("sgl_DrawBitmapRect invalid rectangle");
     if (width == 0 || height == 0 || dw == 0 || dh == 0) return;
-    if (diagnostic_map_buffer && render_source == diagnostic_map_buffer && is_screen_texture(render_destination)) {
-        diagnostic_map_copies[diagnostic_map_copy_count % diagnostic_map_copies.size()] = {sx, sy, dx, dy, width, height};
-        ++diagnostic_map_copy_count;
-    }
     const bool full_map = is_fast_forward_map(source->second->name.c_str()) && is_screen_texture(render_destination) &&
         sx == 0 && sy == 0 && width == dw && height == dh &&
         ((width == 1280 && height == 1024) ||
@@ -2169,41 +1911,17 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
 }
 
 extern "C" void __cdecl sgl_DrawBitmapRect(int sx, int sy, int dx, int dy, int width, int height) {
-    if (trace_to_map() && render_destination != diagnostic_map_buffer) {
-        trace("RA %p", _ReturnAddress());
-        void* frames[16]{};
-        const USHORT count = RtlCaptureStackBackTrace(1, 16, frames, nullptr);
-        std::uintptr_t key = 0;
-        for (USHORT index = 0; index < count; ++index) key = key * 131u + reinterpret_cast<std::uintptr_t>(frames[index]);
-        if (scroll_trace_textures.insert(reinterpret_cast<void*>(key | 1u)).second) {
-            std::string chain;
-            char item[16];
-            for (USHORT index = 0; index < count; ++index) {
-                std::snprintf(item, sizeof(item), " %p", frames[index]);
-                chain += item;
-            }
-            trace("STK%s", chain.c_str());
-        }
-    }
-    if (trace_to_map()) trace_texture(render_source);
-    if (trace_to_map()) trace("DB %s>%s %d %d %d %d %d %d n=%zu", trace_tag(render_source).c_str(), trace_tag(render_destination).c_str(),
-        sx, sy, dx, dy, width, height, get_active_clipper()->rectangles.size());
-    else if (scroll_trace_active) ++scroll_trace_other_draws;
     draw_bitmap(sx, sy, dx, dy, width, height, width, height);
 }
 
 extern "C" void __cdecl sgl_StretchBitmapRect(int sx, int sy, int dx, int dy,
     int width, int height, int dw, int dh) {
-    if (trace_to_map()) trace("DS %s>%s %d %d %d %d %d %d %d %d", trace_tag(render_source).c_str(), trace_tag(render_destination).c_str(), sx, sy, dx, dy, width, height, dw, dh);
-    else if (scroll_trace_active) ++scroll_trace_other_draws;
     draw_bitmap(sx, sy, dx, dy, width, height, dw, dh);
 }
 
 extern "C" int __cdecl sgl_DrawBitmapRectWithAlphaMask(std::uint32_t mask_handle,
     int sx, int sy, int dx, int dy, int width, int height) {
     std::lock_guard<std::mutex> lock(textures_mutex);
-    if (trace_to_map()) trace("DA %s>%s %d %d %d %d %d %d", trace_tag(render_source).c_str(), trace_tag(render_destination).c_str(),
-        sx, sy, dx, dy, width, height);
     const auto source = textures.find(render_source);
     const auto target = textures.find(render_destination);
     const auto mask_id = reinterpret_cast<void*>(static_cast<std::uintptr_t>(mask_handle));
@@ -2475,17 +2193,12 @@ static void blit_bitmap(int sx, int sy, int dx, int dy, int width, int height, s
 
 extern "C" void __cdecl sgl_Blt(int sx, int sy, int dx, int dy, int width, int height, std::uint32_t flags) {
     std::lock_guard<std::mutex> lock(textures_mutex);
-    trace("RA %p", _ReturnAddress());
-    trace("BLT %s->%s %d %d %d %d %d %d f=%u", trace_tag(render_source).c_str(), trace_tag(render_destination).c_str(),
-        sx, sy, dx, dy, width, height, flags);
     blit_bitmap(sx, sy, dx, dy, width, height, flags);
 }
 
 extern "C" void __cdecl sgl_Blt_RC(std::uint32_t flags) {
     std::lock_guard<std::mutex> lock(textures_mutex);
     if (flags != 0 && flags != 2) sgl::unimplemented("sgl_Blt_RC flags");
-    trace("BLTRC %s->%s f=%u n=%zu", trace_tag(render_source).c_str(), trace_tag(render_destination).c_str(), flags,
-        get_active_clipper()->rectangles.size());
     const auto source = textures.find(render_source);
     const auto target = textures.find(render_destination);
     if (source == textures.end() || target == textures.end()) sgl::unimplemented("sgl_Blt_RC state");
@@ -2510,7 +2223,6 @@ extern "C" void __cdecl sgl_FreeMemoryTexture(void* handle) {
     if (entry == textures.end()) sgl::unimplemented("sgl_FreeMemoryTexture object");
     if (render_source == handle) render_source = nullptr;
     if (render_destination == handle) render_destination = nullptr;
-    if (diagnostic_map_buffer == handle) diagnostic_map_buffer = nullptr;
     surface_renderer.forget(handle);
     textures.erase(entry);
 }
