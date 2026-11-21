@@ -10,17 +10,26 @@
 
 namespace sgl {
 
+// Renderer work between two presents: compositor draws, GPU-to-CPU readbacks, CPU-to-GPU texture uploads and the
+// bytes those two transfers moved.
+struct FrameCounters {
+    unsigned draws = 0;
+    unsigned readbacks = 0;
+    unsigned uploads = 0;
+    unsigned long long transfer_bytes = 0;
+};
+
 // Frame statistics drawn into the top-left corner of the presented image: frames per second, average frame time
 // and the longest frame of the last half second, measured between presents.
 class FpsOverlay {
 public:
-    void frame_presented() noexcept;
+    void frame_presented(const FrameCounters& counters = {}) noexcept;
     HRESULT draw(ID3D11Device* device, ID3D11DeviceContext* context, Compositor& compositor,
         ID3D11RenderTargetView* target, UINT target_width, UINT target_height) noexcept;
     void reset() noexcept;
     const std::string& text() const noexcept { return text_; }
 
-    static constexpr UINT max_characters = 32;
+    static constexpr UINT max_characters = 56;
     static constexpr UINT glyph_width = 5;
     static constexpr UINT glyph_height = 7;
     static constexpr UINT padding = 2;
@@ -31,6 +40,7 @@ public:
 
 private:
     void update_text(double fps, double average_ms, double longest_ms) noexcept;
+    FrameCounters totals_{};
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> texture_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view_;

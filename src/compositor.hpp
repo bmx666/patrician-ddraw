@@ -17,7 +17,9 @@ struct Rect {
 // PresentSharp: final output scaling. Nearest texel, blended only across the one output pixel that
 // straddles a texel edge, so non-integer scale factors keep even pixel widths without blurring.
 enum class Sampling { Center, SglFixedPoint, SglBilinear, PresentSharp };
-enum class BlendMode { Opaque, Alpha, Multiply, MultiplyModulated, Multiply2, Additive, AdditiveModulated, AlphaMask };
+// FillAlpha reproduces sgl_FillSolidRect's translucent fill: (source * a >> 8) + (background * (255 - a) >> 8), with a
+// taken from the modulation alpha.
+enum class BlendMode { Opaque, Alpha, Multiply, MultiplyModulated, Multiply2, Additive, AdditiveModulated, AlphaMask, FillAlpha };
 
 class Compositor {
 public:
@@ -65,6 +67,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11PixelShader> multiply_pixel_shader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> multiply_modulated_pixel_shader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> multiply2_pixel_shader_;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> fill_alpha_pixel_shader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> additive_pixel_shader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> additive_modulated_pixel_shader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> indexed_shader_;

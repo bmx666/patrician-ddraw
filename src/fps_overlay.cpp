@@ -23,6 +23,8 @@ constexpr Glyph glyphs[] = {
     {'f', {0x06, 0x09, 0x08, 0x1c, 0x08, 0x08, 0x08}}, {'p', {0x00, 0x00, 0x1e, 0x11, 0x1e, 0x10, 0x10}},
     {'s', {0x00, 0x00, 0x0f, 0x10, 0x0e, 0x01, 0x1e}}, {'m', {0x00, 0x00, 0x1a, 0x15, 0x15, 0x11, 0x11}},
     {'a', {0x00, 0x00, 0x0e, 0x01, 0x0f, 0x11, 0x0f}}, {'x', {0x00, 0x00, 0x11, 0x0a, 0x04, 0x0a, 0x11}},
+    {'d', {0x01, 0x01, 0x0d, 0x13, 0x11, 0x11, 0x0f}}, {'r', {0x00, 0x00, 0x16, 0x19, 0x10, 0x10, 0x10}},
+    {'b', {0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x1e}}, {'u', {0x00, 0x00, 0x11, 0x11, 0x11, 0x13, 0x0d}},
 };
 
 const Glyph* find_glyph(char character) noexcept {
@@ -45,9 +47,10 @@ void FpsOverlay::reset() noexcept {
     pixels_dirty_ = true;
     previous_ = window_start_ = longest_ = 0;
     frames_ = 0;
+    totals_ = {};
 }
 
-void FpsOverlay::frame_presented() noexcept {
+void FpsOverlay::frame_presented(const FrameCounters& counters) noexcept {
     if (!frequency_) {
         LARGE_INTEGER frequency{};
         QueryPerformanceFrequency(&frequency);
@@ -57,6 +60,10 @@ void FpsOverlay::frame_presented() noexcept {
     if (previous_) {
         longest_ = std::max(longest_, current - previous_);
         ++frames_;
+        totals_.draws += counters.draws;
+        totals_.readbacks += counters.readbacks;
+        totals_.uploads += counters.uploads;
+        totals_.transfer_bytes += counters.transfer_bytes;
     } else {
         window_start_ = current;
     }
@@ -68,12 +75,16 @@ void FpsOverlay::frame_presented() noexcept {
         window_start_ = current;
         longest_ = 0;
         frames_ = 0;
+        totals_ = {};
     }
 }
 
 void FpsOverlay::update_text(double fps, double average_ms, double longest_ms) noexcept {
     char buffer[max_characters + 1] = {};
-    std::snprintf(buffer, sizeof(buffer), "%.0f fps %.1f ms max %.1f", fps, average_ms, longest_ms);
+    const double frames = frames_ ? static_cast<double>(frames_) : 1.0;
+    std::snprintf(buffer, sizeof(buffer), "%.0f fps %.1f ms max %.1f dr %.0f rb %.1f up %.1f mb %.1f", fps, average_ms,
+        longest_ms, totals_.draws / frames, totals_.readbacks / frames, totals_.uploads / frames,
+        static_cast<double>(totals_.transfer_bytes) / frames / 1048576.0);
     text_ = buffer;
     pixels_dirty_ = true;
 }

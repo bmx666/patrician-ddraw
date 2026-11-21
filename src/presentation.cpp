@@ -470,10 +470,10 @@ HRESULT Presentation::draw(ID3D11DeviceContext* context, Compositor& compositor,
     return fps_overlay_.draw(device_.Get(), context, compositor, target_.Get(), output_width_, output_height_);
 }
 
-HRESULT Presentation::present() noexcept {
+HRESULT Presentation::present(const FrameCounters& counters) noexcept {
     if (!swap_chain_) return E_UNEXPECTED;
     const HRESULT hr = swap_chain_->Present(1, 0);
-    if (SUCCEEDED(hr) && show_fps_) fps_overlay_.frame_presented();
+    if (SUCCEEDED(hr) && show_fps_) fps_overlay_.frame_presented(counters);
     return hr;
 }
 

@@ -150,6 +150,12 @@ float4 multiply2_pixel_main(Vertex input) : SV_Target {
     int4 background = int4(round(saturate(background_texture.Load(int3(uint2(input.position.xy), 0))) * 255));
     return float4(min((source * background * 2) >> 8, 255)) / 255.0;
 }
+float4 fill_alpha_pixel_main(Vertex input) : SV_Target {
+    int3 source = int3(round(saturate(sample_pixel(input).rgb) * 255));
+    int alpha = int(round(saturate(modulation_color.a) * 255));
+    int3 background = int3(round(saturate(background_texture.Load(int3(uint2(input.position.xy), 0)).rgb) * 255));
+    return float4(((source * alpha) >> 8) + ((background * (255 - alpha)) >> 8), 255) / 255.0;
+}
 uint2 indexed_pixel(Vertex input) {
     uint width, height;
     index_texture.GetDimensions(width, height);
@@ -250,6 +256,7 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     ComPtr<ID3DBlob> multiply_pixel_code;
     ComPtr<ID3DBlob> multiply_modulated_pixel_code;
     ComPtr<ID3DBlob> multiply2_pixel_code;
+    ComPtr<ID3DBlob> fill_alpha_pixel_code;
     ComPtr<ID3DBlob> additive_pixel_code;
     ComPtr<ID3DBlob> additive_modulated_pixel_code;
     ComPtr<ID3DBlob> indexed_code;
@@ -267,6 +274,7 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     ComPtr<ID3D11PixelShader> multiply_pixel_shader;
     ComPtr<ID3D11PixelShader> multiply_modulated_pixel_shader;
     ComPtr<ID3D11PixelShader> multiply2_pixel_shader;
+    ComPtr<ID3D11PixelShader> fill_alpha_pixel_shader;
     ComPtr<ID3D11PixelShader> additive_pixel_shader;
     ComPtr<ID3D11PixelShader> additive_modulated_pixel_shader;
     ComPtr<ID3D11PixelShader> indexed_shader;
@@ -301,6 +309,9 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     if (FAILED(result)) return result;
     result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "multiply2_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &multiply2_pixel_code, nullptr);
+    if (FAILED(result)) return result;
+    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+        "fill_alpha_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &fill_alpha_pixel_code, nullptr);
     if (FAILED(result)) return result;
     result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "additive_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &additive_pixel_code, nullptr);
@@ -377,6 +388,9 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     result = device->CreatePixelShader(multiply2_pixel_code->GetBufferPointer(), multiply2_pixel_code->GetBufferSize(),
         nullptr, &multiply2_pixel_shader);
     if (FAILED(result)) return result;
+    result = device->CreatePixelShader(fill_alpha_pixel_code->GetBufferPointer(), fill_alpha_pixel_code->GetBufferSize(),
+        nullptr, &fill_alpha_pixel_shader);
+    if (FAILED(result)) return result;
     result = device->CreatePixelShader(additive_pixel_code->GetBufferPointer(), additive_pixel_code->GetBufferSize(),
         nullptr, &additive_pixel_shader);
     if (FAILED(result)) return result;
@@ -413,6 +427,7 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     multiply_pixel_shader_ = multiply_pixel_shader;
     multiply_modulated_pixel_shader_ = multiply_modulated_pixel_shader;
     multiply2_pixel_shader_ = multiply2_pixel_shader;
+    fill_alpha_pixel_shader_ = fill_alpha_pixel_shader;
     additive_pixel_shader_ = additive_pixel_shader;
     additive_modulated_pixel_shader_ = additive_modulated_pixel_shader;
     indexed_shader_ = indexed_shader;
@@ -483,15 +498,17 @@ HRESULT Compositor::copy_impl(ID3D11DeviceContext* context, ID3D11RenderTargetVi
     };
     if (failure_stage) *failure_stage = "compositor parameter validation";
     if (!context || !target || !source || !device_ || !vertex_shader_ || !pixel_shader_ || !keyed_pixel_shader_ ||
-        !alpha_pixel_shader_ || !multiply_pixel_shader_ || !multiply_modulated_pixel_shader_ || !multiply2_pixel_shader_ ||
+        !alpha_pixel_shader_ || !multiply_pixel_shader_ || !multiply_modulated_pixel_shader_ || !multiply2_pixel_shader_ || !fill_alpha_pixel_shader_ ||
         !additive_pixel_shader_ || !additive_modulated_pixel_shader_ || !constants_ || !indexed_shader_ || !keyed_indexed_shader_ ||
         !alpha_indexed_shader_ || !multiply_indexed_shader_ || !multiply_modulated_indexed_shader_ || !additive_indexed_shader_ ||
         !additive_modulated_indexed_shader_ || !alpha_masked_indexed_shader_ || !sampler_ || !present_sampler_ || !rasterizer_ || !target_width || !target_height ||
         !valid_rect(source_rect) || !valid_rect(destination_rect)) return fail("compositor invalid/null inputs or rectangles", E_INVALIDARG);
     if (blend != BlendMode::Opaque && blend != BlendMode::Alpha && blend != BlendMode::Multiply &&
         blend != BlendMode::MultiplyModulated && blend != BlendMode::Multiply2 &&
-        blend != BlendMode::Additive && blend != BlendMode::AdditiveModulated && blend != BlendMode::AlphaMask)
+        blend != BlendMode::Additive && blend != BlendMode::AdditiveModulated && blend != BlendMode::AlphaMask &&
+        blend != BlendMode::FillAlpha)
         return fail("unsupported compositor blend mode", E_INVALIDARG);
+    if (blend == BlendMode::FillAlpha && palette) return fail("fill blend requires a BGRA source", E_INVALIDARG);
     if ((blend == BlendMode::Opaque) != (background == nullptr) ||
         (blend != BlendMode::Opaque && color_key) ||
         (blend != BlendMode::Opaque && palette && blend != BlendMode::Alpha && blend != BlendMode::Multiply &&
@@ -734,6 +751,7 @@ HRESULT Compositor::copy_impl(ID3D11DeviceContext* context, ID3D11RenderTargetVi
         blend == BlendMode::MultiplyModulated ? multiply_modulated_pixel_shader_.Get() :
         blend == BlendMode::Multiply ? multiply_pixel_shader_.Get() :
         blend == BlendMode::Multiply2 ? multiply2_pixel_shader_.Get() :
+        blend == BlendMode::FillAlpha ? fill_alpha_pixel_shader_.Get() :
         blend == BlendMode::AdditiveModulated ? additive_modulated_pixel_shader_.Get() :
         blend == BlendMode::Additive ? additive_pixel_shader_.Get() :
         color_key ? keyed_pixel_shader_.Get() : pixel_shader_.Get();

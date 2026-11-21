@@ -20,6 +20,8 @@ public:
         const char** failure_stage = nullptr) noexcept;
     HRESULT synchronize_to_cpu(void* id, DecodedImage& image) noexcept;
     void mark_cpu_modified(void* id) noexcept;
+    // True when the GPU copy of a surface is newer than its CPU pixels, so CPU access would need a readback.
+    bool gpu_holds_newer_pixels(void* id) const noexcept;
     void mark_palette_modified(void* id) noexcept;
     void forget(void* id) noexcept;
     HRESULT open_screen(HWND window, const std::filesystem::path& config, std::string& error);
@@ -46,6 +48,8 @@ private:
         bool cpu_needs_upload = true;
         bool cpu_needs_readback = false;
         bool palette_needs_upload = true;
+        // Bounds of the GPU writes not yet copied to the CPU pixels; readback copies only this region.
+        RECT gpu_dirty{};
     };
     HRESULT surface(void* id, const DecodedImage& image, Surface*& result) noexcept;
     HRESULT upload_cpu_image(Surface& surface, const DecodedImage& image) noexcept;
@@ -59,6 +63,8 @@ private:
     Compositor compositor_;
     Presentation presentation_;
     std::unordered_map<void*, Surface> surfaces_;
+    FrameCounters counters_{};
+    ID3D11Resource* bound_target_ = nullptr;
 };
 
 }

@@ -25,7 +25,7 @@ public:
     void close() noexcept;
     HRESULT draw(ID3D11DeviceContext* context, Compositor& compositor, ID3D11ShaderResourceView* source,
         Rect source_rect, Rect render_rect) noexcept;
-    HRESULT present() noexcept;
+    HRESULT present(const FrameCounters& counters = {}) noexcept;
     ID3D11Texture2D* back_buffer() const noexcept { return back_buffer_.Get(); }
     DisplaySize render_size() const noexcept { return {render_width_, render_height_}; }
     DisplaySize output_size() const noexcept { return {output_width_, output_height_}; }

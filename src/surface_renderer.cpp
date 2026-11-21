@@ -1,5 +1,7 @@
 #include "surface_renderer.hpp"
+#include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <new>
@@ -114,8 +116,11 @@ HRESULT SurfaceRenderer::upload_cpu_image(Surface& surface, const DecodedImage& 
         const HRESULT hr = as_bgra(image, converted, pixels, pitch);
         if (FAILED(hr)) return hr;
         context_->UpdateSubresource(surface.texture.Get(), 0, nullptr, pixels, pitch, 0);
+        ++counters_.uploads;
+        counters_.transfer_bytes += static_cast<unsigned long long>(pitch) * image.height;
         surface.cpu_needs_upload = false;
         surface.cpu_needs_readback = false;
+        surface.gpu_dirty = {};
     }
     if (surface.palette && surface.palette_needs_upload && !image.palette.empty()) {
         if (image.palette.size() != 1024) return E_INVALIDARG;
@@ -182,7 +187,12 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
     src = &surfaces_.at(source_id);
     if (mask) mask_surface = &surfaces_.at(mask_id);
     dst = &surfaces_.at(target_id);
-    context_->OMSetRenderTargets(0, nullptr, nullptr);
+    // The previous draw leaves its target bound. Unbind it only when this draw reads it; binding a bound render
+    // target as a shader resource would silently null the input, while re-binding per draw costs driver time.
+    if (bound_target_ && (bound_target_ == src->texture.Get() || (mask && bound_target_ == mask_surface->texture.Get()))) {
+        context_->OMSetRenderTargets(0, nullptr, nullptr);
+        bound_target_ = nullptr;
+    }
     if (failure_stage) *failure_stage = "source texture upload";
     hr = upload_cpu_image(*src, source);
     if (FAILED(hr)) return hr;
@@ -249,7 +259,25 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
             modulation_color, blend, failure_stage, &renderer_source);
     }
     if (FAILED(hr)) return hr;
-    context_->OMSetRenderTargets(0, nullptr, nullptr);
+    ++counters_.draws;
+    bound_target_ = dst->texture.Get();
+    {
+        const auto bound = [](float value, LONG low, LONG high, bool up) {
+            const float rounded = up ? std::ceil(value) : std::floor(value);
+            return std::clamp(static_cast<LONG>(std::clamp(rounded, -1.0e9f, 1.0e9f)), low, high);
+        };
+        const LONG width = static_cast<LONG>(target.width), height = static_cast<LONG>(target.height);
+        const RECT written{std::max(bound(target_rect.left, 0, width, false), std::clamp<LONG>(clip.left, 0, width)),
+            std::max(bound(target_rect.top, 0, height, false), std::clamp<LONG>(clip.top, 0, height)),
+            std::min(bound(target_rect.right, 0, width, true), std::clamp<LONG>(clip.right, 0, width)),
+            std::min(bound(target_rect.bottom, 0, height, true), std::clamp<LONG>(clip.bottom, 0, height))};
+        if (written.left < written.right && written.top < written.bottom) {
+            auto& dirty = dst->gpu_dirty;
+            if (dirty.left >= dirty.right || dirty.top >= dirty.bottom) dirty = written;
+            else dirty = {std::min(dirty.left, written.left), std::min(dirty.top, written.top),
+                std::max(dirty.right, written.right), std::max(dirty.bottom, written.bottom)};
+        }
+    }
     dst->cpu_needs_upload = false;
     dst->cpu_needs_readback = true;
     return S_OK;
@@ -265,10 +293,20 @@ HRESULT SurfaceRenderer::synchronize_to_cpu(void* id, DecodedImage& image) noexc
         (image.format != ImageFormat::Bgra32 && image.format != ImageFormat::Bgr24) ||
         image.pitch < static_cast<std::uint64_t>(image.width) * bytes_per_pixel(image.format) ||
         static_cast<std::uint64_t>(image.pitch) * image.height > image.pixels.size()) return E_INVALIDARG;
+    const RECT dirty = target.gpu_dirty;
+    if (dirty.left >= dirty.right || dirty.top >= dirty.bottom ||
+        dirty.right > static_cast<LONG>(image.width) || dirty.bottom > static_cast<LONG>(image.height)) {
+        target.cpu_needs_readback = false;
+        target.gpu_dirty = {};
+        return S_OK;
+    }
     context_->OMSetRenderTargets(0, nullptr, nullptr);
+    bound_target_ = nullptr;
     ID3D11ShaderResourceView* empty[] = {nullptr, nullptr, nullptr, nullptr, nullptr};
     context_->PSSetShaderResources(0, 5, empty);
-    context_->CopyResource(target.staging.Get(), target.texture.Get());
+    const D3D11_BOX region{static_cast<UINT>(dirty.left), static_cast<UINT>(dirty.top), 0,
+        static_cast<UINT>(dirty.right), static_cast<UINT>(dirty.bottom), 1};
+    context_->CopySubresourceRegion(target.staging.Get(), 0, region.left, region.top, 0, target.texture.Get(), 0, &region);
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     const HRESULT hr = context_->Map(target.staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr)) return hr;
@@ -276,22 +314,30 @@ HRESULT SurfaceRenderer::synchronize_to_cpu(void* id, DecodedImage& image) noexc
         context_->Unmap(target.staging.Get(), 0);
         return E_INVALIDARG;
     }
-    for (std::uint32_t y = 0; y < image.height; ++y) {
+    const auto first = static_cast<std::size_t>(dirty.left), columns = static_cast<std::size_t>(dirty.right - dirty.left);
+    for (auto y = static_cast<std::uint32_t>(dirty.top); y < static_cast<std::uint32_t>(dirty.bottom); ++y) {
         const auto* output_row = static_cast<const std::uint8_t*>(mapped.pData) + static_cast<std::size_t>(y) * mapped.RowPitch;
         auto* target_row = image.pixels.data() + static_cast<std::size_t>(y) * image.pitch;
         if (image.format == ImageFormat::Bgra32) {
-            std::memcpy(target_row, output_row, static_cast<std::size_t>(image.width) * 4);
+            std::memcpy(target_row + first * 4, output_row + first * 4, columns * 4);
         } else {
-            for (std::uint32_t x = 0; x < image.width; ++x) {
-                std::memcpy(target_row + static_cast<std::size_t>(x) * 3,
-                    output_row + static_cast<std::size_t>(x) * 4, 3);
+            for (std::size_t x = first; x < first + columns; ++x) {
+                std::memcpy(target_row + x * 3, output_row + x * 4, 3);
             }
         }
     }
     context_->Unmap(target.staging.Get(), 0);
+    ++counters_.readbacks;
+    counters_.transfer_bytes += static_cast<unsigned long long>(columns) * 4 * static_cast<unsigned long long>(dirty.bottom - dirty.top);
+    target.gpu_dirty = {};
     target.cpu_needs_upload = false;
     target.cpu_needs_readback = false;
     return S_OK;
+}
+
+bool SurfaceRenderer::gpu_holds_newer_pixels(void* id) const noexcept {
+    const auto found = surfaces_.find(id);
+    return found != surfaces_.end() && found->second.cpu_needs_readback && !found->second.cpu_needs_upload;
 }
 
 void SurfaceRenderer::mark_cpu_modified(void* id) noexcept {
@@ -299,6 +345,7 @@ void SurfaceRenderer::mark_cpu_modified(void* id) noexcept {
     if (found == surfaces_.end()) return;
     found->second.cpu_needs_upload = true;
     found->second.cpu_needs_readback = false;
+    found->second.gpu_dirty = {};
 }
 
 void SurfaceRenderer::mark_palette_modified(void* id) noexcept {
@@ -307,7 +354,15 @@ void SurfaceRenderer::mark_palette_modified(void* id) noexcept {
     found->second.palette_needs_upload = true;
 }
 
-void SurfaceRenderer::forget(void* id) noexcept { surfaces_.erase(id); }
+void SurfaceRenderer::forget(void* id) noexcept {
+    const auto found = surfaces_.find(id);
+    if (found == surfaces_.end()) return;
+    if (context_ && bound_target_ == found->second.texture.Get()) {
+        context_->OMSetRenderTargets(0, nullptr, nullptr);
+        bound_target_ = nullptr;
+    }
+    surfaces_.erase(found);
+}
 
 HRESULT SurfaceRenderer::open_screen(HWND window, const std::filesystem::path& config, std::string& error) {
     HRESULT hr = initialize();
@@ -323,6 +378,7 @@ void SurfaceRenderer::close_screen() noexcept { presentation_.close(); }
 
 void SurfaceRenderer::shutdown() noexcept {
     if (context_) context_->ClearState();
+    bound_target_ = nullptr;
     presentation_.close();
     surfaces_.clear();
     compositor_ = {};
@@ -352,6 +408,7 @@ HRESULT SurfaceRenderer::present(void* id, const DecodedImage& image) noexcept {
     HRESULT hr = surface(id, image, source);
     if (FAILED(hr)) return hr;
     context_->OMSetRenderTargets(0, nullptr, nullptr);
+    bound_target_ = nullptr;
     ID3D11ShaderResourceView* empty[] = {nullptr, nullptr, nullptr, nullptr, nullptr};
     context_->PSSetShaderResources(0, 5, empty);
     hr = upload_cpu_image(*source, image);
@@ -360,7 +417,9 @@ HRESULT SurfaceRenderer::present(void* id, const DecodedImage& image) noexcept {
         {0, 0, static_cast<float>(image.width), static_cast<float>(image.height)},
         {0, 0, static_cast<float>(image.width), static_cast<float>(image.height)});
     if (FAILED(hr)) return hr;
-    return presentation_.present();
+    const FrameCounters counters = counters_;
+    counters_ = {};
+    return presentation_.present(counters);
 }
 
 }

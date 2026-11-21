@@ -329,6 +329,19 @@ int main(int argc, char** argv) {
             actual_additive_pixels[4], actual_additive_pixels[5], actual_additive_pixels[6], actual_additive_pixels[7]);
         return 57;
     }
+    // Translucent solid fills: (source * a >> 8) + (background * (255 - a) >> 8) on a black background.
+    context->ClearRenderTargetView(target.Get(), clear);
+    result = compositor.copy(context.Get(), target.Get(), source.Get(), 8, 8,
+        {0, 0, 1, 1}, {0, 0, 1, 1}, {0, 0, 8, 8}, sgl::Sampling::SglFixedPoint,
+        std::nullopt, background.Get(), nullptr, 0x80ffffff, sgl::BlendMode::FillAlpha);
+    if (FAILED(result)) return 64;
+    context->CopyResource(staging.Get(), output.Get());
+    result = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(result)) return 65;
+    const auto* fill_bytes = static_cast<const std::uint8_t*>(mapped.pData);
+    const bool fill_matches = fill_bytes[0] == 127 && fill_bytes[1] == 0 && fill_bytes[2] == 0 && fill_bytes[3] == 255;
+    context->Unmap(staging.Get(), 0);
+    if (!fill_matches) return 66;
     // Final-output scaling: 1:1 and integer factors stay exact; at 1.5x only the seam pixel blends.
     const auto read_present = [&](sgl::Rect destination, std::array<std::uint32_t, 64>& out) -> HRESULT {
         context->ClearRenderTargetView(target.Get(), clear);

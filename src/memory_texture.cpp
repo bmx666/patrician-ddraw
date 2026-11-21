@@ -57,6 +57,8 @@ void* render_source = nullptr;
 void* render_destination = nullptr;
 std::array<std::int32_t, 4> clip_rectangle{};
 std::int32_t clipping_mode = 0;
+// Incremented whenever the clipping mode, clip rectangle, active clipper or clipper contents change.
+std::uint64_t clip_state_version = 0;
 
 void report_screen_init_failure(const char* stage, const char* detail) noexcept {
     OutputDebugStringA("Patrician III D3D11: ");
@@ -908,18 +910,19 @@ static bool make_screen_transform(void* handle, const sgl::DecodedImage& image,
     return true;
 }
 
-static std::vector<RECT> draw_clip_rectangles(const sgl::DecodedImage& target) {
-    std::vector<RECT> clips;
+// Fills clips in place so a caller can reuse its storage.
+static void collect_draw_clips(const sgl::DecodedImage& target, std::vector<RECT>& clips) {
+    clips.clear();
     try {
         const RECT bounds = texture_bounds(render_destination, target);
         if (clipping_mode == 0) {
             if (nonempty(bounds)) clips.push_back(bounds);
-            return clips;
+            return;
         }
         if (clipping_mode == 1) {
             RECT clip{clip_rectangle[0], clip_rectangle[1], clip_rectangle[2], clip_rectangle[3]};
             if (intersect_with(clip, bounds)) clips.push_back(clip);
-            return clips;
+            return;
         }
         if (clipping_mode != 2 && clipping_mode != 3)
             sgl::unimplemented("sgl_DrawBitmapRect unsupported clipping mode");
@@ -936,7 +939,55 @@ static std::vector<RECT> draw_clip_rectangles(const sgl::DecodedImage& target) {
     } catch (const std::length_error&) {
         sgl::unimplemented("sgl_DrawBitmapRect region allocation");
     }
+}
+
+static std::vector<RECT> draw_clip_rectangles(const sgl::DecodedImage& target) {
+    std::vector<RECT> clips;
+    collect_draw_clips(target, clips);
     return clips;
+}
+
+// Draw paths query the clip list once per sprite while it changes only between redraw passes. The result is cached
+// per clip state, destination and screen mapping; screen destinations keep their clips in output pixels.
+struct DrawClipCache {
+    std::uint64_t version = 0;
+    void* destination = nullptr;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    int logical_width = 0;
+    int logical_height = 0;
+    bool screen = false;
+    bool valid = false;
+    std::vector<RECT> clips;
+};
+static DrawClipCache draw_clip_cache;
+
+static const std::vector<RECT>& cached_draw_clips(const sgl::DecodedImage& target, bool map_to_screen,
+    const sgl::ScreenTransform& transform) {
+    auto& cache = draw_clip_cache;
+    if (cache.valid && cache.version == clip_state_version && cache.destination == render_destination &&
+        cache.width == target.width && cache.height == target.height && cache.screen == map_to_screen &&
+        cache.logical_width == view_state.logical_width && cache.logical_height == view_state.logical_height)
+        return cache.clips;
+    cache.valid = false;
+    collect_draw_clips(target, cache.clips);
+    if (map_to_screen) {
+        std::size_t kept = 0;
+        for (const RECT& clip : cache.clips) {
+            RECT mapped{};
+            if (transform.map_clip(clip, mapped)) cache.clips[kept++] = mapped;
+        }
+        cache.clips.resize(kept);
+    }
+    cache.version = clip_state_version;
+    cache.destination = render_destination;
+    cache.width = target.width;
+    cache.height = target.height;
+    cache.logical_width = view_state.logical_width;
+    cache.logical_height = view_state.logical_height;
+    cache.screen = map_to_screen;
+    cache.valid = true;
+    return cache.clips;
 }
 
 static HMODULE load_game_library(const wchar_t* name) {
@@ -1365,6 +1416,7 @@ extern "C" int __cdecl sgl_Set2dClippingMode(int mode) {
     std::lock_guard<std::mutex> lock(textures_mutex);
     const int previous = clipping_mode;
     clipping_mode = mode;
+    ++clip_state_version;
     return previous;
 }
 
@@ -1395,6 +1447,7 @@ extern "C" void* __cdecl sgl_SetActiveClipper(void* handle) {
         if (found == clippers.end()) sgl::unimplemented("sgl_SetActiveClipper object");
         active_clipper = found->second.get();
     }
+    ++clip_state_version;
     return previous;
 }
 
@@ -1406,6 +1459,7 @@ extern "C" void __cdecl sgl_FreeClipper(void* handle) {
     if (found == clippers.end()) sgl::unimplemented("sgl_FreeClipper object");
     if (active_clipper == handle) active_clipper = default_clipper.get();
     clippers.erase(found);
+    ++clip_state_version;
 }
 
 extern "C" void __cdecl sgl_FreeRectClipper(void* handle) { sgl_FreeClipper(handle); }
@@ -1427,6 +1481,7 @@ extern "C" void __cdecl sgl_CopyClipper(void* source_handle) {
     try {
         auto rectangles = source->rectangles;
         destination->rectangles.swap(rectangles);
+        ++clip_state_version;
     } catch (const std::bad_alloc&) {
         sgl::unimplemented("sgl_CopyClipper allocation");
     } catch (const std::length_error&) {
@@ -1442,6 +1497,7 @@ static void change_clip(const RECT* rectangle, int operation) {
     try {
         auto combined = combine_clip_rectangles(clipper->rectangles, *rectangle, operation);
         clipper->rectangles.swap(combined);
+        ++clip_state_version;
     } catch (const std::bad_alloc&) {
         sgl::unimplemented("clip rectangle allocation");
     } catch (const std::length_error&) {
@@ -1457,6 +1513,7 @@ extern "C" void __cdecl sgl_SubClipRect_4i(int l, int t, int r, int b) { const R
 extern "C" void __cdecl sgl_ResetClipper() {
     std::lock_guard<std::mutex> lock(textures_mutex);
     get_active_clipper()->rectangles.clear();
+    ++clip_state_version;
 }
 
 extern "C" int __cdecl sgl_IsRectInClippingRegion(const RECT* rect) {
@@ -1476,6 +1533,7 @@ extern "C" int __cdecl sgl_IsRectInClippingRegion(const RECT* rect) {
 extern "C" void __cdecl sgl_SetClipRect_4i(int left, int top, int right, int bottom) {
     std::lock_guard<std::mutex> lock(textures_mutex);
     clip_rectangle = {left, top, right, bottom};
+    ++clip_state_version;
 }
 
 extern "C" void __cdecl sgl_SetClipRect(int left, int top, int right, int bottom) {
@@ -1485,6 +1543,7 @@ extern "C" void __cdecl sgl_SetClipRect(int left, int top, int right, int bottom
 extern "C" void __cdecl sgl_SetClipRect_r(const std::int32_t* rectangle) {
     std::lock_guard<std::mutex> lock(textures_mutex);
     std::memcpy(clip_rectangle.data(), rectangle, sizeof(clip_rectangle));
+    ++clip_state_version;
 }
 
 extern "C" void __cdecl sgl_GetClipRect_r(std::int32_t* rectangle) {
@@ -1713,6 +1772,44 @@ extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
         pixel_bound(rectangle.bottom, image.height, true)};
     if (!nonempty(fill)) return;
 
+    const auto alpha = static_cast<std::uint8_t>(constant_color >> 24);
+    // A surface whose current pixels are on the GPU is filled there: the CPU path would first read back the whole
+    // surface and then upload it again. The GPU blend modes reproduce the integer formulas of the CPU path below.
+    if (surface_renderer.gpu_holds_newer_pixels(render_destination)) {
+        static std::array<std::uint8_t, 4> fill_pixel_bytes{};
+        static sgl::DecodedImage fill_source = [] {
+            sgl::DecodedImage image;
+            image.width = image.height = 1;
+            image.pitch = 4;
+            image.format = sgl::ImageFormat::Bgra32;
+            image.pixels.assign(4, 0);
+            return image;
+        }();
+        fill_pixel_bytes = {static_cast<std::uint8_t>(constant_color), static_cast<std::uint8_t>(constant_color >> 8),
+            static_cast<std::uint8_t>(constant_color >> 16), 0xff};
+        std::memcpy(fill_source.pixels.data(), fill_pixel_bytes.data(), 4);
+        surface_renderer.mark_cpu_modified(&fill_source);
+        const auto blend = active_blend_mode == 2 ? sgl::BlendMode::Multiply :
+            active_blend_mode == 3 ? sgl::BlendMode::AdditiveModulated :
+            alpha == 0xff ? sgl::BlendMode::Opaque : sgl::BlendMode::FillAlpha;
+        const std::uint32_t modulation = active_blend_mode == 3
+            ? 0xff000000u | (static_cast<std::uint32_t>(alpha) << 16) | (static_cast<std::uint32_t>(alpha) << 8) | alpha
+            : blend == sgl::BlendMode::FillAlpha ? (static_cast<std::uint32_t>(alpha) << 24) | 0x00ffffffu : 0xffffffffu;
+        const sgl::Rect target_rect{static_cast<float>(fill.left), static_cast<float>(fill.top),
+            static_cast<float>(fill.right), static_cast<float>(fill.bottom)};
+        sgl::ScreenTransform clip_transform;
+        const bool clip_mapped = make_screen_transform(render_destination, image, clip_transform);
+        for (const RECT& clip : cached_draw_clips(image, clip_mapped, clip_transform)) {
+            RECT region{std::max(fill.left, clip.left), std::max(fill.top, clip.top),
+                std::min(fill.right, clip.right), std::min(fill.bottom, clip.bottom)};
+            if (!intersect_with(region, {0, 0, static_cast<LONG>(image.width), static_cast<LONG>(image.height)})) continue;
+            const char* failure_stage = nullptr;
+            if (FAILED(surface_renderer.draw(&fill_source, fill_source, render_destination, image, {0, 0, 1, 1},
+                target_rect, region, std::nullopt, blend, &failure_stage, modulation)))
+                sgl::unimplemented(failure_stage ? failure_stage : "sgl_FillSolidRect D3D11 fill");
+        }
+        return;
+    }
     if (FAILED(surface_renderer.synchronize_to_cpu(render_destination, image)))
         sgl::unimplemented("sgl_FillSolidRect D3D11 synchronization");
 
@@ -1723,7 +1820,6 @@ extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
         static_cast<std::uint8_t>(constant_color >> 8),
         static_cast<std::uint8_t>(constant_color >> 16)
     };
-    const auto alpha = static_cast<std::uint8_t>(constant_color >> 24);
     const auto inverse_alpha = static_cast<std::uint8_t>(255 - alpha);
     const auto fill_pixel = [&](std::uint8_t* pixel) {
         if (active_blend_mode == 2) {
@@ -1856,9 +1952,11 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
     if (full_map) { expanded_menu_background = true; fast_forward_overlay = true; }
     else if (fast_forward_overlay && _stricmp(src.name.c_str(), "images/Banner_klein.tga") == 0) fast_forward_overlay = false;
 
-    const auto clips = expanded_menu_background
-        ? std::vector<RECT>{{0, 0, static_cast<LONG>(dst.image.width), static_cast<LONG>(dst.image.height)}}
-        : draw_clip_rectangles(dst.image);
+    sgl::ScreenTransform destination_transform;
+    const bool destination_mapped = make_screen_transform(render_destination, dst.image, destination_transform);
+    const std::vector<RECT> full_clip{{0, 0, static_cast<LONG>(dst.image.width), static_cast<LONG>(dst.image.height)}};
+    const auto& clips = expanded_menu_background ? full_clip :
+        cached_draw_clips(dst.image, destination_mapped, destination_transform);
     if (clips.empty()) return;
     sgl::Rect src_rect = expanded_menu_background
         ? sgl::Rect{0.0f, 0.0f, static_cast<float>(draw_source->image.width),
@@ -1887,12 +1985,7 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
         sgl::unimplemented("sgl_DrawBitmapRect source lock");
     const auto key = draw_source->keyed && blend_mode == sgl::BlendMode::Opaque
         ? std::optional<std::uint32_t>(draw_source->key) : std::nullopt;
-    for (RECT clip : clips) {
-        if (destination_is_screen && !expanded_menu_background) {
-            RECT mapped_clip{};
-            if (!transform.map_clip(clip, mapped_clip)) continue;
-            clip = mapped_clip;
-        }
+    for (const RECT& clip : clips) {
         if (mapped_destination.left >= static_cast<float>(clip.right) ||
             mapped_destination.top >= static_cast<float>(clip.bottom) ||
             mapped_destination.right <= static_cast<float>(clip.left) ||
@@ -1959,7 +2052,9 @@ extern "C" int __cdecl sgl_DrawBitmapRectWithAlphaMask(std::uint32_t mask_handle
         sgl::unimplemented(message);
     }
 
-    const auto clips = draw_clip_rectangles(dst.image);
+    sgl::ScreenTransform destination_transform;
+    const bool destination_mapped = make_screen_transform(render_destination, dst.image, destination_transform);
+    const auto& clips = cached_draw_clips(dst.image, destination_mapped, destination_transform);
     if (clips.empty()) return 1;
     sgl::Rect source_rect{static_cast<float>(sx), static_cast<float>(sy),
         static_cast<float>(sx) + width, static_cast<float>(sy) + height};
@@ -1978,12 +2073,7 @@ extern "C" int __cdecl sgl_DrawBitmapRectWithAlphaMask(std::uint32_t mask_handle
         unlock_texture(src);
         sgl::unimplemented("sgl_DrawBitmapRectWithAlphaMask mask lock");
     }
-    for (RECT clip : clips) {
-        if (destination_is_screen) {
-            RECT mapped_clip{};
-            if (!transform.map_clip(clip, mapped_clip)) continue;
-            clip = mapped_clip;
-        }
+    for (const RECT& clip : clips) {
         if (mapped_target.left >= static_cast<float>(clip.right) ||
             mapped_target.top >= static_cast<float>(clip.bottom) ||
             mapped_target.right <= static_cast<float>(clip.left) ||
