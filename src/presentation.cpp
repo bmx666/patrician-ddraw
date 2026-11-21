@@ -180,7 +180,10 @@ HRESULT Presentation::initialize_configured(ID3D11Device* device, HWND window, c
     DisplayConfig config{};
     if (!display_config(window, path, config, error)) return E_INVALIDARG;
     const HRESULT hr = initialize(device, window, config.size.width, config.size.height, config.mode);
-    if (SUCCEEDED(hr)) max_fps_ = config.max_fps;
+    if (SUCCEEDED(hr)) {
+        max_fps_ = config.max_fps;
+        set_show_fps(config.show_fps);
+    }
     if (FAILED(hr)) {
         error = hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) ?
             "The selected windowed resolution does not fit within the monitor work area; choose a lower resolution or borderless mode." :
@@ -291,6 +294,8 @@ void Presentation::close() noexcept {
     mode_ = DisplayMode::Borderless;
     window_change_in_progress_ = false;
     max_fps_.reset();
+    show_fps_ = false;
+    fps_overlay_.reset();
 }
 
 HRESULT Presentation::initialize(ID3D11Device* device, HWND window, UINT width, UINT height, DisplayMode mode) noexcept {
@@ -458,13 +463,18 @@ HRESULT Presentation::draw(ID3D11DeviceContext* context, Compositor& compositor,
         return E_INVALIDARG;
     const float clear[] = {0, 0, 0, 1};
     context->ClearRenderTargetView(target_.Get(), clear);
-    return compositor.copy(context, target_.Get(), source, output_width_, output_height_, source_rect,
+    const HRESULT hr = compositor.copy(context, target_.Get(), source, output_width_, output_height_, source_rect,
         transform.map(render_rect),
         {0, 0, static_cast<LONG>(output_width_), static_cast<LONG>(output_height_)}, Sampling::PresentSharp);
+    if (FAILED(hr) || !show_fps_) return hr;
+    return fps_overlay_.draw(device_.Get(), context, compositor, target_.Get(), output_width_, output_height_);
 }
 
 HRESULT Presentation::present() noexcept {
-    return swap_chain_ ? swap_chain_->Present(1, 0) : E_UNEXPECTED;
+    if (!swap_chain_) return E_UNEXPECTED;
+    const HRESULT hr = swap_chain_->Present(1, 0);
+    if (SUCCEEDED(hr) && show_fps_) fps_overlay_.frame_presented();
+    return hr;
 }
 
 }

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <commctrl.h>
 
 using Microsoft::WRL::ComPtr;
@@ -53,6 +54,24 @@ bool output_is(const sgl::Presentation& presentation, SIZE size) {
     const auto output = presentation.output_size();
     return output.width == static_cast<UINT>(size.cx) && output.height == static_cast<UINT>(size.cy) &&
         actual.Width == output.width && actual.Height == output.height;
+}
+
+std::uint32_t read_pixel(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Texture2D* texture, UINT x, UINT y) {
+    D3D11_TEXTURE2D_DESC desc = {};
+    texture->GetDesc(&desc);
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> staging;
+    if (FAILED(device->CreateTexture2D(&desc, nullptr, &staging))) return 0;
+    context->CopyResource(staging.Get(), texture);
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 0;
+    std::uint32_t value = 0;
+    std::memcpy(&value, static_cast<const std::uint8_t*>(mapped.pData) + y * mapped.RowPitch + x * 4, sizeof(value));
+    context->Unmap(staging.Get(), 0);
+    return value;
 }
 
 // The original executable strips the frame and requests a topmost fullscreen placement on every mode change.
@@ -225,6 +244,20 @@ int main() {
             if (FAILED(configured.draw(context.Get(), compositor, source.Get(), {0, 0, 2, 2},
                 {0, 0, static_cast<float>(next[0]), static_cast<float>(next[1])})) ||
                 !output_is(configured, resized) || configured.render_size().width != next[0]) return 31;
+            if (i == 0) {
+                // The frame statistics overlay is drawn over the presented frame and updates from presents.
+                configured.set_show_fps(true);
+                if (FAILED(configured.draw(context.Get(), compositor, source.Get(), {0, 0, 2, 2},
+                    {0, 0, static_cast<float>(next[0]), static_cast<float>(next[1])})) ||
+                    read_pixel(device.Get(), context.Get(), configured.back_buffer(), 10, 10) !=
+                    sgl::FpsOverlay::background) return 34;
+                for (int presented = 0; presented < 4; ++presented) {
+                    if (FAILED(configured.present())) return 35;
+                    Sleep(200);
+                }
+                if (configured.fps_overlay().text().find(" fps ") == std::string::npos ||
+                    configured.fps_overlay().text().front() == '-') return 36;
+            }
 
             configured.close();
             if (GetWindowLongPtrW(window, GWL_STYLE) != borderless_style) return 28;

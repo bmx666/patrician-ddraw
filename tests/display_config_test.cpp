@@ -40,10 +40,13 @@ int main() {
         "[display]\nwidth=\nheight=1080\n", "[display]\nwidth=1920\nheight=1080\nmode=fullscreen\n",
         "[display]\nwidth=1920\nheight=1080\nmode=windowed\nmode=borderless\n",
         "[display]\nwidth=1920\nheight=1080\nmax_fps=5\n", "[display]\nwidth=1920\nheight=1080\nmax_fps=1001\n",
-        "[display]\nwidth=1920\nheight=1080\nmax_fps=\n", "[display]\nwidth=1920\nheight=1080\nmax_fps=60\nmax_fps=60\n"}) {
+        "[display]\nwidth=1920\nheight=1080\nmax_fps=\n", "[display]\nwidth=1920\nheight=1080\nshow_fps=yes\n",
+        "[display]\nwidth=1920\nheight=1080\nshow_fps=1\nshow_fps=0\n", "[display]\nwidth=1920\nheight=1080\nmax_fps=60\nmax_fps=60\n"}) {
         if (!write(invalid) || sgl::display_config(GetDesktopWindow(), path, config, error) || error.empty()) return 3;
     }
-    if (config.max_fps) return 22;
+    if (config.max_fps || config.show_fps) return 22;
+    if (!write("[display]\nwidth=1920\nheight=1080\nshow_fps=1\n") ||
+        !sgl::display_config(GetDesktopWindow(), path, config, error) || !config.show_fps) return 25;
     for (const auto& [text, expected] : std::array<std::pair<const char*, unsigned>, 3>{{
         {"[display]\nwidth=1920\nheight=1080\nmax_fps=0\n", 0u},
         {"[display]\nwidth=1920\nheight=1080\nmax_fps=144\n", 144u},

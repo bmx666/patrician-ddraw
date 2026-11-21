@@ -17,6 +17,8 @@ struct DisplayConfig {
     // [display] max_fps: absent keeps the game's own 50 fps limiter; 0 removes it (presentation still waits for
     // vertical blank); 10..1000 sets the limiter's minimum frame time to the nearest millisecond.
     std::optional<unsigned> max_fps;
+    // [display] show_fps=1 draws frame rate and frame times into the top-left corner.
+    bool show_fps = false;
 };
 
 bool is_supported_display_size(DisplaySize size) noexcept;

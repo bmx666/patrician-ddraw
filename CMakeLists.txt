@@ -74,7 +74,7 @@ target_compile_options(PatricianSGL PRIVATE /W4 /WX /permissive-)
 target_link_libraries(PatricianSGL PRIVATE user32 gdi32 bcrypt)
 set_target_properties(PatricianSGL PROPERTIES OUTPUT_NAME ddraw_Dll PREFIX "")
 
-add_library(sgl_compositor STATIC src/compositor.cpp src/surface_renderer.cpp src/presentation.cpp src/display_config.cpp)
+add_library(sgl_compositor STATIC src/compositor.cpp src/surface_renderer.cpp src/presentation.cpp src/display_config.cpp src/fps_overlay.cpp)
 target_compile_features(sgl_compositor PUBLIC cxx_std_17)
 target_compile_definitions(sgl_compositor PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(sgl_compositor PRIVATE /W4 /WX /permissive-)
