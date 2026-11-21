@@ -14,7 +14,9 @@ struct Rect {
     float bottom;
 };
 
-enum class Sampling { Center, SglFixedPoint, SglBilinear };
+// PresentSharp: final output scaling. Nearest texel, blended only across the one output pixel that
+// straddles a texel edge, so non-integer scale factors keep even pixel widths without blurring.
+enum class Sampling { Center, SglFixedPoint, SglBilinear, PresentSharp };
 enum class BlendMode { Opaque, Alpha, Multiply, MultiplyModulated, Multiply2, Additive, AdditiveModulated, AlphaMask };
 
 class Compositor {
@@ -75,6 +77,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11PixelShader> alpha_masked_indexed_shader_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> constants_;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler_;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> present_sampler_;
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> rasterizer_;
     ID3D11DeviceContext* renderer_state_context_ = nullptr;
     ID3D11PixelShader* renderer_pixel_shader_ = nullptr;

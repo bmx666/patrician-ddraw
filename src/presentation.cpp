@@ -361,7 +361,7 @@ HRESULT Presentation::draw(ID3D11DeviceContext* context, Compositor& compositor,
     context->ClearRenderTargetView(target_.Get(), clear);
     return compositor.copy(context, target_.Get(), source, output_width_, output_height_, source_rect,
         transform.map(render_rect),
-        {0, 0, static_cast<LONG>(output_width_), static_cast<LONG>(output_height_)});
+        {0, 0, static_cast<LONG>(output_width_), static_cast<LONG>(output_height_)}, Sampling::PresentSharp);
 }
 
 HRESULT Presentation::present() noexcept {

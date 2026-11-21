@@ -329,6 +329,49 @@ int main(int argc, char** argv) {
             actual_additive_pixels[4], actual_additive_pixels[5], actual_additive_pixels[6], actual_additive_pixels[7]);
         return 57;
     }
-    std::puts("RGBA, BGRA and indexed textures, color modulation, keying, alpha and tinted additive blending, fractional scaling, clipping and invalid input verified on D3D11.");
+    // Final-output scaling: 1:1 and integer factors stay exact; at 1.5x only the seam pixel blends.
+    const auto read_present = [&](sgl::Rect destination, std::array<std::uint32_t, 64>& out) -> HRESULT {
+        context->ClearRenderTargetView(target.Get(), clear);
+        HRESULT hr = compositor.copy(context.Get(), target.Get(), source.Get(), 8, 8,
+            full_source, destination, {0, 0, 8, 8}, sgl::Sampling::PresentSharp);
+        if (FAILED(hr)) return hr;
+        context->CopyResource(staging.Get(), output.Get());
+        hr = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr)) return hr;
+        for (UINT y = 0; y < 8; ++y) {
+            const auto* row = reinterpret_cast<const std::uint32_t*>(
+                static_cast<const std::uint8_t*>(mapped.pData) + y * mapped.RowPitch);
+            for (UINT x = 0; x < 8; ++x) out[y * 8 + x] = row[x];
+        }
+        context->Unmap(staging.Get(), 0);
+        return S_OK;
+    };
+    std::array<std::uint32_t, 64> present_pixels = {};
+    if (FAILED(read_present({0, 0, 2, 2}, present_pixels))) return 58;
+    for (UINT y = 0; y < 2; ++y)
+        for (UINT x = 0; x < 2; ++x)
+            if (present_pixels[y * 8 + x] != pixels[y * 2 + x]) {
+                std::fputs("PresentSharp changed pixels at 1:1 scale.\n", stderr);
+                return 59;
+            }
+    if (FAILED(read_present({0, 0, 8, 8}, present_pixels))) return 60;
+    for (UINT y = 0; y < 8; ++y)
+        for (UINT x = 0; x < 8; ++x)
+            if (present_pixels[y * 8 + x] != pixels[(y / 4) * 2 + x / 4]) {
+                std::fprintf(stderr, "PresentSharp 4x (%u,%u): %08x, expected %08x\n",
+                    x, y, present_pixels[y * 8 + x], pixels[(y / 4) * 2 + x / 4]);
+                return 61;
+            }
+    if (FAILED(read_present({0, 0, 3, 3}, present_pixels))) return 62;
+    const std::uint32_t seam = present_pixels[1];
+    const unsigned seam_red = seam & 0xff, seam_green = (seam >> 8) & 0xff;
+    if (present_pixels[0] != pixels[0] || present_pixels[2] != pixels[1] ||
+        present_pixels[16] != pixels[2] || present_pixels[18] != pixels[3] ||
+        seam_red < 96 || seam_red > 160 || seam_green < 96 || seam_green > 160 || (seam >> 24) != 0xff) {
+        std::fprintf(stderr, "PresentSharp 1.5x row: %08x %08x %08x\n",
+            present_pixels[0], present_pixels[1], present_pixels[2]);
+        return 63;
+    }
+    std::puts("RGBA, BGRA and indexed textures, color modulation, keying, alpha and tinted additive blending, fractional and present scaling, clipping and invalid input verified on D3D11.");
     return 0;
 }

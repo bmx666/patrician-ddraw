@@ -41,6 +41,7 @@ Texture2D palette_texture : register(t2);
 Texture2D background_texture : register(t3);
 Texture2D<uint> alpha_mask_texture : register(t4);
 SamplerState source_sampler : register(s0);
+SamplerState present_sampler : register(s1);
 float4 modulate_color(float4 color) {
     return color * modulation_color;
 }
@@ -70,6 +71,17 @@ float4 sample_pixel(Vertex input) {
         float2 relative = max(pixel_center - destination.xy, 0.0);
         uint2 pixel = uint2(floor(source_origin + relative * fractional_step));
         return source_texture.Load(int3(pixel, 0));
+    }
+    if (fixed_sampling == 4) {
+        uint width, height;
+        source_texture.GetDimensions(width, height);
+        float2 size = float2(width, height);
+        float2 texel = input.uv * size;
+        float2 seam = floor(texel + 0.5);
+        texel = seam + clamp((texel - seam) / max(fwidth(texel), 1e-5), -0.5, 0.5);
+        // Never blend in texels outside the source rectangle.
+        texel = clamp(texel, source_uv.xy * size + 0.5, source_uv.zw * size - 0.5);
+        return source_texture.SampleLevel(present_sampler, texel / size, 0);
     }
     return source_texture.Sample(source_sampler, input.uv);
 }
@@ -267,6 +279,7 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     ComPtr<ID3D11PixelShader> alpha_masked_indexed_shader;
     ComPtr<ID3D11Buffer> constants;
     ComPtr<ID3D11SamplerState> sampler_state;
+    ComPtr<ID3D11SamplerState> present_sampler_state;
     ComPtr<ID3D11RasterizerState> rasterizer_state;
     HRESULT result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "vertex_main", "vs_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &vertex_code, nullptr);
@@ -382,6 +395,9 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     sampler.MaxLOD = D3D11_FLOAT32_MAX;
     result = device->CreateSamplerState(&sampler, &sampler_state);
     if (FAILED(result)) return result;
+    sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    result = device->CreateSamplerState(&sampler, &present_sampler_state);
+    if (FAILED(result)) return result;
     D3D11_RASTERIZER_DESC rasterizer = {};
     rasterizer.FillMode = D3D11_FILL_SOLID;
     rasterizer.CullMode = D3D11_CULL_NONE;
@@ -409,6 +425,7 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     alpha_masked_indexed_shader_ = alpha_masked_indexed_shader;
     constants_ = constants;
     sampler_ = sampler_state;
+    present_sampler_ = present_sampler_state;
     rasterizer_ = rasterizer_state;
     return S_OK;
 }
@@ -469,7 +486,7 @@ HRESULT Compositor::copy_impl(ID3D11DeviceContext* context, ID3D11RenderTargetVi
         !alpha_pixel_shader_ || !multiply_pixel_shader_ || !multiply_modulated_pixel_shader_ || !multiply2_pixel_shader_ ||
         !additive_pixel_shader_ || !additive_modulated_pixel_shader_ || !constants_ || !indexed_shader_ || !keyed_indexed_shader_ ||
         !alpha_indexed_shader_ || !multiply_indexed_shader_ || !multiply_modulated_indexed_shader_ || !additive_indexed_shader_ ||
-        !additive_modulated_indexed_shader_ || !alpha_masked_indexed_shader_ || !sampler_ || !rasterizer_ || !target_width || !target_height ||
+        !additive_modulated_indexed_shader_ || !alpha_masked_indexed_shader_ || !sampler_ || !present_sampler_ || !rasterizer_ || !target_width || !target_height ||
         !valid_rect(source_rect) || !valid_rect(destination_rect)) return fail("compositor invalid/null inputs or rectangles", E_INVALIDARG);
     if (blend != BlendMode::Opaque && blend != BlendMode::Alpha && blend != BlendMode::Multiply &&
         blend != BlendMode::MultiplyModulated && blend != BlendMode::Multiply2 &&
@@ -608,7 +625,10 @@ HRESULT Compositor::copy_impl(ID3D11DeviceContext* context, ID3D11RenderTargetVi
     float fractional_step[2] = {};
     std::uint32_t fixed_sampling = 0;
     float sample_origin[2] = {source_rect.left, source_rect.top};
-    if (sampling == Sampling::SglFixedPoint || sampling == Sampling::SglBilinear) {
+    if (sampling == Sampling::PresentSharp) {
+        if (palette || mask) return fail("present sampling requires a BGRA source", E_NOTIMPL);
+        fixed_sampling = 4;
+    } else if (sampling == Sampling::SglFixedPoint || sampling == Sampling::SglBilinear) {
         const float source_values[] = {source_rect.left, source_rect.top, source_rect.right, source_rect.bottom};
         for (float value : source_values) {
             if (value < 0 || value > 65535)
@@ -698,8 +718,8 @@ HRESULT Compositor::copy_impl(ID3D11DeviceContext* context, ID3D11RenderTargetVi
         ID3D11Buffer* constants = constants_.Get();
         context->VSSetConstantBuffers(0, 1, &constants);
         context->PSSetConstantBuffers(0, 1, &constants);
-        ID3D11SamplerState* sampler = sampler_.Get();
-        context->PSSetSamplers(0, 1, &sampler);
+        ID3D11SamplerState* samplers[] = {sampler_.Get(), present_sampler_.Get()};
+        context->PSSetSamplers(0, 2, samplers);
         renderer_state_context_ = renderer_source ? context : nullptr;
         renderer_pixel_shader_ = nullptr;
     }
