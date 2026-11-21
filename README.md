@@ -1,6 +1,6 @@
 # Patrician III D3D11 renderer
 
-A drop-in replacement for `ddraw_Dll.dll`, the 2D graphics library of *Patrician III*, built on Direct3D 11. It runs the game at 1920×1080 and 2560×1440 in a borderless or normal window, scales sharply to any screen size and renders the busiest city views at well over 150 fps. The game executable stays unchanged on disk.
+A drop-in replacement for `ddraw_Dll.dll`, the 2D graphics library of *Patrician III*, built on Direct3D 11. It runs the game at 1920×1080 and 2560×1440 in a borderless or normal window, scales sharply to any screen size and renders the busiest city views at high FPS for a better Experience. The game executable stays unchanged on disk.
 
 ## Why a new graphics library?
 
