@@ -188,7 +188,10 @@ int main() {
                 output.height != size[1] || actual.Width != size[0] || actual.Height != size[1] ||
                 (style & WS_POPUP) || !(style & WS_CAPTION) || (style & WS_THICKFRAME) || (style & WS_MAXIMIZEBOX)) return 23;
 
-            if (!simulate_game_style_reset(window) || configured.set_render_size(size[0], size[1]) != S_OK ||
+            if (!simulate_game_style_reset(window) || !GetClientRect(window, &windowed_client) ||
+                windowed_client.right - windowed_client.left != static_cast<LONG>(size[0]) ||
+                windowed_client.bottom - windowed_client.top != static_cast<LONG>(size[1]) ||
+                !has_fixed_windowed_style(window) || configured.set_render_size(size[0], size[1]) != S_OK ||
                 !GetClientRect(window, &windowed_client) ||
                 windowed_client.right - windowed_client.left != static_cast<LONG>(size[0]) ||
                 windowed_client.bottom - windowed_client.top != static_cast<LONG>(size[1]) ||

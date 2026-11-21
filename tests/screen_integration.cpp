@@ -3,6 +3,8 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <vector>
+#include "qhd_scroll_clips.hpp"
 
 template<typename T> T resolve(HMODULE library, const char* name) {
     return reinterpret_cast<T>(GetProcAddress(library, name));
@@ -34,7 +36,13 @@ int wmain(int argc, wchar_t** argv) {
     const auto clear = resolve<void (__cdecl*)(std::uint32_t, std::uint32_t, float)>(library, "sgl_ClearBuffer");
     const auto set_constant_color = resolve<std::uint32_t (__cdecl*)(std::uint32_t)>(library, "sgl_SetConstantColor");
     const auto fill = resolve<void (__cdecl*)(int, int, int, int)>(library, "sgl_FillSolidRect");
-    if (!init || !destroy || !shutdown || !cleanup || !swap || !switch_mode || !source || !target || !create || !free_image || !free_texture || !lock || !unlock || !clipping || !rectangle || !draw || !blit || !clear || !set_constant_color || !fill) return 3;
+    const auto create_clipper = resolve<void* (__cdecl*)()>(library, "sgl_CreateClipper");
+    const auto set_clipper = resolve<void* (__cdecl*)(void*)>(library, "sgl_SetActiveClipper");
+    const auto free_clipper = resolve<void (__cdecl*)(void*)>(library, "sgl_FreeClipper");
+    const auto add_clip = resolve<void (__cdecl*)(int, int, int, int)>(library, "sgl_AddClipRect_4i");
+    const auto region_blit = resolve<void (__cdecl*)(std::uint32_t)>(library, "sgl_Blt_RC");
+    const auto reset_clipper = resolve<void (__cdecl*)()>(library, "sgl_ResetClipper");
+    if (!init || !destroy || !shutdown || !cleanup || !swap || !switch_mode || !source || !target || !create || !free_image || !free_texture || !lock || !unlock || !clipping || !rectangle || !draw || !blit || !clear || !set_constant_color || !fill || !create_clipper || !set_clipper || !free_clipper || !add_clip || !region_blit || !reset_clipper) return 3;
     cleanup();
     const std::array<std::uint32_t, 6> settings = {800, 600, 32, 60, 0, 0};
     if (switch_mode(settings.data()) != 0) return 24;
@@ -114,6 +122,263 @@ int wmain(int argc, wchar_t** argv) {
     if (screen_locks[0].pixels == screen_locks[1].pixels || screen_locks[0].width != screen_locks[1].width ||
         screen_locks[0].height != screen_locks[1].height || screen_locks[0].pitch != screen_locks[1].pitch ||
         screen_locks[0].width != render_mode[0] || screen_locks[0].height != render_mode[1]) return 23;
+    const auto screen_pattern = [](unsigned x, unsigned y, std::uint32_t salt) {
+        return 0xff000000u | (((x * 29u + salt) & 0xffu) << 16) |
+            (((y * 47u + salt * 3u) & 0xffu) << 8) | ((x * 17u + y * 31u + salt) & 0xffu);
+    };
+    const unsigned screen_width = screen_locks[1].width;
+    const unsigned screen_height = screen_locks[1].height;
+    std::vector<std::uint32_t> display_before(static_cast<std::size_t>(screen_width) * screen_height);
+    LockOutput copy_surface = {};
+    if (!lock(reinterpret_cast<void*>(-3), &copy_surface, 2) || !copy_surface.pixels ||
+        copy_surface.width != screen_width || copy_surface.height != screen_height) return 50;
+    for (unsigned y = 0; y < screen_height; ++y) {
+        auto* row = static_cast<std::uint8_t*>(copy_surface.pixels) + y * copy_surface.pitch;
+        for (unsigned x = 0; x < screen_width; ++x) {
+            const auto pixel = screen_pattern(x, y, 13);
+            display_before[static_cast<std::size_t>(y) * screen_width + x] = pixel;
+            std::memcpy(row + x * 4, &pixel, sizeof(pixel));
+        }
+    }
+    unlock(reinterpret_cast<void*>(-3));
+    void* saved_source = source(nullptr);
+    void* saved_target = target(nullptr);
+    source(reinterpret_cast<void*>(-3));
+    target(reinterpret_cast<void*>(-3));
+    blit(0, 174, 0, 42, 2276, 1266, 4);
+    if (!lock(reinterpret_cast<void*>(-3), &copy_surface, 1) || !copy_surface.pixels) return 51;
+    for (unsigned y = 0; y < screen_height; ++y) {
+        const auto* row = static_cast<const std::uint8_t*>(copy_surface.pixels) + y * copy_surface.pitch;
+        for (unsigned x = 0; x < screen_width; ++x) {
+            std::uint32_t actual = 0;
+            std::memcpy(&actual, row + x * 4, sizeof(actual));
+            const unsigned source_y = y + 132;
+            const auto expected = x < 2276 && y >= 42 && y < 1308
+                ? display_before[static_cast<std::size_t>(source_y) * screen_width + x]
+                : display_before[static_cast<std::size_t>(y) * screen_width + x];
+            if (actual != expected) {
+                unlock(reinterpret_cast<void*>(-3));
+                return 52;
+            }
+        }
+    }
+    unlock(reinterpret_cast<void*>(-3));
+    source(saved_source);
+    target(saved_target);
+    const auto write_pattern = [&](void* handle, std::uint32_t salt) {
+        LockOutput surface_output = {};
+        if (!lock(handle, &surface_output, 2) || !surface_output.pixels ||
+            surface_output.width != screen_width || surface_output.height != screen_height) return false;
+        for (unsigned y = 0; y < screen_height; ++y) {
+            auto* row = static_cast<std::uint8_t*>(surface_output.pixels) + y * surface_output.pitch;
+            for (unsigned x = 0; x < screen_width; ++x) {
+                const auto pixel = screen_pattern(x, y, salt);
+                std::memcpy(row + x * 4, &pixel, sizeof(pixel));
+            }
+        }
+        unlock(handle);
+        return true;
+    };
+    if (!write_pattern(reinterpret_cast<void*>(-1), 37) ||
+        !write_pattern(reinterpret_cast<void*>(-3), 91)) return 53;
+    const auto clipper = create_clipper();
+    if (!clipper) return 54;
+    void* previous_clipper = set_clipper(clipper);
+    const int previous_clipping = clipping(2);
+    for (unsigned i = 0; i < 413; ++i) {
+        const int x = 5 + static_cast<int>(i % 26) * 96;
+        const int y = 7 + static_cast<int>(i / 26) * 88;
+        add_clip(x, y, x + 51, y + 37);
+    }
+    source(reinterpret_cast<void*>(-1));
+    target(reinterpret_cast<void*>(-3));
+    region_blit(0);
+    if (!lock(reinterpret_cast<void*>(-3), &copy_surface, 1) || !copy_surface.pixels) return 55;
+    for (unsigned y = 0; y < screen_height; ++y) {
+        const auto* row = static_cast<const std::uint8_t*>(copy_surface.pixels) + y * copy_surface.pitch;
+        for (unsigned x = 0; x < screen_width; ++x) {
+            const unsigned column = x >= 5 ? (x - 5) / 96 : 26;
+            const unsigned band = y >= 7 ? (y - 7) / 88 : 16;
+            const bool copied = column < 26 && band < 16 && band * 26 + column < 413 &&
+                x >= 5 + column * 96 && x < 56 + column * 96 &&
+                y >= 7 + band * 88 && y < 44 + band * 88;
+            const auto expected = screen_pattern(x, y, copied ? 37 : 91);
+            std::uint32_t actual = 0;
+            std::memcpy(&actual, row + x * 4, sizeof(actual));
+            if (actual != expected) {
+                unlock(reinterpret_cast<void*>(-3));
+                return 56;
+            }
+        }
+    }
+    unlock(reinterpret_cast<void*>(-3));
+    reset_clipper();
+    if (!write_pattern(reinterpret_cast<void*>(-1), 37) ||
+        !write_pattern(reinterpret_cast<void*>(-3), 91)) return 69;
+    std::vector<std::uint8_t> captured_mask(static_cast<std::size_t>(screen_width) * screen_height, 0);
+    for (const RECT& r : qhd_scroll_clips) {
+        add_clip(r.left, r.top, r.right, r.bottom);
+        const LONG left = std::clamp<LONG>(r.left, 0, static_cast<LONG>(screen_width));
+        const LONG right = std::clamp<LONG>(r.right, 0, static_cast<LONG>(screen_width));
+        const LONG top = std::clamp<LONG>(r.top, 0, static_cast<LONG>(screen_height));
+        const LONG bottom = std::clamp<LONG>(r.bottom, 0, static_cast<LONG>(screen_height));
+        for (LONG y = top; y < bottom; ++y) {
+            std::fill(captured_mask.begin() + static_cast<std::size_t>(y) * screen_width + left,
+                captured_mask.begin() + static_cast<std::size_t>(y) * screen_width + right, std::uint8_t{1});
+        }
+    }
+    region_blit(0);
+    if (!lock(reinterpret_cast<void*>(-3), &copy_surface, 1) || !copy_surface.pixels) return 70;
+    for (unsigned y = 0; y < screen_height; ++y) {
+        const auto* row = static_cast<const std::uint8_t*>(copy_surface.pixels) + y * copy_surface.pitch;
+        for (unsigned x = 0; x < screen_width; ++x) {
+            const auto expected = screen_pattern(x, y, captured_mask[static_cast<std::size_t>(y) * screen_width + x] ? 37 : 91);
+            std::uint32_t actual = 0;
+            std::memcpy(&actual, row + x * 4, sizeof(actual));
+            if (actual != expected) {
+                unlock(reinterpret_cast<void*>(-3));
+                return 71;
+            }
+        }
+    }
+    unlock(reinterpret_cast<void*>(-3));
+    reset_clipper();
+    for (unsigned i = 0; i < 413; ++i) {
+        const int x = 5 + static_cast<int>(i % 26) * 96;
+        const int y = 7 + static_cast<int>(i / 26) * 88;
+        add_clip(x, y, x + 51, y + 37);
+    }
+    void* indexed_sprite = create(static_cast<std::uint16_t>(screen_width),
+        static_cast<std::uint16_t>(screen_height), 0x20);
+    if (!indexed_sprite) return 57;
+    LockOutput sprite_pixels = {};
+    if (!lock(indexed_sprite, &sprite_pixels, 2) || !sprite_pixels.pixels) return 58;
+    for (unsigned y = 0; y < screen_height; ++y) {
+        auto* row = static_cast<std::uint8_t*>(sprite_pixels.pixels) + y * sprite_pixels.pitch;
+        for (unsigned x = 0; x < screen_width; ++x) row[x] = static_cast<std::uint8_t>(x * 13u + y * 29u);
+    }
+    unlock(indexed_sprite);
+    if (!lock(reinterpret_cast<void*>(-1), &copy_surface, 2) || !copy_surface.pixels) return 59;
+    for (unsigned y = 0; y < screen_height; ++y) {
+        auto* row = static_cast<std::uint8_t*>(copy_surface.pixels) + y * copy_surface.pitch;
+        for (unsigned x = 0; x < screen_width; ++x) {
+            constexpr std::uint32_t background = 0xff102030u;
+            std::memcpy(row + x * 4, &background, sizeof(background));
+        }
+    }
+    unlock(reinterpret_cast<void*>(-1));
+    source(indexed_sprite);
+    target(reinterpret_cast<void*>(-1));
+    draw(0, 0, 0, 0, static_cast<int>(screen_width), static_cast<int>(screen_height));
+    if (!lock(reinterpret_cast<void*>(-1), &copy_surface, 1) || !copy_surface.pixels) return 60;
+    for (unsigned y = 0; y < screen_height; ++y) {
+        const auto* row = static_cast<const std::uint8_t*>(copy_surface.pixels) + y * copy_surface.pitch;
+        for (unsigned x = 0; x < screen_width; ++x) {
+            const unsigned column = x >= 5 ? (x - 5) / 96 : 26;
+            const unsigned band = y >= 7 ? (y - 7) / 88 : 16;
+            const bool copied = column < 26 && band < 16 && band * 26 + column < 413 &&
+                x >= 5 + column * 96 && x < 56 + column * 96 &&
+                y >= 7 + band * 88 && y < 44 + band * 88;
+            const auto index = static_cast<std::uint8_t>(x * 13u + y * 29u);
+            const auto expected = copied ? 0xff000000u | (static_cast<std::uint32_t>(index) * 0x010101u) : 0xff102030u;
+            std::uint32_t actual = 0;
+            std::memcpy(&actual, row + x * 4, sizeof(actual));
+            if (actual != expected) {
+                unlock(reinterpret_cast<void*>(-1));
+                return 61;
+            }
+        }
+    }
+    unlock(reinterpret_cast<void*>(-1));
+    reset_clipper();
+    for (const RECT& r : qhd_scroll_clips) add_clip(r.left, r.top, r.right, r.bottom);
+    if (!write_pattern(reinterpret_cast<void*>(-1), 91)) return 72;
+    source(indexed_sprite);
+    target(reinterpret_cast<void*>(-1));
+    draw(0, 0, 0, 0, static_cast<int>(screen_width), static_cast<int>(screen_height));
+    if (!lock(reinterpret_cast<void*>(-1), &copy_surface, 1) || !copy_surface.pixels) return 73;
+    for (unsigned y = 0; y < screen_height; ++y) {
+        const auto* row = static_cast<const std::uint8_t*>(copy_surface.pixels) + y * copy_surface.pitch;
+        for (unsigned x = 0; x < screen_width; ++x) {
+            const auto index = static_cast<std::uint8_t>(x * 13u + y * 29u);
+            const auto expected = captured_mask[static_cast<std::size_t>(y) * screen_width + x]
+                ? 0xff000000u | (static_cast<std::uint32_t>(index) * 0x010101u) : screen_pattern(x, y, 91);
+            std::uint32_t actual = 0;
+            std::memcpy(&actual, row + x * 4, sizeof(actual));
+            if (actual != expected) {
+                unlock(reinterpret_cast<void*>(-1));
+                return 74;
+            }
+        }
+    }
+    unlock(reinterpret_cast<void*>(-1));
+    clipping(previous_clipping);
+    set_clipper(previous_clipper);
+    free_clipper(clipper);
+    source(saved_source);
+    target(saved_target);
+    free_texture(indexed_sprite);
+    constexpr unsigned map_width = 2276;
+    constexpr unsigned map_height = 1398;
+    constexpr int view_top = 42;
+    void* map_texture = create(static_cast<std::uint16_t>(map_width), static_cast<std::uint16_t>(map_height), 0);
+    if (!map_texture) return 62;
+    LockOutput map_pixels = {};
+    if (!lock(map_texture, &map_pixels, 2) || !map_pixels.pixels ||
+        map_pixels.width != map_width || map_pixels.height != map_height || map_pixels.pitch < map_width * 4)
+        return 63;
+    for (unsigned y = 0; y < map_height; ++y) {
+        auto* row = static_cast<std::uint8_t*>(map_pixels.pixels) + y * map_pixels.pitch;
+        for (unsigned x = 0; x < map_width; ++x) {
+            const auto pixel = screen_pattern(x, y, 107);
+            std::memcpy(row + x * 4, &pixel, sizeof(pixel));
+        }
+    }
+    unlock(map_texture);
+    constexpr std::uint32_t untouched = 0xff102030u;
+    const int map_clipping = clipping(0);
+    source(map_texture);
+    // The second offset is the near-edge position captured in live frame 21.
+    const std::array<std::array<int, 2>, 2> scroll_offsets = {{{238, 308}, {2106, 330}}};
+    for (const auto& offset : scroll_offsets) {
+        const int scroll_x = offset[0];
+        const int scroll_y = offset[1];
+        const int split_x = static_cast<int>(map_width) - scroll_x;
+        const int split_y = static_cast<int>(map_height) - scroll_y;
+        target(nullptr);
+        if (!lock(reinterpret_cast<void*>(-4), &copy_surface, 2) || !copy_surface.pixels) return 64;
+        for (unsigned y = 0; y < screen_height; ++y) {
+            auto* row = static_cast<std::uint8_t*>(copy_surface.pixels) + y * copy_surface.pitch;
+            for (unsigned x = 0; x < screen_width; ++x) std::memcpy(row + x * 4, &untouched, sizeof(untouched));
+        }
+        unlock(reinterpret_cast<void*>(-4));
+        target(reinterpret_cast<void*>(-4));
+        draw(0, 0, scroll_x, view_top + split_y, split_x, scroll_y);
+        draw(0, scroll_y, scroll_x, view_top, split_x, split_y);
+        draw(split_x, 0, 0, view_top + split_y, scroll_x, scroll_y);
+        draw(split_x, scroll_y, 0, view_top, scroll_x, split_y);
+        if (!lock(reinterpret_cast<void*>(-4), &copy_surface, 1) || !copy_surface.pixels) return 65;
+        for (unsigned y = 0; y < screen_height; ++y) {
+            const auto* row = static_cast<const std::uint8_t*>(copy_surface.pixels) + y * copy_surface.pitch;
+            for (unsigned x = 0; x < screen_width; ++x) {
+                const bool in_map_view = x < map_width && y >= view_top;
+                const auto source_x = (x + map_width - scroll_x) % map_width;
+                const auto source_y = (y + map_height - (view_top + split_y)) % map_height;
+                const auto expected = in_map_view ? screen_pattern(source_x, source_y, 107) : untouched;
+                std::uint32_t actual = 0;
+                std::memcpy(&actual, row + x * 4, sizeof(actual));
+                if (actual != expected) {
+                    unlock(reinterpret_cast<void*>(-4));
+                    return 66;
+                }
+            }
+        }
+        unlock(reinterpret_cast<void*>(-4));
+    }
+    clipping(map_clipping);
+    source(saved_source);
+    target(saved_target);
+    free_texture(map_texture);
     constexpr std::uint32_t marker = 0xff39a7d2;
     target(reinterpret_cast<void*>(-4));
     const auto previous_constant_color = set_constant_color(marker);

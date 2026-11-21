@@ -42,12 +42,15 @@ private:
     UINT output_height_ = 0;
     HWND window_ = nullptr;
     RECT output_rect_{};
+    LONG_PTR windowed_style_ = 0;
+    LONG_PTR windowed_extended_style_ = 0;
     LONG_PTR original_style_ = 0;
     LONG_PTR original_extended_style_ = 0;
     RECT original_window_rect_{};
     DisplayMode mode_ = DisplayMode::Borderless;
     bool window_subclassed_ = false;
     bool original_window_state_saved_ = false;
+    bool window_change_in_progress_ = false;
 };
 
 }

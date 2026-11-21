@@ -1882,6 +1882,63 @@ int wmain(int argc, wchar_t** argv) {
         std::printf("Snapshot self-blit flags=%u shift=(%d,%d): pass.\n", probe.flags, probe.dx, probe.dy);
         replacement_unlock(new_blt_source);
     }
+    constexpr std::uint32_t qhd_scroll_width = 2560;
+    constexpr std::uint32_t qhd_scroll_height = 1440;
+    void* new_qhd_scroll = replacement_create_memory(static_cast<std::uint16_t>(qhd_scroll_width),
+        static_cast<std::uint16_t>(qhd_scroll_height), 0);
+    if (!new_qhd_scroll) return 167;
+    LockedTexture qhd_scroll_pixels = {};
+    if (!replacement_lock(new_qhd_scroll, &qhd_scroll_pixels, 2) ||
+        qhd_scroll_pixels.width != qhd_scroll_width || qhd_scroll_pixels.height != qhd_scroll_height ||
+        qhd_scroll_pixels.pitch < qhd_scroll_width * 4u) return 168;
+    std::vector<std::uint32_t> qhd_scroll_expected(static_cast<std::size_t>(qhd_scroll_width) * qhd_scroll_height);
+    for (std::uint32_t y = 0; y < qhd_scroll_height; ++y) {
+        auto* row = qhd_scroll_pixels.pixels + static_cast<std::size_t>(y) * qhd_scroll_pixels.pitch;
+        for (std::uint32_t x = 0; x < qhd_scroll_width; ++x) {
+            const std::uint32_t pixel = 0xff000000u | ((x & 0xffu) << 16) | ((y & 0xffu) << 8) | ((x ^ y) & 0xffu);
+            std::memcpy(row + static_cast<std::size_t>(x) * 4, &pixel, 4);
+            qhd_scroll_expected[static_cast<std::size_t>(y) * qhd_scroll_width + x] = pixel;
+        }
+    }
+    replacement_unlock(new_qhd_scroll);
+    replacement_source(new_qhd_scroll);
+    replacement_target(new_qhd_scroll);
+    const std::array<BlitCase, 4> qhd_scroll_steps{{
+        {0, 42, 0, 174, 2276, 1266, 4}, {0, 42, 0, 174, 2276, 1266, 4},
+        {0, 174, 0, 42, 2276, 1266, 4}, {0, 174, 0, 42, 2276, 1266, 4}
+    }};
+    for (std::size_t step = 0; step < qhd_scroll_steps.size(); ++step) {
+        const auto& item = qhd_scroll_steps[step];
+        const auto before = qhd_scroll_expected;
+        for (int y = 0; y < item.height; ++y) {
+            const auto* source_row = before.data() + static_cast<std::size_t>(item.sy + y) * qhd_scroll_width + item.sx;
+            auto* target_row = qhd_scroll_expected.data() + static_cast<std::size_t>(item.dy + y) * qhd_scroll_width + item.dx;
+            std::memcpy(target_row, source_row, static_cast<std::size_t>(item.width) * sizeof(std::uint32_t));
+        }
+        new_blt(item.sx, item.sy, item.dx, item.dy, item.width, item.height, item.flags);
+        if (!replacement_lock(new_qhd_scroll, &qhd_scroll_pixels, 1)) return 169;
+        for (std::uint32_t y = 0; y < qhd_scroll_height; ++y) {
+            const auto* expected = qhd_scroll_expected.data() + static_cast<std::size_t>(y) * qhd_scroll_width;
+            const auto* actual = qhd_scroll_pixels.pixels + static_cast<std::size_t>(y) * qhd_scroll_pixels.pitch;
+            if (std::memcmp(expected, actual, static_cast<std::size_t>(qhd_scroll_width) * sizeof(std::uint32_t))) {
+                for (std::uint32_t x = 0; x < qhd_scroll_width; ++x) {
+                    std::uint32_t actual_pixel = 0;
+                    std::memcpy(&actual_pixel, actual + static_cast<std::size_t>(x) * 4, 4);
+                    if (expected[x] != actual_pixel) {
+                        std::fprintf(stderr,
+                            "QHD scroll self-copy mismatch after step %zu at (%u,%u): expected=%08x actual=%08x.\n",
+                            step + 1, x, y, expected[x], actual_pixel);
+                        return 170;
+                    }
+                }
+            }
+        }
+        replacement_unlock(new_qhd_scroll);
+    }
+    replacement_source(nullptr);
+    replacement_target(nullptr);
+    replacement_free(new_qhd_scroll);
+    std::puts("QHD scroll self-copies match the expected pixels at 2560x1440.");
     std::fflush(stdout);
     const auto old_blt_rc = resolve<void (__cdecl*)(std::uint32_t)>(library, "sgl_Blt_RC");
     const auto new_blt_rc = resolve<void (__cdecl*)(std::uint32_t)>(replacement, "sgl_Blt_RC");

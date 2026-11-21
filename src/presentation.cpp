@@ -158,8 +158,27 @@ Presentation::~Presentation() noexcept { close(); }
 LRESULT CALLBACK Presentation::window_subclass_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
     UINT_PTR, DWORD_PTR reference_data) noexcept {
     auto* presentation = reinterpret_cast<Presentation*>(reference_data);
-    if (presentation && presentation->mode_ == DisplayMode::Borderless &&
-        window == presentation->window_ && message == WM_WINDOWPOSCHANGING && lparam) {
+    if (!presentation || window != presentation->window_ || presentation->window_change_in_progress_)
+        return DefSubclassProc(window, message, wparam, lparam);
+
+    if (presentation->mode_ == DisplayMode::Windowed && message == WM_STYLECHANGING &&
+        wparam == static_cast<WPARAM>(GWL_STYLE) && lparam) {
+        auto* style = reinterpret_cast<STYLESTRUCT*>(lparam);
+        style->styleNew = static_cast<DWORD>(presentation->windowed_style_);
+    } else if (presentation->mode_ == DisplayMode::Windowed &&
+        message == WM_WINDOWPOSCHANGING && lparam) {
+        auto* position = reinterpret_cast<WINDOWPOS*>(lparam);
+        if (!(position->flags & SWP_NOSIZE)) {
+            RECT rect{0, 0, static_cast<LONG>(presentation->output_width_),
+                static_cast<LONG>(presentation->output_height_)};
+            if (AdjustWindowRectEx(&rect, static_cast<DWORD>(presentation->windowed_style_),
+                GetMenu(window) != nullptr, static_cast<DWORD>(presentation->windowed_extended_style_))) {
+                position->cx = rect.right - rect.left;
+                position->cy = rect.bottom - rect.top;
+            }
+        }
+    } else if (presentation->mode_ == DisplayMode::Borderless &&
+        message == WM_WINDOWPOSCHANGING && lparam) {
         auto* position = reinterpret_cast<WINDOWPOS*>(lparam);
         if (!(position->flags & SWP_NOMOVE)) {
             position->x = presentation->output_rect_.left;
@@ -190,7 +209,9 @@ void Presentation::close() noexcept {
     render_width_ = render_height_ = output_width_ = output_height_ = 0;
     original_style_ = original_extended_style_ = 0;
     original_window_rect_ = {};
+    windowed_style_ = windowed_extended_style_ = 0;
     mode_ = DisplayMode::Borderless;
+    window_change_in_progress_ = false;
 }
 
 HRESULT Presentation::initialize(ID3D11Device* device, HWND window, UINT width, UINT height, DisplayMode mode) noexcept {
@@ -226,6 +247,19 @@ HRESULT Presentation::initialize(ID3D11Device* device, HWND window, UINT width, 
         restore_window(window, original_style, original_extended_style, original_window_rect);
         return E_INVALIDARG;
     }
+    LONG_PTR windowed_style = 0, windowed_extended_style = 0;
+    if (mode == DisplayMode::Windowed) {
+        hr = get_window_value(window, GWL_STYLE, windowed_style);
+        if (FAILED(hr)) {
+            restore_window(window, original_style, original_extended_style, original_window_rect);
+            return hr;
+        }
+        hr = get_window_value(window, GWL_EXSTYLE, windowed_extended_style);
+        if (FAILED(hr)) {
+            restore_window(window, original_style, original_extended_style, original_window_rect);
+            return hr;
+        }
+    }
     ComPtr<IDXGIDevice> dxgi_device;
     hr = device->QueryInterface(IID_PPV_ARGS(&dxgi_device));
     if (FAILED(hr)) { restore_window(window, original_style, original_extended_style, original_window_rect); return hr; }
@@ -256,6 +290,8 @@ HRESULT Presentation::initialize(ID3D11Device* device, HWND window, UINT width, 
     if (FAILED(hr)) { restore_window(window, original_style, original_extended_style, original_window_rect); return hr; }
     window_ = window;
     output_rect_ = output_rect;
+    windowed_style_ = windowed_style;
+    windowed_extended_style_ = windowed_extended_style;
     if (!SetWindowSubclass(window_, window_subclass_proc, reinterpret_cast<UINT_PTR>(this),
         reinterpret_cast<DWORD_PTR>(this))) {
         window_ = nullptr;
@@ -283,7 +319,9 @@ HRESULT Presentation::initialize(ID3D11Device* device, HWND window, UINT width, 
 HRESULT Presentation::set_render_size(UINT width, UINT height) noexcept {
     if (!swap_chain_ || !is_supported_display_size({width, height})) return E_INVALIDARG;
     if (mode_ == DisplayMode::Windowed) {
+        window_change_in_progress_ = true;
         HRESULT hr = place_windowed_client(window_, output_width_, output_height_);
+        window_change_in_progress_ = false;
         if (FAILED(hr)) return hr;
         if (width != output_width_ || height != output_height_) {
             hr = resize_windowed_output(width, height);
@@ -314,7 +352,9 @@ HRESULT Presentation::resize_windowed_output(UINT width, UINT height) noexcept {
     device_->GetImmediateContext(&context);
     if (!context) return E_FAIL;
     RECT previous_rect = {};
+    window_change_in_progress_ = true;
     HRESULT hr = place_windowed_client(window_, width, height, &previous_rect);
+    window_change_in_progress_ = false;
     if (FAILED(hr)) return hr;
 
     const UINT previous_width = output_width_;
