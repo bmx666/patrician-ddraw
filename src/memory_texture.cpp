@@ -1132,6 +1132,8 @@ extern "C" void* __cdecl sgl_InitScreen(HWND window, int fullscreen, const char*
             view_state.logical_height = previous_logical_height;
             return nullptr;
         }
+        if (!sgl::set_game_frame_limit(surface_renderer.max_fps()))
+            OutputDebugStringA("Frame limit: the game's frame limiter does not match the verified executable\n");
         // Not fatal: without it the window still works, but the game can move it, keep it topmost and hold capture.
         if (surface_renderer.display_mode() == sgl::DisplayMode::Windowed && !sgl::install_game_window_binding(window))
             OutputDebugStringA("Windowed mode: cannot bind the game's window placement, capture and cursor calls\n");

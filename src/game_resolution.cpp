@@ -573,6 +573,39 @@ void remove_aim_map_hook() noexcept {
 }
 }
 
+namespace {
+// FUN_004bd180 runs once per frame: if fewer than 20 ms passed since the previous frame it sleeps for the rest,
+// otherwise Sleep(1). The accumulated timeGetTime delta drives game time, so the limit sets the frame rate only.
+// Bytes: cmp ecx, 20 / jae +0x18 / sub eax, esi / add eax, 20.
+constexpr std::size_t frame_limiter_rva = 0xbd1a9;
+constexpr std::array<std::uint8_t, 10> frame_limiter_original{0x83, 0xf9, 0x14, 0x73, 0x18, 0x2b, 0xc6, 0x83, 0xc0, 0x14};
+constexpr std::size_t frame_limiter_compare = 2;
+constexpr std::size_t frame_limiter_sleep = 9;
+
+bool write_frame_limit(std::uint8_t* base, std::uint8_t milliseconds) noexcept {
+    auto* const code = base + frame_limiter_rva;
+    std::array<std::uint8_t, 10> current{};
+    std::memcpy(current.data(), code, current.size());
+    current[frame_limiter_compare] = current[frame_limiter_sleep] = frame_limiter_original[frame_limiter_compare];
+    if (current != frame_limiter_original) return false;
+    DWORD protection = 0, discarded = 0;
+    if (!VirtualProtect(code, frame_limiter_original.size(), PAGE_EXECUTE_READWRITE, &protection)) return false;
+    code[frame_limiter_compare] = code[frame_limiter_sleep] = milliseconds;
+    const bool flushed = FlushInstructionCache(GetCurrentProcess(), code, frame_limiter_original.size()) != FALSE;
+    return VirtualProtect(code, frame_limiter_original.size(), protection, &discarded) && flushed;
+}
+}
+
+bool sgl::set_game_frame_limit(std::optional<unsigned> max_fps) noexcept {
+    if (!game) return true;
+    std::uint8_t milliseconds = frame_limiter_original[frame_limiter_compare];
+    if (max_fps) {
+        if (*max_fps != 0 && (*max_fps < 10 || *max_fps > 1000)) return false;
+        milliseconds = *max_fps ? static_cast<std::uint8_t>((1000u + *max_fps / 2) / *max_fps) : 0;
+    }
+    return write_frame_limit(game, milliseconds);
+}
+
 bool sgl::install_game_resolution(DisplaySize size, std::string& error) {
     if (game) return game_width == size.width && game_height == size.height;
     std::array<wchar_t, 32768> path{};
@@ -676,6 +709,7 @@ void sgl::set_fast_forward_map_source_size(DisplaySize size) noexcept {
 
 void sgl::remove_game_resolution() noexcept {
     if (!game) return;
+    write_frame_limit(game, frame_limiter_original[frame_limiter_compare]);
     remove_aim_map_hook();
     DWORD protection = 0, discarded = 0;
     if (!VirtualProtect(game + patch_start, patch_span, PAGE_EXECUTE_READWRITE, &protection))

@@ -29,6 +29,7 @@ public:
     DisplaySize screen_size() const noexcept;
     DisplaySize output_size() const noexcept;
     DisplayMode display_mode() const noexcept;
+    std::optional<unsigned> max_fps() const noexcept;
     HRESULT present(void* id, const DecodedImage& image) noexcept;
 
 private:

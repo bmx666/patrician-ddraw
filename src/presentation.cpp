@@ -180,6 +180,7 @@ HRESULT Presentation::initialize_configured(ID3D11Device* device, HWND window, c
     DisplayConfig config{};
     if (!display_config(window, path, config, error)) return E_INVALIDARG;
     const HRESULT hr = initialize(device, window, config.size.width, config.size.height, config.mode);
+    if (SUCCEEDED(hr)) max_fps_ = config.max_fps;
     if (FAILED(hr)) {
         error = hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) ?
             "The selected windowed resolution does not fit within the monitor work area; choose a lower resolution or borderless mode." :
@@ -289,6 +290,7 @@ void Presentation::close() noexcept {
     original_window_rect_ = {};
     mode_ = DisplayMode::Borderless;
     window_change_in_progress_ = false;
+    max_fps_.reset();
 }
 
 HRESULT Presentation::initialize(ID3D11Device* device, HWND window, UINT width, UINT height, DisplayMode mode) noexcept {

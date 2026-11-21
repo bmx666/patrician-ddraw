@@ -29,6 +29,7 @@ public:
     DisplaySize render_size() const noexcept { return {render_width_, render_height_}; }
     DisplaySize output_size() const noexcept { return {output_width_, output_height_}; }
     DisplayMode display_mode() const noexcept { return mode_; }
+    std::optional<unsigned> max_fps() const noexcept { return max_fps_; }
 
 private:
     static LRESULT CALLBACK window_subclass_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
@@ -54,6 +55,7 @@ private:
     bool original_window_state_saved_ = false;
     bool window_change_in_progress_ = false;
     int revealed_cursor_count_ = 0;
+    std::optional<unsigned> max_fps_;
 };
 
 }

@@ -55,7 +55,7 @@ bool sgl::display_config(HWND window, const std::filesystem::path& path, Display
     } else {
         std::ifstream file(path, std::ios::binary);
         if (!file) { error = "Cannot read high_res.ini"; return false; }
-        bool in_display = false, has_width = false, has_height = false, has_mode = false;
+        bool in_display = false, has_width = false, has_height = false, has_mode = false, has_max_fps = false;
         std::string line;
         unsigned line_number = 0;
         while (std::getline(file, line)) {
@@ -81,6 +81,18 @@ bool sgl::display_config(HWND window, const std::filesystem::path& path, Display
                 if (equal_ascii(value, "windowed")) selected.mode = DisplayMode::Windowed;
                 else if (equal_ascii(value, "borderless")) selected.mode = DisplayMode::Borderless;
                 else { error = "high_res.ini line " + std::to_string(line_number) + ": mode must be windowed or borderless"; return false; }
+                continue;
+            } else if (equal_ascii(key, "max_fps")) {
+                if (has_max_fps) { error = "high_res.ini line " + std::to_string(line_number) + ": duplicate setting"; return false; }
+                has_max_fps = true;
+                unsigned fps = 0;
+                const auto parsed = std::from_chars(value.data(), value.data() + value.size(), fps);
+                if (value.empty() || parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+                    (fps != 0 && (fps < 10 || fps > 1000))) {
+                    error = "high_res.ini line " + std::to_string(line_number) + ": max_fps must be 0 or 10 to 1000";
+                    return false;
+                }
+                selected.max_fps = fps;
                 continue;
             } else { error = "high_res.ini line " + std::to_string(line_number) + ": unknown display setting"; return false; }
             if (*present) { error = "high_res.ini line " + std::to_string(line_number) + ": duplicate setting"; return false; }

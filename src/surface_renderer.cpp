@@ -342,6 +342,10 @@ DisplayMode SurfaceRenderer::display_mode() const noexcept {
     return presentation_.display_mode();
 }
 
+std::optional<unsigned> SurfaceRenderer::max_fps() const noexcept {
+    return presentation_.max_fps();
+}
+
 HRESULT SurfaceRenderer::present(void* id, const DecodedImage& image) noexcept {
     if (!id || image.format != ImageFormat::Bgra32 || image.pixels.empty() || !presentation_.back_buffer()) return E_INVALIDARG;
     Surface* source = nullptr;

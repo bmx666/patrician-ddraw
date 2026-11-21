@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <utility>
 
 int main() {
     wchar_t directory[MAX_PATH] = {}, filename[MAX_PATH] = {};
@@ -37,9 +38,23 @@ int main() {
         "[display]\nwidth=1920\nwidth=1920\nheight=1080\n", "[display]\nwidth=1920x\nheight=1080\n",
         "[display]\nwidth=1920\nheight=1080\nextra=1\n", "[display]\nwidth 1920\nheight=1080\n",
         "[display]\nwidth=\nheight=1080\n", "[display]\nwidth=1920\nheight=1080\nmode=fullscreen\n",
-        "[display]\nwidth=1920\nheight=1080\nmode=windowed\nmode=borderless\n"}) {
+        "[display]\nwidth=1920\nheight=1080\nmode=windowed\nmode=borderless\n",
+        "[display]\nwidth=1920\nheight=1080\nmax_fps=5\n", "[display]\nwidth=1920\nheight=1080\nmax_fps=1001\n",
+        "[display]\nwidth=1920\nheight=1080\nmax_fps=\n", "[display]\nwidth=1920\nheight=1080\nmax_fps=60\nmax_fps=60\n"}) {
         if (!write(invalid) || sgl::display_config(GetDesktopWindow(), path, config, error) || error.empty()) return 3;
     }
+    if (config.max_fps) return 22;
+    for (const auto& [text, expected] : std::array<std::pair<const char*, unsigned>, 3>{{
+        {"[display]\nwidth=1920\nheight=1080\nmax_fps=0\n", 0u},
+        {"[display]\nwidth=1920\nheight=1080\nmax_fps=144\n", 144u},
+        {"[display]\nwidth=1920\nheight=1080\nmax_fps=1000\n", 1000u}}}) {
+        if (!write(text) || !sgl::display_config(GetDesktopWindow(), path, config, error) ||
+            !config.max_fps || *config.max_fps != expected) return 23;
+    }
+    if (!write("[display]\nwidth=1920\nheight=1080\nmax_fps=144\n") ||
+        !sgl::save_display_config(path, {2560, 1440}, sgl::DisplayMode::Windowed, error) ||
+        !sgl::display_config(GetDesktopWindow(), path, config, error) || !config.max_fps || *config.max_fps != 144)
+        return 24;
     if (!write("; keep this comment\n[other]\nvalue=preserved\n[display]\nwidth=1920\nheight=1080\nmode=windowed\n[tail]\nvalue=also preserved\n") ||
         !sgl::save_display_config(path, {2560, 1440}, sgl::DisplayMode::Borderless, error)) return 13;
     const auto saved = read();
