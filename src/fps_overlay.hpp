@@ -17,6 +17,9 @@ struct FrameCounters {
     unsigned readbacks = 0;
     unsigned uploads = 0;
     unsigned long long transfer_bytes = 0;
+    // QueryPerformanceCounter ticks spent in readbacks (including the GPU wait) and in uploads.
+    long long readback_ticks = 0;
+    long long upload_ticks = 0;
 };
 
 // Frame statistics drawn into the top-left corner of the presented image: frames per second, average frame time
@@ -29,7 +32,7 @@ public:
     void reset() noexcept;
     const std::string& text() const noexcept { return text_; }
 
-    static constexpr UINT max_characters = 56;
+    static constexpr UINT max_characters = 80;
     static constexpr UINT glyph_width = 5;
     static constexpr UINT glyph_height = 7;
     static constexpr UINT padding = 2;

@@ -42,6 +42,8 @@ public:
         ID3D11ShaderResourceView* mask, ID3D11ShaderResourceView* background,
         UINT target_width, UINT target_height, Rect source_rect, Rect destination_rect, RECT clip,
         std::uint32_t modulation_color = 0xffffffff, const char** failure_stage = nullptr) noexcept;
+    // Call after binding or unbinding pipeline state outside the compositor.
+    void invalidate_renderer_bindings() noexcept;
 
 private:
     friend class SurfaceRenderer;
@@ -84,6 +86,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> rasterizer_;
     ID3D11DeviceContext* renderer_state_context_ = nullptr;
     ID3D11PixelShader* renderer_pixel_shader_ = nullptr;
+    // Renderer-owned draws also keep target, viewport and shader resources bound between draws.
+    ID3D11RenderTargetView* renderer_target_ = nullptr;
+    UINT renderer_viewport_width_ = 0;
+    UINT renderer_viewport_height_ = 0;
+    ID3D11ShaderResourceView* renderer_resources_[5] = {};
 };
 
 }

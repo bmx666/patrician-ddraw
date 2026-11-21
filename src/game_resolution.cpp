@@ -596,6 +596,8 @@ bool write_frame_limit(std::uint8_t* base, std::uint8_t milliseconds) noexcept {
 }
 }
 
+bool sgl::game_binding_active() noexcept { return game != nullptr; }
+
 bool sgl::set_game_frame_limit(std::optional<unsigned> max_fps) noexcept {
     if (!game) return true;
     std::uint8_t milliseconds = frame_limiter_original[frame_limiter_compare];

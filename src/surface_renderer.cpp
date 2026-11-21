@@ -108,8 +108,17 @@ HRESULT SurfaceRenderer::surface(void* id, const DecodedImage& image, Surface*& 
     return S_OK;
 }
 
+namespace {
+long long performance_counter() noexcept {
+    LARGE_INTEGER value{};
+    QueryPerformanceCounter(&value);
+    return value.QuadPart;
+}
+}
+
 HRESULT SurfaceRenderer::upload_cpu_image(Surface& surface, const DecodedImage& image) noexcept {
     if (surface.cpu_needs_upload) {
+        const long long started = performance_counter();
         std::vector<std::uint8_t> converted;
         const std::uint8_t* pixels = nullptr;
         UINT pitch = 0;
@@ -118,6 +127,7 @@ HRESULT SurfaceRenderer::upload_cpu_image(Surface& surface, const DecodedImage& 
         context_->UpdateSubresource(surface.texture.Get(), 0, nullptr, pixels, pitch, 0);
         ++counters_.uploads;
         counters_.transfer_bytes += static_cast<unsigned long long>(pitch) * image.height;
+        counters_.upload_ticks += performance_counter() - started;
         surface.cpu_needs_upload = false;
         surface.cpu_needs_readback = false;
         surface.gpu_dirty = {};
@@ -192,6 +202,7 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
     if (bound_target_ && (bound_target_ == src->texture.Get() || (mask && bound_target_ == mask_surface->texture.Get()))) {
         context_->OMSetRenderTargets(0, nullptr, nullptr);
         bound_target_ = nullptr;
+        compositor_.invalidate_renderer_bindings();
     }
     if (failure_stage) *failure_stage = "source texture upload";
     hr = upload_cpu_image(*src, source);
@@ -300,8 +311,10 @@ HRESULT SurfaceRenderer::synchronize_to_cpu(void* id, DecodedImage& image) noexc
         target.gpu_dirty = {};
         return S_OK;
     }
+    const long long started = performance_counter();
     context_->OMSetRenderTargets(0, nullptr, nullptr);
     bound_target_ = nullptr;
+    compositor_.invalidate_renderer_bindings();
     ID3D11ShaderResourceView* empty[] = {nullptr, nullptr, nullptr, nullptr, nullptr};
     context_->PSSetShaderResources(0, 5, empty);
     const D3D11_BOX region{static_cast<UINT>(dirty.left), static_cast<UINT>(dirty.top), 0,
@@ -330,6 +343,7 @@ HRESULT SurfaceRenderer::synchronize_to_cpu(void* id, DecodedImage& image) noexc
     ++counters_.readbacks;
     counters_.transfer_bytes += static_cast<unsigned long long>(columns) * 4 * static_cast<unsigned long long>(dirty.bottom - dirty.top);
     target.gpu_dirty = {};
+    counters_.readback_ticks += performance_counter() - started;
     target.cpu_needs_upload = false;
     target.cpu_needs_readback = false;
     return S_OK;
@@ -338,6 +352,60 @@ HRESULT SurfaceRenderer::synchronize_to_cpu(void* id, DecodedImage& image) noexc
 bool SurfaceRenderer::gpu_holds_newer_pixels(void* id) const noexcept {
     const auto found = surfaces_.find(id);
     return found != surfaces_.end() && found->second.cpu_needs_readback && !found->second.cpu_needs_upload;
+}
+
+HRESULT SurfaceRenderer::synchronize_region_to_cpu(void* id, DecodedImage& image, RECT region) noexcept {
+    const auto found = surfaces_.find(id);
+    if (found == surfaces_.end()) return S_OK;
+    auto& target = found->second;
+    if (!target.cpu_needs_readback || target.cpu_needs_upload) return S_OK;
+    if (!context_ || !target.staging || image.format != ImageFormat::Bgra32 || image.pixels.empty() ||
+        image.pitch < static_cast<std::uint64_t>(image.width) * 4 ||
+        static_cast<std::uint64_t>(image.pitch) * image.height > image.pixels.size()) return E_INVALIDARG;
+    const RECT& dirty = target.gpu_dirty;
+    region = {std::max({region.left, dirty.left, 0L}), std::max({region.top, dirty.top, 0L}),
+        std::min({region.right, dirty.right, static_cast<LONG>(image.width)}),
+        std::min({region.bottom, dirty.bottom, static_cast<LONG>(image.height)})};
+    if (region.left >= region.right || region.top >= region.bottom) return S_OK;
+    const long long started = performance_counter();
+    const D3D11_BOX box{static_cast<UINT>(region.left), static_cast<UINT>(region.top), 0,
+        static_cast<UINT>(region.right), static_cast<UINT>(region.bottom), 1};
+    context_->CopySubresourceRegion(target.staging.Get(), 0, box.left, box.top, 0, target.texture.Get(), 0, &box);
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    const HRESULT hr = context_->Map(target.staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) return hr;
+    const auto columns = static_cast<std::size_t>(region.right - region.left) * 4;
+    for (LONG y = region.top; y < region.bottom; ++y) {
+        std::memcpy(image.pixels.data() + static_cast<std::size_t>(y) * image.pitch + static_cast<std::size_t>(region.left) * 4,
+            static_cast<const std::uint8_t*>(mapped.pData) + static_cast<std::size_t>(y) * mapped.RowPitch +
+                static_cast<std::size_t>(region.left) * 4, columns);
+    }
+    context_->Unmap(target.staging.Get(), 0);
+    ++counters_.readbacks;
+    counters_.transfer_bytes += static_cast<unsigned long long>(columns) * static_cast<unsigned long long>(region.bottom - region.top);
+    counters_.readback_ticks += performance_counter() - started;
+    return S_OK;
+}
+
+HRESULT SurfaceRenderer::upload_region(void* id, const DecodedImage& image, RECT region) noexcept {
+    const auto found = surfaces_.find(id);
+    if (found == surfaces_.end() || found->second.cpu_needs_upload) return S_OK;
+    if (!context_ || image.format != ImageFormat::Bgra32 || image.pixels.empty() ||
+        static_cast<std::uint64_t>(image.pitch) * image.height > image.pixels.size()) return E_INVALIDARG;
+    region = {std::max(region.left, 0L), std::max(region.top, 0L), std::min(region.right, static_cast<LONG>(image.width)),
+        std::min(region.bottom, static_cast<LONG>(image.height))};
+    if (region.left >= region.right || region.top >= region.bottom) return S_OK;
+    const long long started = performance_counter();
+    const D3D11_BOX box{static_cast<UINT>(region.left), static_cast<UINT>(region.top), 0,
+        static_cast<UINT>(region.right), static_cast<UINT>(region.bottom), 1};
+    context_->UpdateSubresource(found->second.texture.Get(), 0, &box,
+        image.pixels.data() + static_cast<std::size_t>(region.top) * image.pitch + static_cast<std::size_t>(region.left) * 4,
+        image.pitch, 0);
+    ++counters_.uploads;
+    counters_.transfer_bytes += static_cast<unsigned long long>(region.right - region.left) * 4 *
+        static_cast<unsigned long long>(region.bottom - region.top);
+    counters_.upload_ticks += performance_counter() - started;
+    return S_OK;
 }
 
 void SurfaceRenderer::mark_cpu_modified(void* id) noexcept {
@@ -360,6 +428,7 @@ void SurfaceRenderer::forget(void* id) noexcept {
     if (context_ && bound_target_ == found->second.texture.Get()) {
         context_->OMSetRenderTargets(0, nullptr, nullptr);
         bound_target_ = nullptr;
+        compositor_.invalidate_renderer_bindings();
     }
     surfaces_.erase(found);
 }
@@ -379,6 +448,7 @@ void SurfaceRenderer::close_screen() noexcept { presentation_.close(); }
 void SurfaceRenderer::shutdown() noexcept {
     if (context_) context_->ClearState();
     bound_target_ = nullptr;
+    compositor_.invalidate_renderer_bindings();
     presentation_.close();
     surfaces_.clear();
     compositor_ = {};
@@ -409,6 +479,7 @@ HRESULT SurfaceRenderer::present(void* id, const DecodedImage& image) noexcept {
     if (FAILED(hr)) return hr;
     context_->OMSetRenderTargets(0, nullptr, nullptr);
     bound_target_ = nullptr;
+    compositor_.invalidate_renderer_bindings();
     ID3D11ShaderResourceView* empty[] = {nullptr, nullptr, nullptr, nullptr, nullptr};
     context_->PSSetShaderResources(0, 5, empty);
     hr = upload_cpu_image(*source, image);

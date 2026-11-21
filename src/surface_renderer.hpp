@@ -19,6 +19,11 @@ public:
         Rect target_rect, RECT clip, std::uint32_t modulation_color = 0xffffffff,
         const char** failure_stage = nullptr) noexcept;
     HRESULT synchronize_to_cpu(void* id, DecodedImage& image) noexcept;
+    // Partial transfers for CPU work confined to a known region of a GPU-current BGRA surface: the readback copies
+    // the region's GPU-written pixels to the CPU; the upload copies the region's CPU pixels to the GPU. Neither
+    // changes which copy is authoritative for the rest of the surface.
+    HRESULT synchronize_region_to_cpu(void* id, DecodedImage& image, RECT region) noexcept;
+    HRESULT upload_region(void* id, const DecodedImage& image, RECT region) noexcept;
     void mark_cpu_modified(void* id) noexcept;
     // True when the GPU copy of a surface is newer than its CPU pixels, so CPU access would need a readback.
     bool gpu_holds_newer_pixels(void* id) const noexcept;

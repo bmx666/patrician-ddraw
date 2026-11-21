@@ -4,6 +4,7 @@
 #include "image_decoder.hpp"
 #include "game_resolution.hpp"
 #include "game_window_binding.hpp"
+#include <intrin.h>
 #include "unimplemented.hpp"
 #include "mouse_input_transform.hpp"
 #include "screen_transform.hpp"
@@ -451,6 +452,11 @@ Texture* load_wide_menu_background(const Texture& original, const std::string& f
 }
 }
 
+namespace water_effect {
+void install() noexcept;
+void remove() noexcept;
+}
+
 extern "C" void* __cdecl sgl_LoadMemoryTexture(const char* name, std::uint32_t flags) {
     if (!name || !*name) return nullptr;
     try {
@@ -570,7 +576,7 @@ extern "C" void* __cdecl sgl_CreateMemoryTexture(std::uint16_t width, std::uint1
 }
 
 static int lock_texture(Texture& texture, LockOutput* output, int flags, bool external_access = false,
-    LockIntent intent = LockIntent::CpuPixels) {
+    LockIntent intent = LockIntent::CpuPixels, bool defer_synchronization = false) {
     auto& image = texture.image;
     if (texture.initial_color_key_pending) {
         if (texture.keyed && image.format == sgl::ImageFormat::Bgra32) {
@@ -620,7 +626,7 @@ static int lock_texture(Texture& texture, LockOutput* output, int flags, bool ex
         } catch (const std::bad_alloc&) { return 0; }
         catch (const std::filesystem::filesystem_error&) { return 0; }
     }
-    if (external_access || (intent == LockIntent::CpuPixels && (flags & 1))) {
+    if (!defer_synchronization && (external_access || (intent == LockIntent::CpuPixels && (flags & 1)))) {
         if (FAILED(surface_renderer.synchronize_to_cpu(texture.header.data(), image))) return 0;
     }
     if (output && !image.palette.empty() && texture.locked_palette.empty()) {
@@ -910,8 +916,8 @@ static bool make_screen_transform(void* handle, const sgl::DecodedImage& image,
     return true;
 }
 
-// Fills clips in place so a caller can reuse its storage.
-static void collect_draw_clips(const sgl::DecodedImage& target, std::vector<RECT>& clips) {
+// Fills clips in place so a caller can reuse its storage. With within, only clips overlapping it are kept.
+static void collect_draw_clips(const sgl::DecodedImage& target, std::vector<RECT>& clips, const RECT* within = nullptr) {
     clips.clear();
     try {
         const RECT bounds = texture_bounds(render_destination, target);
@@ -928,8 +934,18 @@ static void collect_draw_clips(const sgl::DecodedImage& target, std::vector<RECT
             sgl::unimplemented("sgl_DrawBitmapRect unsupported clipping mode");
 
         auto* clipper = get_active_clipper();
-        clips.reserve(clipper->rectangles.size());
         const RECT clip_bounds{clip_rectangle[0], clip_rectangle[1], clip_rectangle[2], clip_rectangle[3]};
+        if (within) {
+            for (const RECT& region : clipper->rectangles) {
+                if (region.left >= within->right || region.right <= within->left ||
+                    region.top >= within->bottom || region.bottom <= within->top) continue;
+                RECT clip = region;
+                if (clipping_mode == 3 && !intersect_with(clip, clip_bounds)) continue;
+                if (intersect_with(clip, bounds)) clips.push_back(clip);
+            }
+            return;
+        }
+        clips.reserve(clipper->rectangles.size());
         for (RECT clip : clipper->rectangles) {
             if (clipping_mode == 3 && !intersect_with(clip, clip_bounds)) continue;
             if (intersect_with(clip, bounds)) clips.push_back(clip);
@@ -958,18 +974,45 @@ struct DrawClipCache {
     int logical_height = 0;
     bool screen = false;
     bool valid = false;
+    bool first_use = false;
     std::vector<RECT> clips;
 };
 static DrawClipCache draw_clip_cache;
 
+// within is the draw's bounding box in the destination's logical coordinates. The game often changes the clip
+// region between single draws; the first draw of a clip state therefore only collects the clips it overlaps,
+// and the full list is cached once the same state is used again.
 static const std::vector<RECT>& cached_draw_clips(const sgl::DecodedImage& target, bool map_to_screen,
-    const sgl::ScreenTransform& transform) {
+    const sgl::ScreenTransform& transform, const RECT* within = nullptr) {
     auto& cache = draw_clip_cache;
-    if (cache.valid && cache.version == clip_state_version && cache.destination == render_destination &&
+    const bool same_state = cache.version == clip_state_version && cache.destination == render_destination &&
         cache.width == target.width && cache.height == target.height && cache.screen == map_to_screen &&
-        cache.logical_width == view_state.logical_width && cache.logical_height == view_state.logical_height)
-        return cache.clips;
+        cache.logical_width == view_state.logical_width && cache.logical_height == view_state.logical_height;
+    if (cache.valid && same_state) return cache.clips;
+    if (within && !(cache.first_use && same_state)) {
+        static std::vector<RECT> filtered;
+        collect_draw_clips(target, filtered, within);
+        if (map_to_screen) {
+            std::size_t kept = 0;
+            for (const RECT& clip : filtered) {
+                RECT mapped{};
+                if (transform.map_clip(clip, mapped)) filtered[kept++] = mapped;
+            }
+            filtered.resize(kept);
+        }
+        cache.valid = false;
+        cache.first_use = true;
+        cache.version = clip_state_version;
+        cache.destination = render_destination;
+        cache.width = target.width;
+        cache.height = target.height;
+        cache.logical_width = view_state.logical_width;
+        cache.logical_height = view_state.logical_height;
+        cache.screen = map_to_screen;
+        return filtered;
+    }
     cache.valid = false;
+    cache.first_use = false;
     collect_draw_clips(target, cache.clips);
     if (map_to_screen) {
         std::size_t kept = 0;
@@ -1185,6 +1228,7 @@ extern "C" void* __cdecl sgl_InitScreen(HWND window, int fullscreen, const char*
         }
         if (!sgl::set_game_frame_limit(surface_renderer.max_fps()))
             OutputDebugStringA("Frame limit: the game's frame limiter does not match the verified executable\n");
+        water_effect::install();
         // Not fatal: without it the window still works, but the game can move it, keep it topmost and hold capture.
         if (surface_renderer.display_mode() == sgl::DisplayMode::Windowed && !sgl::install_game_window_binding(window))
             OutputDebugStringA("Windowed mode: cannot bind the game's window placement, capture and cursor calls\n");
@@ -1283,6 +1327,7 @@ extern "C" void __cdecl sgl_CleanUp() {
 extern "C" void __cdecl sgl_ShotDown() {
     std::lock_guard<std::mutex> lock(textures_mutex);
     destroy_screen();
+    water_effect::remove();
     sgl::remove_game_resolution();
     surface_renderer.shutdown();
     if (archive_library) FreeLibrary(archive_library);
@@ -1305,15 +1350,126 @@ extern "C" int __cdecl sgl_SwapBuffer(std::uint32_t flags) {
     return 0;
 }
 
+// City water effect. Once per frame the city view (0x588960) locks the offscreen surface (handle -4, flags 3) and calls
+// FUN_0059e8e0, which redraws its listed 8x8 water tiles in place from displaced pixels of the same surface. A whole-
+// surface lock costs a full readback (waiting for the GPU) and a full upload per frame. With this binding the lock
+// defers synchronization; the effect call reads back only the tiles plus the largest displacement and uploads only
+// the tiles it wrote.
+namespace water_effect {
+constexpr std::uintptr_t lock_return = 0x5889e7;
+constexpr std::uintptr_t call_site = 0x588a25;
+constexpr std::uintptr_t function = 0x59e8e0;
+// Tile list: count at +0x2c, (x, y) shorts every 8 bytes from +0x34, pixel offsets at +0xbbc4 and +0xbbc8.
+constexpr std::size_t tile_count_offset = 0x2c;
+constexpr std::size_t tile_list_offset = 0x34;
+constexpr std::size_t offset_x_offset = 0xbbc4;
+constexpr std::size_t offset_y_offset = 0xbbc8;
+// Height differences of -255..255 displace reads by at most 126 pixels horizontally and 127 vertically.
+constexpr LONG read_margin = 128;
+bool installed = false;
+bool lock_deferred = false;
+void* deferred_texture = nullptr;
+
+using Function = void(__fastcall*)(void*, void*, std::uint8_t*, int, int, const RECT*, int);
+
+void __fastcall hook(void* self, void* unused, std::uint8_t* pixels, int offset_x, int offset_y, const RECT* bounds,
+    int pitch) {
+    RECT written{};
+    bool partial = false;
+    {
+        std::lock_guard<std::mutex> lock(textures_mutex);
+        const auto entry = lock_deferred ? textures.find(deferred_texture) : textures.end();
+        if (entry != textures.end() && self && bounds) {
+            const auto* object = static_cast<const std::uint8_t*>(self);
+            int count = 0, shift_x = 0, shift_y = 0;
+            std::memcpy(&count, object + tile_count_offset, sizeof(count));
+            std::memcpy(&shift_x, object + offset_x_offset, sizeof(shift_x));
+            std::memcpy(&shift_y, object + offset_y_offset, sizeof(shift_y));
+            written = {LONG_MAX, LONG_MAX, LONG_MIN, LONG_MIN};
+            for (int index = 0; index < count && index < 1 << 20; ++index) {
+                std::int16_t tile[2]{};
+                std::memcpy(tile, object + tile_list_offset + static_cast<std::size_t>(index) * 8, sizeof(tile));
+                const LONG left = std::max<LONG>(tile[0] * 8 - shift_x - offset_x, bounds->left);
+                const LONG top = std::max<LONG>(tile[1] * 8 - shift_y - offset_y, bounds->top);
+                const LONG right = std::min<LONG>(tile[0] * 8 - shift_x - offset_x + 8, bounds->right);
+                const LONG bottom = std::min<LONG>(tile[1] * 8 - shift_y - offset_y + 8, bounds->bottom);
+                if (left >= right || top >= bottom) continue;
+                written = {std::min(written.left, left), std::min(written.top, top),
+                    std::max(written.right, right), std::max(written.bottom, bottom)};
+            }
+            auto& image = entry->second->image;
+            partial = true;
+            if (written.left < written.right) {
+                const RECT read{written.left - read_margin, written.top - read_margin,
+                    written.right + read_margin, written.bottom + read_margin};
+                if (FAILED(surface_renderer.synchronize_region_to_cpu(deferred_texture, image, read)))
+                    sgl::unimplemented("water effect: D3D11 region readback");
+            }
+        }
+    }
+    reinterpret_cast<Function>(function)(self, unused, pixels, offset_x, offset_y, bounds, pitch);
+    if (!partial) return;
+    std::lock_guard<std::mutex> lock(textures_mutex);
+    const auto entry = textures.find(deferred_texture);
+    if (entry != textures.end() && written.left < written.right &&
+        FAILED(surface_renderer.upload_region(deferred_texture, entry->second->image, written)))
+        sgl::unimplemented("water effect: D3D11 region upload");
+    lock_deferred = false;
+}
+
+// Redirects the effect call after checking both call sites against the verified executable.
+void install() noexcept {
+    if (installed || !sgl::game_binding_active()) return;
+    auto* const call = reinterpret_cast<std::uint8_t*>(call_site);
+    const auto* const lock_call = reinterpret_cast<const std::uint8_t*>(lock_return - 5);
+    std::int32_t relative = 0;
+    std::memcpy(&relative, call + 1, sizeof(relative));
+    if (call[0] != 0xe8 || call_site + 5 + relative != function || lock_call[0] != 0xe8) return;
+    const auto hook_relative = static_cast<std::int32_t>(reinterpret_cast<std::uintptr_t>(&hook) - (call_site + 5));
+    DWORD protection = 0, discarded = 0;
+    if (!VirtualProtect(call + 1, sizeof(hook_relative), PAGE_EXECUTE_READWRITE, &protection)) return;
+    std::memcpy(call + 1, &hook_relative, sizeof(hook_relative));
+    FlushInstructionCache(GetCurrentProcess(), call, 5);
+    VirtualProtect(call + 1, sizeof(hook_relative), protection, &discarded);
+    installed = true;
+}
+
+void remove() noexcept {
+    if (!installed) return;
+    auto* const call = reinterpret_cast<std::uint8_t*>(call_site);
+    const auto original = static_cast<std::int32_t>(function - (call_site + 5));
+    DWORD protection = 0, discarded = 0;
+    if (VirtualProtect(call + 1, sizeof(original), PAGE_EXECUTE_READWRITE, &protection)) {
+        std::memcpy(call + 1, &original, sizeof(original));
+        FlushInstructionCache(GetCurrentProcess(), call, 5);
+        VirtualProtect(call + 1, sizeof(original), protection, &discarded);
+    }
+    installed = false;
+    lock_deferred = false;
+    deferred_texture = nullptr;
+}
+}
+
 extern "C" int __cdecl sgl_LockTexture(void* handle, LockOutput* output, int flags) {
     if (flags < 1 || flags > 3) sgl::unimplemented("sgl_LockTexture flags");
+    const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
     std::lock_guard<std::mutex> lock(textures_mutex);
+    const bool water_lock = water_effect::installed && caller == water_effect::lock_return &&
+        reinterpret_cast<std::intptr_t>(handle) == -4 && flags == 3;
     handle = screen_alias(handle);
     const auto entry = textures.find(handle);
     if (entry == textures.end()) sgl::unimplemented("sgl_LockTexture object");
     auto& texture = *entry->second;
     if (texture.external_locks == UINT_MAX) sgl::unimplemented("sgl_LockTexture nesting");
-    const int result = lock_texture(texture, output, flags, true);
+    const bool defer = water_lock && texture.external_locks == 0 &&
+        texture.image.format == sgl::ImageFormat::Bgra32;
+    const int result = lock_texture(texture, output, flags, true, LockIntent::CpuPixels, defer);
+    if (result && defer) {
+        water_effect::lock_deferred = true;
+        water_effect::deferred_texture = handle;
+        ++texture.external_locks;
+        return result;
+    }
     if (result) {
         ++texture.external_locks;
         texture.external_write_pending = texture.external_write_pending || (flags & 2) != 0;
@@ -1328,6 +1484,14 @@ extern "C" void __cdecl sgl_UnlockTexture(void* handle) {
     if (entry == textures.end() || !entry->second->locks || !entry->second->external_locks ||
         (handle == render_destination && entry->second->locks == 1)) sgl::unimplemented("sgl_UnlockTexture object");
     auto& texture = *entry->second;
+    if (handle == water_effect::deferred_texture && texture.external_locks == 1) {
+        // The effect binding already uploaded the tiles it wrote; the rest of the surface is unchanged.
+        unlock_texture(texture);
+        --texture.external_locks;
+        water_effect::deferred_texture = nullptr;
+        water_effect::lock_deferred = false;
+        return;
+    }
     const bool final_external_write = texture.external_locks == 1 && texture.external_write_pending;
     unlock_texture(texture);
     --texture.external_locks;
@@ -1415,8 +1579,8 @@ extern "C" void* __cdecl sgl_SetRenderDest(void* handle) {
 extern "C" int __cdecl sgl_Set2dClippingMode(int mode) {
     std::lock_guard<std::mutex> lock(textures_mutex);
     const int previous = clipping_mode;
+    if (clipping_mode != mode) ++clip_state_version;
     clipping_mode = mode;
-    ++clip_state_version;
     return previous;
 }
 
@@ -1447,7 +1611,7 @@ extern "C" void* __cdecl sgl_SetActiveClipper(void* handle) {
         if (found == clippers.end()) sgl::unimplemented("sgl_SetActiveClipper object");
         active_clipper = found->second.get();
     }
-    ++clip_state_version;
+    if (active_clipper != previous) ++clip_state_version;
     return previous;
 }
 
@@ -1532,8 +1696,9 @@ extern "C" int __cdecl sgl_IsRectInClippingRegion(const RECT* rect) {
 
 extern "C" void __cdecl sgl_SetClipRect_4i(int left, int top, int right, int bottom) {
     std::lock_guard<std::mutex> lock(textures_mutex);
-    clip_rectangle = {left, top, right, bottom};
-    ++clip_state_version;
+    const std::array<std::int32_t, 4> next{left, top, right, bottom};
+    if (clip_rectangle != next) ++clip_state_version;
+    clip_rectangle = next;
 }
 
 extern "C" void __cdecl sgl_SetClipRect(int left, int top, int right, int bottom) {
@@ -1542,8 +1707,8 @@ extern "C" void __cdecl sgl_SetClipRect(int left, int top, int right, int bottom
 
 extern "C" void __cdecl sgl_SetClipRect_r(const std::int32_t* rectangle) {
     std::lock_guard<std::mutex> lock(textures_mutex);
+    if (std::memcmp(clip_rectangle.data(), rectangle, sizeof(clip_rectangle)) != 0) ++clip_state_version;
     std::memcpy(clip_rectangle.data(), rectangle, sizeof(clip_rectangle));
-    ++clip_state_version;
 }
 
 extern "C" void __cdecl sgl_GetClipRect_r(std::int32_t* rectangle) {
@@ -1954,9 +2119,13 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
 
     sgl::ScreenTransform destination_transform;
     const bool destination_mapped = make_screen_transform(render_destination, dst.image, destination_transform);
-    const std::vector<RECT> full_clip{{0, 0, static_cast<LONG>(dst.image.width), static_cast<LONG>(dst.image.height)}};
+    static std::vector<RECT> full_clip(1);
+    full_clip[0] = {0, 0, static_cast<LONG>(dst.image.width), static_cast<LONG>(dst.image.height)};
+    // Logical destination bounds, widened by a pixel for the rounding of mapped clips.
+    const RECT logical_bounds{dx - 1, dy - 1, dx + dw + 1, dy + dh + 1};
     const auto& clips = expanded_menu_background ? full_clip :
-        cached_draw_clips(dst.image, destination_mapped, destination_transform);
+        cached_draw_clips(dst.image, destination_mapped, destination_transform,
+            fast_forward_overlay ? nullptr : &logical_bounds);
     if (clips.empty()) return;
     sgl::Rect src_rect = expanded_menu_background
         ? sgl::Rect{0.0f, 0.0f, static_cast<float>(draw_source->image.width),

@@ -29,6 +29,8 @@ void remove_game_resolution() noexcept;
 // Rewrites the minimum frame time of the game's frame limiter (FUN_004bd180, originally 20 ms). No value restores
 // the original limiter. Requires an installed game resolution binding; a no-op for programs without one.
 bool set_game_frame_limit(std::optional<unsigned> max_fps) noexcept;
+// True while the verified GOG executable's in-memory bindings are installed.
+bool game_binding_active() noexcept;
 DisplaySize pending_game_resolution() noexcept;
 DisplayApplyResult apply_options_display_resolution(std::string& error);
 DisplaySize current_game_resolution() noexcept;

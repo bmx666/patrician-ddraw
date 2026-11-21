@@ -2,6 +2,8 @@
 
 #include <d3dcompiler.h>
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <cmath>
 
 using Microsoft::WRL::ComPtr;
@@ -488,10 +490,7 @@ HRESULT Compositor::copy_impl(ID3D11DeviceContext* context, ID3D11RenderTargetVi
     std::optional<std::uint32_t> color_key, Sampling sampling, ID3D11ShaderResourceView* background,
     std::uint32_t modulation_color, BlendMode blend, const char** failure_stage,
     const RendererSource* renderer_source) noexcept {
-    if (!renderer_source) {
-        renderer_state_context_ = nullptr;
-        renderer_pixel_shader_ = nullptr;
-    }
+    if (!renderer_source) invalidate_renderer_bindings();
     const auto fail = [failure_stage](const char* stage, HRESULT result) {
         if (failure_stage) *failure_stage = stage;
         return result;
@@ -717,12 +716,21 @@ HRESULT Compositor::copy_impl(ID3D11DeviceContext* context, ID3D11RenderTargetVi
         {modulation[0], modulation[1], modulation[2], modulation[3]},
     };
     context->UpdateSubresource(constants_.Get(), 0, nullptr, &geometry, 0, 0);
-    const D3D11_VIEWPORT viewport = {0, 0, static_cast<float>(target_width), static_cast<float>(target_height), 0, 1};
-    context->RSSetViewports(1, &viewport);
-    context->RSSetScissorRects(1, &clip);
-    context->OMSetRenderTargets(1, &target, nullptr);
     // Renderer-owned draws keep these bindings; public compositor calls invalidate the cache.
     const bool bind_renderer_state = !renderer_source || renderer_state_context_ != context;
+    if (bind_renderer_state || renderer_target_ != target) {
+        context->OMSetRenderTargets(1, &target, nullptr);
+        renderer_target_ = target;
+        // Binding a target unbinds any shader resource view of the same texture.
+        for (auto& resource : renderer_resources_) resource = reinterpret_cast<ID3D11ShaderResourceView*>(~std::uintptr_t{0});
+    }
+    if (bind_renderer_state || renderer_viewport_width_ != target_width || renderer_viewport_height_ != target_height) {
+        const D3D11_VIEWPORT viewport = {0, 0, static_cast<float>(target_width), static_cast<float>(target_height), 0, 1};
+        context->RSSetViewports(1, &viewport);
+        renderer_viewport_width_ = target_width;
+        renderer_viewport_height_ = target_height;
+    }
+    context->RSSetScissorRects(1, &clip);
     if (bind_renderer_state) {
         context->RSSetState(rasterizer_.Get());
         context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
@@ -760,11 +768,25 @@ HRESULT Compositor::copy_impl(ID3D11DeviceContext* context, ID3D11RenderTargetVi
         renderer_pixel_shader_ = renderer_source ? pixel_shader : nullptr;
     }
     ID3D11ShaderResourceView* resources[] = {palette ? nullptr : source, palette ? source : nullptr, palette, background, mask};
-    context->PSSetShaderResources(0, 5, resources);
+    if (bind_renderer_state || std::memcmp(resources, renderer_resources_, sizeof(resources)) != 0) {
+        context->PSSetShaderResources(0, 5, resources);
+        std::memcpy(renderer_resources_, resources, sizeof(resources));
+    }
     context->Draw(6, 0);
-    ID3D11ShaderResourceView* empty[] = {nullptr, nullptr, nullptr, nullptr, nullptr};
-    context->PSSetShaderResources(0, 5, empty);
+    if (!renderer_source) {
+        ID3D11ShaderResourceView* empty[] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+        context->PSSetShaderResources(0, 5, empty);
+        invalidate_renderer_bindings();
+    }
     return S_OK;
+}
+
+void Compositor::invalidate_renderer_bindings() noexcept {
+    renderer_state_context_ = nullptr;
+    renderer_pixel_shader_ = nullptr;
+    renderer_target_ = nullptr;
+    renderer_viewport_width_ = renderer_viewport_height_ = 0;
+    for (auto& resource : renderer_resources_) resource = nullptr;
 }
 
 }

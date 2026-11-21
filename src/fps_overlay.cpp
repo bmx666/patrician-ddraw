@@ -64,6 +64,8 @@ void FpsOverlay::frame_presented(const FrameCounters& counters) noexcept {
         totals_.readbacks += counters.readbacks;
         totals_.uploads += counters.uploads;
         totals_.transfer_bytes += counters.transfer_bytes;
+        totals_.readback_ticks += counters.readback_ticks;
+        totals_.upload_ticks += counters.upload_ticks;
     } else {
         window_start_ = current;
     }
@@ -82,9 +84,10 @@ void FpsOverlay::frame_presented(const FrameCounters& counters) noexcept {
 void FpsOverlay::update_text(double fps, double average_ms, double longest_ms) noexcept {
     char buffer[max_characters + 1] = {};
     const double frames = frames_ ? static_cast<double>(frames_) : 1.0;
-    std::snprintf(buffer, sizeof(buffer), "%.0f fps %.1f ms max %.1f dr %.0f rb %.1f up %.1f mb %.1f", fps, average_ms,
-        longest_ms, totals_.draws / frames, totals_.readbacks / frames, totals_.uploads / frames,
-        static_cast<double>(totals_.transfer_bytes) / frames / 1048576.0);
+    const double tick_ms = frequency_ ? 1000.0 / static_cast<double>(frequency_) / frames : 0.0;
+    std::snprintf(buffer, sizeof(buffer), "%.0f fps %.1f ms max %.1f dr %.0f rb %.1f %.1fms up %.1f %.1fms mb %.1f", fps,
+        average_ms, longest_ms, totals_.draws / frames, totals_.readbacks / frames, totals_.readback_ticks * tick_ms,
+        totals_.uploads / frames, totals_.upload_ticks * tick_ms, static_cast<double>(totals_.transfer_bytes) / frames / 1048576.0);
     text_ = buffer;
     pixels_dirty_ = true;
 }
