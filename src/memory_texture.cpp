@@ -2069,14 +2069,12 @@ extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
     const bool destination_is_screen = make_screen_transform(render_destination, image, transform);
     if (destination_is_screen) rectangle = transform.map(rectangle);
 
-    const auto pixel_bound = [](double value, std::uint32_t extent, bool round_up) {
-        const double rounded = round_up ? std::ceil(value) : std::floor(value);
-        return static_cast<LONG>(std::clamp(rounded, 0.0, static_cast<double>(extent)));
+    // Pixels whose centers lie inside the mapped rectangle, as the GPU path rasterizes it and as clips are mapped.
+    const auto pixel_bound = [](double value, std::uint32_t extent) {
+        return static_cast<LONG>(std::clamp(sgl::ScreenTransform::pixel_edge(value), 0.0, static_cast<double>(extent)));
     };
-    RECT fill{pixel_bound(rectangle.left, image.width, false),
-        pixel_bound(rectangle.top, image.height, false),
-        pixel_bound(rectangle.right, image.width, true),
-        pixel_bound(rectangle.bottom, image.height, true)};
+    RECT fill{pixel_bound(rectangle.left, image.width), pixel_bound(rectangle.top, image.height),
+        pixel_bound(rectangle.right, image.width), pixel_bound(rectangle.bottom, image.height)};
     if (!nonempty(fill)) return;
 
     const auto alpha = static_cast<std::uint8_t>(constant_color >> 24);

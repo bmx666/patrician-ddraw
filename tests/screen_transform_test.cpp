@@ -112,5 +112,19 @@ int main() {
         std::abs(transform.offset_x - 320.0) > 0.000001 ||
         std::abs(transform.offset_y) > 0.000001) return 23;
     if (sgl::ScreenTransform::create_composed(800, 600, 0, 900, 2560, 1440, transform)) return 24;
+
+    // Clips that share a logical edge must share the mapped edge: each output pixel belongs to exactly one of them.
+    // The options menu splits its dirty regions at the pointer, e.g. [526,648) and [648,729) at a 2.4 scale.
+    if (!sgl::ScreenTransform::create(800, 600, 2560, 1440, transform)) return 25;
+    RECT first{}, second{};
+    if (!transform.map_clip({526, 242, 648, 265}, first) || !transform.map_clip({648, 242, 729, 265}, second) ||
+        first.right != second.left || first.right != 1875) return 26;
+    for (LONG edge = 1; edge < 600; ++edge) {
+        if (!transform.map_clip({0, 0, edge, edge}, first) || !transform.map_clip({edge, edge, 800, 600}, second) ||
+            first.right != second.left || first.bottom != second.top) return 27;
+        // The mapped clip holds exactly the pixels whose centers a quad over the logical range covers.
+        const double mapped = transform.offset_x + edge * transform.scale;
+        if (!(first.right - 0.5 < mapped + 1e-9 && first.right + 0.5 >= mapped - 1e-9)) return 28;
+    }
     return 0;
 }

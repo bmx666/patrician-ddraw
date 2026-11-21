@@ -52,19 +52,22 @@ struct ScreenTransform {
         };
     }
 
+    // An output pixel belongs to a mapped clip when its center lies inside it, the rule the rasterizer applies to the
+    // draws themselves. Adjacent logical clips therefore map to adjacent pixel ranges without overlap or gap. Rounding
+    // each clip outward made both neighbours own the pixel on a fractional seam, so translucent draws split at that
+    // seam were blended into it twice.
     bool map_clip(const RECT& clip, RECT& result) const noexcept {
-        const double left = offset_x + clip.left * scale;
-        const double top = offset_y + clip.top * scale;
-        const double right = offset_x + clip.right * scale;
-        const double bottom = offset_y + clip.bottom * scale;
         result = {
-            clamp_pixel(std::floor(left), output_width),
-            clamp_pixel(std::floor(top), output_height),
-            clamp_pixel(std::ceil(right), output_width),
-            clamp_pixel(std::ceil(bottom), output_height)
+            clamp_pixel(pixel_edge(offset_x + clip.left * scale), output_width),
+            clamp_pixel(pixel_edge(offset_y + clip.top * scale), output_height),
+            clamp_pixel(pixel_edge(offset_x + clip.right * scale), output_width),
+            clamp_pixel(pixel_edge(offset_y + clip.bottom * scale), output_height)
         };
         return result.left < result.right && result.top < result.bottom;
     }
+
+    // First pixel whose center lies at or beyond a mapped edge.
+    static double pixel_edge(double coordinate) noexcept { return std::ceil(coordinate - 0.5); }
 
     bool inverse(float output_x, float output_y, float& logical_x, float& logical_y) const noexcept {
         const double x = (output_x - offset_x) / scale;
