@@ -6,6 +6,10 @@
 
 namespace sgl {
 
+// Client size for a windowed render size: the render size when it fits, otherwise the largest
+// aspect-correct size within the available client area. Returns {0, 0} when nothing fits.
+SIZE fit_windowed_client(UINT render_width, UINT render_height, LONG available_width, LONG available_height) noexcept;
+
 class Presentation {
 public:
     Presentation() = default;
@@ -30,7 +34,7 @@ private:
     static LRESULT CALLBACK window_subclass_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
         UINT_PTR subclass_id, DWORD_PTR reference_data) noexcept;
     HRESULT create_back_buffer() noexcept;
-    HRESULT resize_windowed_output(UINT width, UINT height) noexcept;
+    HRESULT sync_windowed_buffers() noexcept;
 
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<IDXGISwapChain> swap_chain_;
@@ -42,8 +46,6 @@ private:
     UINT output_height_ = 0;
     HWND window_ = nullptr;
     RECT output_rect_{};
-    LONG_PTR windowed_style_ = 0;
-    LONG_PTR windowed_extended_style_ = 0;
     LONG_PTR original_style_ = 0;
     LONG_PTR original_extended_style_ = 0;
     RECT original_window_rect_{};
@@ -51,6 +53,7 @@ private:
     bool window_subclassed_ = false;
     bool original_window_state_saved_ = false;
     bool window_change_in_progress_ = false;
+    int revealed_cursor_count_ = 0;
 };
 
 }

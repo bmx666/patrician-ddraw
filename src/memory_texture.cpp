@@ -3,6 +3,7 @@
 #include "color_key.hpp"
 #include "image_decoder.hpp"
 #include "game_resolution.hpp"
+#include "game_window_binding.hpp"
 #include "unimplemented.hpp"
 #include "mouse_input_transform.hpp"
 #include "screen_transform.hpp"
@@ -1113,9 +1114,7 @@ extern "C" void* __cdecl sgl_InitScreen(HWND window, int fullscreen, const char*
         screen = std::move(next);
         view_state.logical_width = logical_width;
         view_state.logical_height = logical_height;
-        const auto output_size = surface_renderer.output_size();
-        if (!sgl::install_mouse_input_transform(window, output_size.width, output_size.height,
-            size.width, size.height,
+        if (!sgl::install_mouse_input_transform(window, size.width, size.height,
             static_cast<unsigned>(view_state.logical_width), static_cast<unsigned>(view_state.logical_height))) {
             char message[128];
             std::snprintf(message, sizeof(message), "Cannot install SGL mouse coordinate transform: error=%lu\n",
@@ -1133,6 +1132,9 @@ extern "C" void* __cdecl sgl_InitScreen(HWND window, int fullscreen, const char*
             view_state.logical_height = previous_logical_height;
             return nullptr;
         }
+        // Not fatal: without it the window still works, but the game can move it, keep it topmost and hold capture.
+        if (surface_renderer.display_mode() == sgl::DisplayMode::Windowed && !sgl::install_game_window_binding(window))
+            OutputDebugStringA("Windowed mode: cannot bind the game's window placement, capture and cursor calls\n");
         return screen.get();
     } catch (const std::bad_alloc&) {
         report_screen_init_failure("initializing SGL screen", "memory allocation failed");
@@ -1180,6 +1182,7 @@ extern "C" int __cdecl sgl_SetZoomFactor(int x, int y) {
 
 static void destroy_screen() {
     if (!screen) return;
+    sgl::remove_game_window_binding();
     sgl::remove_mouse_input_transform();
     if (render_destination) {
         const auto entry = textures.find(render_destination);

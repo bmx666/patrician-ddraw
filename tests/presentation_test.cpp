@@ -1,8 +1,10 @@
 #include "presentation.hpp"
 #include "screen_transform.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <commctrl.h>
 
@@ -10,52 +12,65 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-struct FixedWindowSize {
+struct WorkArea {
+    RECT rect;
     LONG width;
     LONG height;
 };
 
-LRESULT CALLBACK fixed_window_size_subclass(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
-    UINT_PTR, DWORD_PTR reference_data) {
-    if (message == WM_WINDOWPOSCHANGING && lparam && reference_data) {
-        const auto* size = reinterpret_cast<const FixedWindowSize*>(reference_data);
-        auto* position = reinterpret_cast<WINDOWPOS*>(lparam);
-        if (!(position->flags & SWP_NOSIZE)) {
-            position->cx = size->width;
-            position->cy = size->height;
-        }
-    }
-    return DefSubclassProc(window, message, wparam, lparam);
-}
-
-bool windowed_size_fits_monitor(HWND window, UINT width, UINT height) {
-    const LONG_PTR style = (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME) & ~WS_MAXIMIZEBOX;
-    const LONG_PTR extended_style = GetWindowLongPtrW(window, GWL_EXSTYLE);
-    RECT rect{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
-    if (!AdjustWindowRectEx(&rect, static_cast<DWORD>(style), GetMenu(window) != nullptr,
-        static_cast<DWORD>(extended_style))) return false;
-    const HMONITOR handle = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+bool work_area(HWND window, WorkArea& area) {
     MONITORINFO info = {};
     info.cbSize = sizeof(info);
+    const HMONITOR handle = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
     if (!handle || !GetMonitorInfoW(handle, &info)) return false;
-    return rect.right - rect.left <= info.rcWork.right - info.rcWork.left &&
-        rect.bottom - rect.top <= info.rcWork.bottom - info.rcWork.top;
+    area = {info.rcWork, info.rcWork.right - info.rcWork.left, info.rcWork.bottom - info.rcWork.top};
+    return true;
 }
 
+SIZE frame_size(HWND window) {
+    RECT frame{0, 0, 0, 0};
+    if (!AdjustWindowRectEx(&frame, static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE)), GetMenu(window) != nullptr,
+        static_cast<DWORD>(GetWindowLongPtrW(window, GWL_EXSTYLE)))) return {0, 0};
+    return {frame.right - frame.left, frame.bottom - frame.top};
+}
+
+SIZE expected_windowed_client(HWND window, UINT width, UINT height) {
+    WorkArea area = {};
+    const SIZE frame = frame_size(window);
+    if (!work_area(window, area) || !frame.cx || !frame.cy) return {0, 0};
+    return sgl::fit_windowed_client(width, height, area.width - frame.cx, area.height - frame.cy);
+}
+
+bool client_is(HWND window, SIZE size) {
+    RECT client = {};
+    return GetClientRect(window, &client) && client.right - client.left == size.cx &&
+        client.bottom - client.top == size.cy;
+}
+
+bool output_is(const sgl::Presentation& presentation, SIZE size) {
+    D3D11_TEXTURE2D_DESC actual = {};
+    presentation.back_buffer()->GetDesc(&actual);
+    const auto output = presentation.output_size();
+    return output.width == static_cast<UINT>(size.cx) && output.height == static_cast<UINT>(size.cy) &&
+        actual.Width == output.width && actual.Height == output.height;
+}
+
+// The original executable strips the frame and requests a topmost fullscreen placement on every mode change.
 bool simulate_game_style_reset(HWND window) {
     constexpr LONG_PTR game_style = WS_VISIBLE | WS_CLIPSIBLINGS | WS_SYSMENU | WS_MINIMIZEBOX;
     SetLastError(ERROR_SUCCESS);
     const LONG_PTR previous = SetWindowLongPtrW(window, GWL_STYLE, game_style);
     if (!previous && GetLastError() != ERROR_SUCCESS) return false;
-    return SetWindowPos(window, nullptr, 0, 0, 640, 480,
-        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED) != FALSE;
+    return SetWindowPos(window, HWND_TOPMOST, 0, 0, 640, 480,
+        SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED) != FALSE;
 }
 
-bool has_fixed_windowed_style(HWND window) {
+bool has_windowed_frame(HWND window) {
     const LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
-    return !(style & (WS_POPUP | WS_THICKFRAME | WS_MAXIMIZEBOX)) && (style & WS_CAPTION);
+    const LONG_PTR extended_style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+    return (style & WS_CAPTION) == WS_CAPTION && (style & WS_THICKFRAME) && (style & WS_MAXIMIZEBOX) &&
+        !(style & WS_POPUP) && !(extended_style & WS_EX_TOPMOST);
 }
-
 }
 
 int main() {
@@ -165,77 +180,52 @@ int main() {
             {1280, 1024}, {1600, 900}, {1920, 1080}, {2560, 1440}
         }};
         const LONG_PTR borderless_style = GetWindowLongPtrW(window, GWL_STYLE);
+        const SIZE fitted = sgl::fit_windowed_client(2560, 1440, 2554, 1361);
+        const SIZE unscaled = sgl::fit_windowed_client(1920, 1080, 2554, 1361);
+        const SIZE none = sgl::fit_windowed_client(1920, 1080, 0, 1361);
+        if (fitted.cx != 2419 || fitted.cy != 1361 || unscaled.cx != 1920 || unscaled.cy != 1080 || none.cx || none.cy)
+            return 21;
         for (std::size_t i = 0; i < resolutions.size(); ++i) {
             const auto& size = resolutions[i];
             sgl::Presentation configured;
-            const HRESULT initialized = configured.initialize(device.Get(), window, size[0], size[1], sgl::DisplayMode::Windowed);
-            if (!windowed_size_fits_monitor(window, size[0], size[1])) {
-                RECT unchanged = {};
-                if (initialized != HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) ||
-                    GetWindowLongPtrW(window, GWL_STYLE) != borderless_style || !GetWindowRect(window, &unchanged) ||
-                    unchanged.left != monitor.rcMonitor.left || unchanged.top != monitor.rcMonitor.top ||
-                    unchanged.right != monitor.rcMonitor.right || unchanged.bottom != monitor.rcMonitor.bottom) return 21;
-                continue;
+            if (FAILED(configured.initialize(device.Get(), window, size[0], size[1], sgl::DisplayMode::Windowed)) ||
+                configured.display_mode() != sgl::DisplayMode::Windowed) return 22;
+            const SIZE expected = expected_windowed_client(window, size[0], size[1]);
+            if (!expected.cx || !client_is(window, expected) || !output_is(configured, expected) ||
+                !has_windowed_frame(window)) return 23;
+
+            if (!simulate_game_style_reset(window) || !has_windowed_frame(window)) {
+                std::fprintf(stderr, "After game style reset: style %08llx, extended style %08llx\n",
+                    static_cast<unsigned long long>(GetWindowLongPtrW(window, GWL_STYLE)),
+                    static_cast<unsigned long long>(GetWindowLongPtrW(window, GWL_EXSTYLE)));
+                return 32;
             }
-            if (FAILED(initialized) || configured.display_mode() != sgl::DisplayMode::Windowed) return 22;
-            const auto output = configured.output_size();
-            RECT windowed_client = {};
-            D3D11_TEXTURE2D_DESC actual = {};
-            configured.back_buffer()->GetDesc(&actual);
-            const LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
-            if (!GetClientRect(window, &windowed_client) || windowed_client.right - windowed_client.left != static_cast<LONG>(size[0]) ||
-                windowed_client.bottom - windowed_client.top != static_cast<LONG>(size[1]) || output.width != size[0] ||
-                output.height != size[1] || actual.Width != size[0] || actual.Height != size[1] ||
-                (style & WS_POPUP) || !(style & WS_CAPTION) || (style & WS_THICKFRAME) || (style & WS_MAXIMIZEBOX)) return 23;
-
-            if (!simulate_game_style_reset(window) || !GetClientRect(window, &windowed_client) ||
-                windowed_client.right - windowed_client.left != static_cast<LONG>(size[0]) ||
-                windowed_client.bottom - windowed_client.top != static_cast<LONG>(size[1]) ||
-                !has_fixed_windowed_style(window) || configured.set_render_size(size[0], size[1]) != S_OK ||
-                !GetClientRect(window, &windowed_client) ||
-                windowed_client.right - windowed_client.left != static_cast<LONG>(size[0]) ||
-                windowed_client.bottom - windowed_client.top != static_cast<LONG>(size[1]) ||
-                !has_fixed_windowed_style(window)) return 32;
-
-            const auto& next = resolutions[(i + 1) % resolutions.size()];
             if (configured.set_render_size(800, 600) != E_INVALIDARG) return 24;
-            if (!windowed_size_fits_monitor(window, next[0], next[1])) {
-                if (!simulate_game_style_reset(window)) return 33;
-                if (configured.set_render_size(next[0], next[1]) != HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) ||
-                    configured.output_size().width != size[0] || configured.output_size().height != size[1] ||
-                    configured.render_size().width != size[0] || configured.render_size().height != size[1] ||
-                    !GetClientRect(window, &windowed_client) ||
-                    windowed_client.right - windowed_client.left != static_cast<LONG>(size[0]) ||
-                    windowed_client.bottom - windowed_client.top != static_cast<LONG>(size[1]) ||
-                    !has_fixed_windowed_style(window)) return 25;
-            } else if (!simulate_game_style_reset(window) || configured.set_render_size(next[0], next[1]) != S_OK) {
-                return 26;
-            }
-            const auto resized_output = configured.output_size();
-            if (windowed_size_fits_monitor(window, next[0], next[1]) &&
-                (resized_output.width != next[0] || resized_output.height != next[1] ||
-                    configured.render_size().width != next[0] || configured.render_size().height != next[1] ||
-                    !GetClientRect(window, &windowed_client) || windowed_client.right - windowed_client.left != static_cast<LONG>(next[0]) ||
-                    windowed_client.bottom - windowed_client.top != static_cast<LONG>(next[1]) ||
-                    !has_fixed_windowed_style(window))) return 27;
-            if (windowed_size_fits_monitor(window, next[0], next[1])) {
-                RECT before_failure = {};
-                if (!GetWindowRect(window, &before_failure)) return 29;
-                const FixedWindowSize fixed_size{before_failure.right - before_failure.left,
-                    before_failure.bottom - before_failure.top};
-                constexpr UINT_PTR subclass_id = 1;
-                if (!SetWindowSubclass(window, fixed_window_size_subclass, subclass_id,
-                    reinterpret_cast<DWORD_PTR>(&fixed_size))) return 30;
-                const HRESULT rejected = configured.set_render_size(size[0], size[1]);
-                const BOOL removed = RemoveWindowSubclass(window, fixed_window_size_subclass, subclass_id);
-                RECT after_failure = {};
-                const auto unchanged_output = configured.output_size();
-                const auto unchanged_render = configured.render_size();
-                if (!removed || rejected != E_FAIL || !GetWindowRect(window, &after_failure) ||
-                    std::memcmp(&before_failure, &after_failure, sizeof(RECT)) != 0 ||
-                    unchanged_output.width != next[0] || unchanged_output.height != next[1] ||
-                    unchanged_render.width != next[0] || unchanged_render.height != next[1]) return 31;
-            }
+
+            RECT before = {};
+            if (!GetWindowRect(window, &before)) return 33;
+            const auto& next = resolutions[(i + 1) % resolutions.size()];
+            if (configured.set_render_size(next[0], next[1]) != S_OK) return 26;
+            const SIZE next_expected = expected_windowed_client(window, next[0], next[1]);
+            if (!next_expected.cx || !client_is(window, next_expected) || !output_is(configured, next_expected) ||
+                configured.render_size().width != next[0] || configured.render_size().height != next[1] ||
+                !has_windowed_frame(window)) return 27;
+            RECT after = {};
+            WorkArea area = {};
+            if (!GetWindowRect(window, &after) || !work_area(window, area)) return 29;
+            if (after.left != std::clamp(before.left, area.rect.left, area.rect.right - (after.right - after.left)) ||
+                after.top != std::clamp(before.top, area.rect.top, area.rect.bottom - (after.bottom - after.top)))
+                return 25;
+
+            // A user resize is followed by the next draw; the render size stays unchanged.
+            const SIZE frame = frame_size(window);
+            const SIZE resized{400, 300};
+            if (!SetWindowPos(window, nullptr, 0, 0, resized.cx + frame.cx, resized.cy + frame.cy,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) || !client_is(window, resized)) return 30;
+            if (FAILED(configured.draw(context.Get(), compositor, source.Get(), {0, 0, 2, 2},
+                {0, 0, static_cast<float>(next[0]), static_cast<float>(next[1])})) ||
+                !output_is(configured, resized) || configured.render_size().width != next[0]) return 31;
+
             configured.close();
             if (GetWindowLongPtrW(window, GWL_STYLE) != borderless_style) return 28;
         }

@@ -26,7 +26,7 @@ int wmain() {
         nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!window) return 1;
 
-    if (!sgl::install_mouse_input_transform(window, 2560, 1440, 1280, 1024, 800, 600)) {
+    if (!sgl::install_mouse_input_transform(window, 1280, 1024, 800, 600)) {
         DestroyWindow(window);
         return 2;
     }

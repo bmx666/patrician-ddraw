@@ -3,12 +3,11 @@
 #include "screen_transform.hpp"
 
 #include <atomic>
+#include <cmath>
 
 namespace {
 HHOOK mouse_message_hook = nullptr;
 HWND mouse_window = nullptr;
-std::atomic<unsigned> output_width{0};
-std::atomic<unsigned> output_height{0};
 std::atomic<unsigned> logical_width{0};
 std::atomic<unsigned> logical_height{0};
 std::atomic<unsigned> render_width{0};
@@ -59,11 +58,12 @@ bool map_mouse_message(MSG& message) noexcept {
     const LONG height = client.bottom - client.top;
     if (width <= 0 || height <= 0) return false;
 
+    // The presentation back buffer always matches the client area, so the client is the output.
     sgl::ScreenTransform transform;
     if (!sgl::ScreenTransform::create_composed(logical_width.load(std::memory_order_relaxed),
         logical_height.load(std::memory_order_relaxed), render_width.load(std::memory_order_relaxed),
-        render_height.load(std::memory_order_relaxed), output_width.load(std::memory_order_relaxed),
-        output_height.load(std::memory_order_relaxed), transform)) return false;
+        render_height.load(std::memory_order_relaxed), static_cast<unsigned>(width),
+        static_cast<unsigned>(height), transform)) return false;
 
     const float client_x = static_cast<short>(LOWORD(message.lParam));
     const float client_y = static_cast<short>(HIWORD(message.lParam));
@@ -95,10 +95,9 @@ LRESULT CALLBACK mouse_message_proc(int code, WPARAM remove_mode, LPARAM data) {
 
 namespace sgl {
 
-bool install_mouse_input_transform(HWND window, unsigned width, unsigned height,
-    unsigned game_render_width, unsigned game_render_height, unsigned game_width,
-    unsigned game_height) noexcept {
-    if (!window || !IsWindow(window) || !width || !height || !game_render_width ||
+bool install_mouse_input_transform(HWND window, unsigned game_render_width, unsigned game_render_height,
+    unsigned game_width, unsigned game_height) noexcept {
+    if (!window || !IsWindow(window) || !game_render_width ||
         !game_render_height || !game_width || !game_height) return false;
     if (mouse_message_hook) return mouse_window == window;
 
@@ -107,8 +106,6 @@ bool install_mouse_input_transform(HWND window, unsigned width, unsigned height,
     if (!thread_id || process_id != GetCurrentProcessId()) return false;
 
     mouse_window = window;
-    output_width.store(width, std::memory_order_relaxed);
-    output_height.store(height, std::memory_order_relaxed);
     logical_width.store(game_width, std::memory_order_relaxed);
     logical_height.store(game_height, std::memory_order_relaxed);
     render_width.store(game_render_width, std::memory_order_relaxed);
@@ -117,8 +114,6 @@ bool install_mouse_input_transform(HWND window, unsigned width, unsigned height,
     if (mouse_message_hook) return true;
 
     mouse_window = nullptr;
-    output_width.store(0, std::memory_order_relaxed);
-    output_height.store(0, std::memory_order_relaxed);
     logical_width.store(0, std::memory_order_relaxed);
     logical_height.store(0, std::memory_order_relaxed);
     render_width.store(0, std::memory_order_relaxed);
@@ -138,12 +133,25 @@ void remove_mouse_input_transform() noexcept {
     if (mouse_message_hook) UnhookWindowsHookEx(mouse_message_hook);
     mouse_message_hook = nullptr;
     mouse_window = nullptr;
-    output_width.store(0, std::memory_order_relaxed);
-    output_height.store(0, std::memory_order_relaxed);
     logical_width.store(0, std::memory_order_relaxed);
     logical_height.store(0, std::memory_order_relaxed);
     render_width.store(0, std::memory_order_relaxed);
     render_height.store(0, std::memory_order_relaxed);
+}
+
+bool map_game_point_to_client(int& x, int& y) noexcept {
+    RECT client{};
+    if (!mouse_window || !GetClientRect(mouse_window, &client)) return false;
+    ScreenTransform transform;
+    if (!ScreenTransform::create_composed(logical_width.load(std::memory_order_relaxed),
+        logical_height.load(std::memory_order_relaxed), render_width.load(std::memory_order_relaxed),
+        render_height.load(std::memory_order_relaxed), static_cast<unsigned>(client.right - client.left),
+        static_cast<unsigned>(client.bottom - client.top), transform)) return false;
+    const Rect mapped = transform.map({static_cast<float>(x), static_cast<float>(y),
+        static_cast<float>(x) + 1.0f, static_cast<float>(y) + 1.0f});
+    x = static_cast<int>(std::floor((mapped.left + mapped.right) * 0.5f));
+    y = static_cast<int>(std::floor((mapped.top + mapped.bottom) * 0.5f));
+    return true;
 }
 
 }

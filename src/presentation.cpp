@@ -1,6 +1,7 @@
 #include "presentation.hpp"
 #include "screen_transform.hpp"
 
+#include <algorithm>
 #include <commctrl.h>
 
 using Microsoft::WRL::ComPtr;
@@ -69,8 +70,48 @@ void restore_window(HWND window, LONG_PTR style, LONG_PTR extended_style, const 
         SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
 }
 
-HRESULT place_windowed_client(HWND window, UINT width, UINT height, RECT* previous_rect = nullptr) noexcept {
-    if (width > LONG_MAX || height > LONG_MAX) return E_INVALIDARG;
+// Window frame bits owned by windowed presentation. The game strips caption and frame bits on every mode
+// change; only these bits are restored, so system state such as WS_MAXIMIZE or WS_VISIBLE is untouched.
+constexpr LONG_PTR windowed_frame_bits = WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX |
+    WS_MAXIMIZEBOX | WS_POPUP;
+constexpr LONG_PTR windowed_frame_style = WS_OVERLAPPEDWINDOW;
+constexpr LONG minimum_windowed_client_width = 320;
+constexpr LONG minimum_windowed_client_height = 240;
+
+HRESULT window_frame_size(HWND window, LONG_PTR style, LONG_PTR extended_style, SIZE& frame) noexcept {
+    RECT rect{0, 0, 0, 0};
+    if (!AdjustWindowRectEx(&rect, static_cast<DWORD>(style), GetMenu(window) != nullptr,
+        static_cast<DWORD>(extended_style))) {
+        const DWORD error = GetLastError();
+        return error ? HRESULT_FROM_WIN32(error) : E_FAIL;
+    }
+    frame = {rect.right - rect.left, rect.bottom - rect.top};
+    return S_OK;
+}
+
+}
+
+namespace sgl {
+
+SIZE fit_windowed_client(UINT render_width, UINT render_height, LONG available_width, LONG available_height) noexcept {
+    if (!render_width || !render_height || available_width <= 0 || available_height <= 0) return {0, 0};
+    if (render_width <= static_cast<UINT>(available_width) && render_height <= static_cast<UINT>(available_height))
+        return {static_cast<LONG>(render_width), static_cast<LONG>(render_height)};
+    const auto width = static_cast<long long>(render_width), height = static_cast<long long>(render_height);
+    if (static_cast<long long>(available_width) * height <= static_cast<long long>(available_height) * width)
+        return {available_width, std::max<LONG>(1, static_cast<LONG>(available_width * height / width))};
+    return {std::max<LONG>(1, static_cast<LONG>(available_height * width / height)), available_height};
+}
+
+}
+
+namespace {
+
+// Gives the window a normal resizable frame whose client shows the render size, or the largest
+// aspect-correct size that fits the monitor work area. keep_position preserves the current top-left
+// corner (clamped into the work area); otherwise the window is centered.
+HRESULT place_windowed_window(HWND window, UINT render_width, UINT render_height, bool keep_position) noexcept {
+    if (render_width > LONG_MAX || render_height > LONG_MAX) return E_INVALIDARG;
     LONG_PTR original_style = 0;
     LONG_PTR extended_style = 0;
     HRESULT hr = get_window_value(window, GWL_STYLE, original_style);
@@ -81,62 +122,56 @@ HRESULT place_windowed_client(HWND window, UINT width, UINT height, RECT* previo
     RECT prior = {};
     if (!GetWindowRect(window, &prior)) return HRESULT_FROM_WIN32(GetLastError());
 
-    constexpr LONG_PTR retained = WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
-    constexpr LONG_PTR windowed = (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME) & ~WS_MAXIMIZEBOX;
-    const LONG_PTR style = (original_style & retained) | windowed;
-
-    RECT rect{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
-    if (!AdjustWindowRectEx(&rect, static_cast<DWORD>(style), GetMenu(window) != nullptr,
-        static_cast<DWORD>(extended_style))) {
-        const DWORD error = GetLastError();
-        return error ? HRESULT_FROM_WIN32(error) : E_FAIL;
-    }
+    const LONG_PTR style = (original_style & ~windowed_frame_bits & ~static_cast<LONG_PTR>(WS_MAXIMIZE | WS_MINIMIZE)) |
+        windowed_frame_style;
+    SIZE frame = {};
+    hr = window_frame_size(window, style, extended_style, frame);
+    if (FAILED(hr)) return hr;
     const HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
     MONITORINFO info = {};
     info.cbSize = sizeof(info);
     if (!monitor) return E_FAIL;
     if (!GetMonitorInfoW(monitor, &info)) return HRESULT_FROM_WIN32(GetLastError());
-    const LONG window_width = rect.right - rect.left;
-    const LONG window_height = rect.bottom - rect.top;
     const LONG work_width = info.rcWork.right - info.rcWork.left;
     const LONG work_height = info.rcWork.bottom - info.rcWork.top;
-    if (window_width > work_width || window_height > work_height)
-        return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
-    const LONG left = info.rcWork.left + (work_width > window_width ? (work_width - window_width) / 2 : 0);
-    const LONG top = info.rcWork.top + (work_height > window_height ? (work_height - window_height) / 2 : 0);
+    const SIZE client = sgl::fit_windowed_client(render_width, render_height, work_width - frame.cx, work_height - frame.cy);
+    if (!client.cx || !client.cy) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    const LONG window_width = client.cx + frame.cx;
+    const LONG window_height = client.cy + frame.cy;
+    LONG left = info.rcWork.left + (work_width - window_width) / 2;
+    LONG top = info.rcWork.top + (work_height - window_height) / 2;
+    if (keep_position) {
+        left = std::clamp(prior.left, info.rcWork.left, info.rcWork.right - window_width);
+        top = std::clamp(prior.top, info.rcWork.top, info.rcWork.bottom - window_height);
+    }
 
     const auto rollback = [&]() noexcept {
         restore_window(window, original_style, extended_style, prior);
     };
-
     if (style != original_style) {
         SetLastError(ERROR_SUCCESS);
         const LONG_PTR replaced = SetWindowLongPtrW(window, GWL_STYLE, style);
         const DWORD error = GetLastError();
         if (!replaced && error != ERROR_SUCCESS) return HRESULT_FROM_WIN32(error);
     }
-    if (!SetWindowPos(window, nullptr, left, top, window_width, window_height,
-        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED)) {
+    if (!SetWindowPos(window, HWND_NOTOPMOST, left, top, window_width, window_height,
+        SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED)) {
         const DWORD error = GetLastError();
         rollback();
         return error ? HRESULT_FROM_WIN32(error) : E_FAIL;
     }
-
-    RECT client = {};
-    if (!GetClientRect(window, &client)) {
+    RECT actual = {};
+    if (!GetClientRect(window, &actual)) {
         const DWORD error = GetLastError();
         rollback();
         return error ? HRESULT_FROM_WIN32(error) : E_FAIL;
     }
-    if (client.right - client.left != static_cast<LONG>(width) ||
-        client.bottom - client.top != static_cast<LONG>(height)) {
+    if (actual.right - actual.left != client.cx || actual.bottom - actual.top != client.cy) {
         rollback();
         return E_FAIL;
     }
-    if (previous_rect) *previous_rect = prior;
     return S_OK;
 }
-
 }
 
 namespace sgl {
@@ -161,21 +196,63 @@ LRESULT CALLBACK Presentation::window_subclass_proc(HWND window, UINT message, W
     if (!presentation || window != presentation->window_ || presentation->window_change_in_progress_)
         return DefSubclassProc(window, message, wparam, lparam);
 
-    if (presentation->mode_ == DisplayMode::Windowed && message == WM_STYLECHANGING &&
-        wparam == static_cast<WPARAM>(GWL_STYLE) && lparam) {
-        auto* style = reinterpret_cast<STYLESTRUCT*>(lparam);
-        style->styleNew = static_cast<DWORD>(presentation->windowed_style_);
-    } else if (presentation->mode_ == DisplayMode::Windowed &&
-        message == WM_WINDOWPOSCHANGING && lparam) {
-        auto* position = reinterpret_cast<WINDOWPOS*>(lparam);
-        if (!(position->flags & SWP_NOSIZE)) {
-            RECT rect{0, 0, static_cast<LONG>(presentation->output_width_),
-                static_cast<LONG>(presentation->output_height_)};
-            if (AdjustWindowRectEx(&rect, static_cast<DWORD>(presentation->windowed_style_),
-                GetMenu(window) != nullptr, static_cast<DWORD>(presentation->windowed_extended_style_))) {
-                position->cx = rect.right - rect.left;
-                position->cy = rect.bottom - rect.top;
+    if (presentation->mode_ == DisplayMode::Windowed) {
+        constexpr WPARAM mouse_buttons = MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2;
+        switch (message) {
+        case WM_STYLECHANGING:
+            // The game strips the caption and frame on every mode change.
+            if (wparam == static_cast<WPARAM>(GWL_STYLE) && lparam) {
+                auto* style = reinterpret_cast<STYLESTRUCT*>(lparam);
+                style->styleNew = static_cast<DWORD>((static_cast<LONG_PTR>(style->styleNew) & ~windowed_frame_bits) |
+                    windowed_frame_style);
             }
+            break;
+        case WM_WINDOWPOSCHANGED:
+            // The game requests HWND_TOPMOST together with its fullscreen placement; a window should not stay on top.
+            if (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOPMOST) {
+                presentation->window_change_in_progress_ = true;
+                SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+                presentation->window_change_in_progress_ = false;
+            }
+            break;
+        case WM_GETMINMAXINFO:
+            if (lparam) {
+                SIZE frame = {};
+                if (SUCCEEDED(window_frame_size(window, GetWindowLongPtrW(window, GWL_STYLE),
+                    GetWindowLongPtrW(window, GWL_EXSTYLE), frame))) {
+                    auto* limits = reinterpret_cast<MINMAXINFO*>(lparam);
+                    limits->ptMinTrackSize.x = minimum_windowed_client_width + frame.cx;
+                    limits->ptMinTrackSize.y = minimum_windowed_client_height + frame.cy;
+                }
+            }
+            break;
+        case WM_SETCURSOR:
+            // The game hides the system cursor and draws its own; show it over the frame and caption.
+            if (LOWORD(lparam) == HTCLIENT) {
+                for (; presentation->revealed_cursor_count_; --presentation->revealed_cursor_count_) ShowCursor(FALSE);
+            } else if (!presentation->revealed_cursor_count_) {
+                do ++presentation->revealed_cursor_count_; while (ShowCursor(TRUE) < 0);
+            }
+            break;
+        case WM_LBUTTONDOWN:
+        case WM_RBUTTONDOWN:
+        case WM_MBUTTONDOWN:
+        case WM_XBUTTONDOWN:
+        case WM_LBUTTONDBLCLK:
+        case WM_RBUTTONDBLCLK:
+        case WM_MBUTTONDBLCLK:
+        case WM_XBUTTONDBLCLK:
+            // Capture only while a button is held, so drags may leave the client and the frame stays usable.
+            SetCapture(window);
+            break;
+        case WM_LBUTTONUP:
+        case WM_RBUTTONUP:
+        case WM_MBUTTONUP:
+        case WM_XBUTTONUP:
+            if (!(wparam & mouse_buttons) && GetCapture() == window) ReleaseCapture();
+            break;
+        default:
+            break;
         }
     } else if (presentation->mode_ == DisplayMode::Borderless &&
         message == WM_WINDOWPOSCHANGING && lparam) {
@@ -198,6 +275,7 @@ void Presentation::close() noexcept {
     }
     if (mode_ == DisplayMode::Windowed && original_window_state_saved_ && window_ && IsWindow(window_))
         restore_window(window_, original_style_, original_extended_style_, original_window_rect_);
+    for (; revealed_cursor_count_; --revealed_cursor_count_) ShowCursor(FALSE);
     window_subclassed_ = false;
     original_window_state_saved_ = false;
     window_ = nullptr;
@@ -209,7 +287,6 @@ void Presentation::close() noexcept {
     render_width_ = render_height_ = output_width_ = output_height_ = 0;
     original_style_ = original_extended_style_ = 0;
     original_window_rect_ = {};
-    windowed_style_ = windowed_extended_style_ = 0;
     mode_ = DisplayMode::Borderless;
     window_change_in_progress_ = false;
 }
@@ -229,7 +306,7 @@ HRESULT Presentation::initialize(ID3D11Device* device, HWND window, UINT width, 
     if (mode == DisplayMode::Borderless) {
         hr = size_window_to_monitor(window, output_rect);
     } else {
-        hr = place_windowed_client(window, width, height);
+        hr = place_windowed_window(window, width, height, false);
     }
     if (FAILED(hr)) {
         restore_window(window, original_style, original_extended_style, original_window_rect);
@@ -246,19 +323,6 @@ HRESULT Presentation::initialize(ID3D11Device* device, HWND window, UINT width, 
     if (client_width <= 0 || client_height <= 0) {
         restore_window(window, original_style, original_extended_style, original_window_rect);
         return E_INVALIDARG;
-    }
-    LONG_PTR windowed_style = 0, windowed_extended_style = 0;
-    if (mode == DisplayMode::Windowed) {
-        hr = get_window_value(window, GWL_STYLE, windowed_style);
-        if (FAILED(hr)) {
-            restore_window(window, original_style, original_extended_style, original_window_rect);
-            return hr;
-        }
-        hr = get_window_value(window, GWL_EXSTYLE, windowed_extended_style);
-        if (FAILED(hr)) {
-            restore_window(window, original_style, original_extended_style, original_window_rect);
-            return hr;
-        }
     }
     ComPtr<IDXGIDevice> dxgi_device;
     hr = device->QueryInterface(IID_PPV_ARGS(&dxgi_device));
@@ -290,8 +354,6 @@ HRESULT Presentation::initialize(ID3D11Device* device, HWND window, UINT width, 
     if (FAILED(hr)) { restore_window(window, original_style, original_extended_style, original_window_rect); return hr; }
     window_ = window;
     output_rect_ = output_rect;
-    windowed_style_ = windowed_style;
-    windowed_extended_style_ = windowed_extended_style;
     if (!SetWindowSubclass(window_, window_subclass_proc, reinterpret_cast<UINT_PTR>(this),
         reinterpret_cast<DWORD_PTR>(this))) {
         window_ = nullptr;
@@ -319,14 +381,15 @@ HRESULT Presentation::initialize(ID3D11Device* device, HWND window, UINT width, 
 HRESULT Presentation::set_render_size(UINT width, UINT height) noexcept {
     if (!swap_chain_ || !is_supported_display_size({width, height})) return E_INVALIDARG;
     if (mode_ == DisplayMode::Windowed) {
-        window_change_in_progress_ = true;
-        HRESULT hr = place_windowed_client(window_, output_width_, output_height_);
-        window_change_in_progress_ = false;
-        if (FAILED(hr)) return hr;
-        if (width != output_width_ || height != output_height_) {
-            hr = resize_windowed_output(width, height);
-            if (FAILED(hr)) return hr;
+        // A user-maximized or minimized window keeps its state; the frame is scaled into it.
+        if (!IsIconic(window_) && !IsZoomed(window_)) {
+            window_change_in_progress_ = true;
+            const HRESULT placed = place_windowed_window(window_, width, height, true);
+            window_change_in_progress_ = false;
+            if (FAILED(placed)) return placed;
         }
+        const HRESULT synced = sync_windowed_buffers();
+        if (FAILED(synced)) return synced;
     }
     render_width_ = width;
     render_height_ = height;
@@ -346,42 +409,31 @@ HRESULT Presentation::create_back_buffer() noexcept {
     return S_OK;
 }
 
-HRESULT Presentation::resize_windowed_output(UINT width, UINT height) noexcept {
+// Matches the swap chain to the current client area; the user may move, resize or maximize the window.
+HRESULT Presentation::sync_windowed_buffers() noexcept {
     if (mode_ != DisplayMode::Windowed || !window_ || !swap_chain_ || !device_) return E_UNEXPECTED;
+    RECT client = {};
+    if (!GetClientRect(window_, &client)) return HRESULT_FROM_WIN32(GetLastError());
+    const UINT width = static_cast<UINT>(std::max<LONG>(0, client.right - client.left));
+    const UINT height = static_cast<UINT>(std::max<LONG>(0, client.bottom - client.top));
+    if (!width || !height || (width == output_width_ && height == output_height_)) return S_OK;
     ComPtr<ID3D11DeviceContext> context;
     device_->GetImmediateContext(&context);
     if (!context) return E_FAIL;
-    RECT previous_rect = {};
-    window_change_in_progress_ = true;
-    HRESULT hr = place_windowed_client(window_, width, height, &previous_rect);
-    window_change_in_progress_ = false;
-    if (FAILED(hr)) return hr;
-
     const UINT previous_width = output_width_;
     const UINT previous_height = output_height_;
     context->OMSetRenderTargets(0, nullptr, nullptr);
     target_.Reset();
     back_buffer_.Reset();
-    hr = swap_chain_->ResizeBuffers(1, width, height, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
-    if (FAILED(hr)) {
-        SetWindowPos(window_, nullptr, previous_rect.left, previous_rect.top,
-            previous_rect.right - previous_rect.left, previous_rect.bottom - previous_rect.top,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-        const HRESULT restore_hr = create_back_buffer();
-        return FAILED(restore_hr) ? restore_hr : hr;
-    }
-
-    hr = create_back_buffer();
+    HRESULT hr = swap_chain_->ResizeBuffers(1, width, height, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
+    if (SUCCEEDED(hr)) hr = create_back_buffer();
     if (FAILED(hr)) {
         target_.Reset();
         back_buffer_.Reset();
-        const HRESULT rollback_hr = swap_chain_->ResizeBuffers(1, previous_width, previous_height,
+        const HRESULT rollback = swap_chain_->ResizeBuffers(1, previous_width, previous_height,
             DXGI_FORMAT_B8G8R8A8_UNORM, 0);
-        SetWindowPos(window_, nullptr, previous_rect.left, previous_rect.top,
-            previous_rect.right - previous_rect.left, previous_rect.bottom - previous_rect.top,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-        const HRESULT restore_hr = FAILED(rollback_hr) ? rollback_hr : create_back_buffer();
-        return FAILED(restore_hr) ? restore_hr : hr;
+        const HRESULT restored = FAILED(rollback) ? rollback : create_back_buffer();
+        return FAILED(restored) ? restored : hr;
     }
     output_width_ = width;
     output_height_ = height;
@@ -394,6 +446,11 @@ HRESULT Presentation::draw(ID3D11DeviceContext* context, Compositor& compositor,
     ComPtr<ID3D11Device> context_device;
     context->GetDevice(&context_device);
     if (context_device.Get() != device_.Get()) return E_INVALIDARG;
+    if (mode_ == DisplayMode::Windowed) {
+        if (IsIconic(window_)) return S_FALSE;
+        const HRESULT synced = sync_windowed_buffers();
+        if (FAILED(synced)) return synced;
+    }
     ScreenTransform transform;
     if (!ScreenTransform::create(render_width_, render_height_, output_width_, output_height_, transform))
         return E_INVALIDARG;
