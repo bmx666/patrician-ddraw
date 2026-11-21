@@ -6,11 +6,13 @@
 #include <algorithm>
 #include <array>
 #include <climits>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <string>
 #include <vector>
 
 namespace {
@@ -39,9 +41,18 @@ std::uint32_t pending_resolution = 0;
 constexpr std::array<sgl::DisplaySize, 4> supported_sizes = {{
     {1280, 1024}, {1600, 900}, {1920, 1080}, {2560, 1440}
 }};
-constexpr std::array<std::uint8_t, 32> expected_aim_sha256 = {
-    0x4c,0x75,0xcb,0x3e,0x6e,0xe4,0x85,0xde,0x8b,0x7e,0xd3,0x0c,0xd5,0xdf,0xab,0xda,
-    0xa7,0xea,0x44,0xba,0xc7,0x2b,0x52,0x3a,0x01,0xc6,0x0b,0x72,0x05,0xd7,0x1c,0x72};
+// Build identities. The GOG, Steam and p3-lib modloader executables are the same build: the Steam release wraps it in
+// a DRM section that decrypts .text at startup, and the modloader adds an import section. Their unchanged .rdata
+// section and link time identify the build; every patch still compares its own bytes in memory before writing.
+// Steam's AIM.dll differs from GOG's only in one header byte, so AIM.dll is identified by its code section.
+constexpr std::uint32_t executable_timestamp = 0x3f544d3c;
+constexpr std::array<std::uint8_t, 32> executable_rdata_sha256 = {
+    0x1f,0x5b,0x5a,0xb4,0xb9,0x9f,0x30,0x44,0x2a,0x84,0x75,0xb9,0x97,0xe9,0x2a,0x2c,
+    0x26,0x9a,0x0d,0xcf,0x1a,0xab,0xad,0x16,0x46,0xf8,0x96,0xd7,0xe4,0x2b,0xc6,0x5a};
+constexpr std::uint32_t aim_timestamp = 0x39d35554;
+constexpr std::array<std::uint8_t, 32> aim_text_sha256 = {
+    0xe7,0xa3,0xbc,0x55,0xa3,0x12,0xc3,0x47,0xfc,0xf9,0xaf,0x09,0xa2,0xd6,0xac,0xec,
+    0x22,0x7b,0xe0,0x5e,0xff,0x41,0x97,0x18,0x60,0x73,0x06,0xe0,0xca,0xa7,0x4d,0x8f};
 constexpr std::uint32_t aim_map_decode_call_rva = 0x2984;
 constexpr std::array<std::uint8_t, 5> aim_map_decode_call_original = {0xe8,0x47,0x16,0,0};
 constexpr char resolution_1280[] = "1280 x 1024";
@@ -385,12 +396,8 @@ constexpr std::size_t patch_start = 0x1000;
 constexpr std::size_t patch_end = 0x63ffd;
 constexpr std::size_t patch_span = patch_end - patch_start;
 
-bool verified_sha256(const std::filesystem::path& path,
-    const std::array<std::uint8_t, 32>& expected) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) return false;
-    std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(file)), {});
-    if (file.bad() || bytes.size() > std::numeric_limits<ULONG>::max()) return false;
+bool sha256_matches(const unsigned char* data, std::size_t size, const std::array<std::uint8_t, 32>& expected) {
+    if (size > std::numeric_limits<ULONG>::max()) return false;
     BCRYPT_ALG_HANDLE algorithm = nullptr;
     BCRYPT_HASH_HANDLE hash = nullptr;
     std::array<unsigned char, 32> digest{};
@@ -400,18 +407,48 @@ bool verified_sha256(const std::filesystem::path& path,
         reinterpret_cast<PUCHAR>(&object_size), sizeof(object_size), &written, 0) >= 0;
     std::vector<unsigned char> object(success ? object_size : 0);
     success = success && BCryptCreateHash(algorithm, &hash, object.data(), object_size, nullptr, 0, 0) >= 0;
-    success = success && BCryptHashData(hash, bytes.data(), static_cast<ULONG>(bytes.size()), 0) >= 0;
+    success = success && BCryptHashData(hash, const_cast<PUCHAR>(data), static_cast<ULONG>(size), 0) >= 0;
     success = success && BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) >= 0;
     if (hash) BCryptDestroyHash(hash);
     BCryptCloseAlgorithmProvider(algorithm, 0);
     return success && digest == expected;
 }
 
+// True when the PE file at path has the given link time and its named section's raw data has the expected SHA-256.
+bool verified_section(const std::filesystem::path& path, std::uint32_t timestamp, const char* section_name,
+    const std::array<std::uint8_t, 32>& expected) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return false;
+    std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(file)), {});
+    if (file.bad() || bytes.size() < sizeof(IMAGE_DOS_HEADER)) return false;
+    IMAGE_DOS_HEADER dos{};
+    std::memcpy(&dos, bytes.data(), sizeof(dos));
+    const auto headers = static_cast<std::size_t>(static_cast<std::uint32_t>(dos.e_lfanew));
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE || headers > bytes.size() ||
+        bytes.size() - headers < sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER)) return false;
+    DWORD signature = 0;
+    IMAGE_FILE_HEADER header{};
+    std::memcpy(&signature, bytes.data() + headers, sizeof(signature));
+    std::memcpy(&header, bytes.data() + headers + sizeof(signature), sizeof(header));
+    if (signature != IMAGE_NT_SIGNATURE || header.Machine != IMAGE_FILE_MACHINE_I386 || header.TimeDateStamp != timestamp)
+        return false;
+    const std::size_t table = headers + sizeof(signature) + sizeof(header) + header.SizeOfOptionalHeader;
+    for (std::size_t index = 0; index < header.NumberOfSections; ++index) {
+        const std::size_t offset = table + index * sizeof(IMAGE_SECTION_HEADER);
+        if (offset > bytes.size() || bytes.size() - offset < sizeof(IMAGE_SECTION_HEADER)) return false;
+        IMAGE_SECTION_HEADER section{};
+        std::memcpy(&section, bytes.data() + offset, sizeof(section));
+        if (std::strncmp(reinterpret_cast<const char*>(section.Name), section_name, IMAGE_SIZEOF_SHORT_NAME) != 0)
+            continue;
+        if (section.PointerToRawData > bytes.size() || bytes.size() - section.PointerToRawData < section.SizeOfRawData)
+            return false;
+        return sha256_matches(bytes.data() + section.PointerToRawData, section.SizeOfRawData, expected);
+    }
+    return false;
+}
+
 bool verified_executable(const std::filesystem::path& path) {
-    constexpr std::array<std::uint8_t, 32> expected = {
-        0xfe,0x43,0x6d,0xc5,0xf8,0xad,0xdc,0x4d,0x3a,0xa4,0x37,0xeb,0x48,0xa8,0xbc,0x64,
-        0x15,0xd9,0xba,0x55,0x77,0xc1,0x02,0x7d,0x06,0xdb,0x9b,0xb9,0x15,0xed,0xde,0xce};
-    return verified_sha256(path, expected);
+    return verified_section(path, executable_timestamp, ".rdata", executable_rdata_sha256);
 }
 
 bool read_map_asset(const std::filesystem::path& path, sgl::DisplaySize expected_size,
@@ -497,8 +534,8 @@ bool install_aim_map_hook(const std::filesystem::path& executable, std::string& 
         error = "Fast-forward map loaded an unexpected module name: " + aim_path.filename().string();
         return false;
     }
-    if (!verified_sha256(aim_path, expected_aim_sha256)) {
-        error = "Fast-forward map AIM.dll SHA-256 does not match the verified original";
+    if (!verified_section(aim_path, aim_timestamp, ".text", aim_text_sha256)) {
+        error = "Fast-forward map AIM.dll code does not match the verified original";
         return false;
     }
     if (!load_accelerated_map_assets(executable, error)) return false;
@@ -614,16 +651,20 @@ bool sgl::install_game_resolution(DisplaySize size, std::string& error) {
     const auto length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
     if (!length || length == path.size()) { error = "Cannot identify the game executable"; return false; }
     const std::filesystem::path executable(path.data());
-    // Offscreen SGL comparison programs do not contain the game's layout code.
-    if (_wcsicmp(executable.filename().c_str(), L"Patrician3.exe") != 0) return true;
     auto* base = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
     if (!verified_executable(executable) || base != reinterpret_cast<void*>(0x400000)) {
-        error = "Game resolution requires the original GOG executable (SHA-256 FE436DC5...)";
+        // Offscreen SGL comparison programs do not contain the game's layout code.
+        if (_wcsnicmp(executable.filename().c_str(), L"Patrician3", 10) != 0) return true;
+        error = "Game resolution requires the Patrician III build of the GOG or Steam release";
         return false;
     }
     for (const auto& patch : patches) {
         if (std::memcmp(base + patch.rva, patch.original, patch.length) != 0) {
-            error = "Game resolution: executable code does not match the verified GOG profile";
+            // Usually another mod patched the same code, such as the p3-lib high_res mod this renderer replaces.
+            char address[16] = {};
+            std::snprintf(address, sizeof(address), "0x%06zx", static_cast<std::size_t>(0x400000 + patch.rva));
+            error = std::string("Game resolution: executable code at ") + address +
+                " does not match the verified profile (changed by another mod?)";
             return false;
         }
     }
