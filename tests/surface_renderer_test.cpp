@@ -102,6 +102,53 @@ int main() {
         return 14;
     }
 
+    // Queued blended draws must match drawing one at a time: a draw that reads pixels an earlier queued draw writes
+    // ends the batch, while draws that do not overlap share one batch.
+    const auto run_sequence = [](bool synchronize_each, std::vector<std::uint8_t>& output) -> HRESULT {
+        constexpr std::uint32_t sequence_width = 8;
+        sgl::DecodedImage target{sequence_width, 1, sequence_width * 4, sgl::ImageFormat::Bgra32, {}, {}};
+        for (std::uint32_t x = 0; x < sequence_width; ++x) {
+            const std::uint8_t pixel[] = {static_cast<std::uint8_t>(20 + x * 25), static_cast<std::uint8_t>(200 - x * 20),
+                static_cast<std::uint8_t>(90 + x * 7), 0xff};
+            target.pixels.insert(target.pixels.end(), pixel, pixel + 4);
+        }
+        const sgl::DecodedImage opaque{1, 1, 4, sgl::ImageFormat::Bgra32, {12, 230, 140, 0xff}, {}};
+        const sgl::DecodedImage translucent{2, 1, 8, sgl::ImageFormat::Bgra32, {200, 100, 50, 128, 30, 250, 170, 77}, {}};
+        int opaque_id = 0, translucent_id = 0, target_id = 0;
+        sgl::SurfaceRenderer sequence_renderer;
+        const RECT full{0, 0, static_cast<LONG>(sequence_width), 1};
+        struct Step { const sgl::DecodedImage* source; int* id; float left; float width; sgl::BlendMode blend; };
+        const Step steps[] = {
+            {&opaque, &opaque_id, 2, 1, sgl::BlendMode::Opaque},
+            {&translucent, &translucent_id, 2, 1, sgl::BlendMode::Alpha},
+            {&translucent, &translucent_id, 5, 1, sgl::BlendMode::Alpha},
+            {&translucent, &translucent_id, 0, 2, sgl::BlendMode::Alpha},
+            {&translucent, &translucent_id, 5, 2, sgl::BlendMode::Multiply2},
+            {&opaque, &opaque_id, 7, 1, sgl::BlendMode::Opaque},
+            {&translucent, &translucent_id, 3, 1, sgl::BlendMode::Alpha},
+        };
+        for (const Step& step : steps) {
+            const sgl::Rect source_rect{0, 0, step.width, 1};
+            const sgl::Rect destination{step.left, 0, step.left + step.width, 1};
+            HRESULT hr = sequence_renderer.draw(step.id, *step.source, &target_id, target, source_rect, destination, full,
+                std::nullopt, step.blend);
+            if (FAILED(hr)) return hr;
+            if (synchronize_each) {
+                hr = sequence_renderer.synchronize_to_cpu(&target_id, target);
+                if (FAILED(hr)) return hr;
+            }
+        }
+        const HRESULT hr = sequence_renderer.synchronize_to_cpu(&target_id, target);
+        output = target.pixels;
+        return hr;
+    };
+    std::vector<std::uint8_t> one_at_a_time, batched;
+    if (FAILED(run_sequence(true, one_at_a_time)) || FAILED(run_sequence(false, batched))) return 16;
+    if (one_at_a_time != batched) {
+        std::fprintf(stderr, "Batched blended draws differ from drawing them one at a time.\n");
+        return 17;
+    }
+
     std::puts("GPU region copy preserved blended pixels and untouched destination content.");
     return 0;
 }

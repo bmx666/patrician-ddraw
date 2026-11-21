@@ -45,6 +45,19 @@ public:
     // Call after binding or unbinding pipeline state outside the compositor.
     void invalidate_renderer_bindings() noexcept;
 
+    // A validated draw with its pipeline inputs resolved, recorded later by record(). The views are not referenced;
+    // the caller keeps them alive until the draw is recorded.
+    struct PreparedDraw {
+        ID3D11RenderTargetView* target = nullptr;
+        UINT target_width = 0;
+        UINT target_height = 0;
+        RECT clip{};
+        ID3D11PixelShader* pixel_shader = nullptr;
+        ID3D11ShaderResourceView* resources[5] = {};
+        std::uint8_t constants[96] = {};
+        bool visible = false;
+    };
+
 private:
     friend class SurfaceRenderer;
 
@@ -61,6 +74,17 @@ private:
         std::optional<std::uint32_t> color_key, Sampling sampling, ID3D11ShaderResourceView* background,
         std::uint32_t modulation_color, BlendMode blend, const char** failure_stage,
         const RendererSource* renderer_source) noexcept;
+    // Validates a draw and resolves its shader, resources and constants without touching the pipeline.
+    HRESULT prepare(ID3D11DeviceContext* context, ID3D11RenderTargetView* target,
+        ID3D11ShaderResourceView* source, ID3D11ShaderResourceView* palette,
+        ID3D11ShaderResourceView* mask,
+        UINT target_width, UINT target_height, Rect source_rect, Rect destination_rect, RECT clip,
+        std::optional<std::uint32_t> color_key, Sampling sampling, ID3D11ShaderResourceView* background,
+        std::uint32_t modulation_color, BlendMode blend, const char** failure_stage,
+        const RendererSource* renderer_source, PreparedDraw& prepared) noexcept;
+    // Records a prepared draw. Renderer-owned draws keep their bindings cached between draws; other draws unbind
+    // their shader resources afterwards.
+    void record(ID3D11DeviceContext* context, const PreparedDraw& prepared, bool renderer_owned) noexcept;
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> vertex_shader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> pixel_shader_;

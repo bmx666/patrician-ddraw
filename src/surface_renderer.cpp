@@ -117,6 +117,9 @@ long long performance_counter() noexcept {
 }
 
 HRESULT SurfaceRenderer::upload_cpu_image(Surface& surface, const DecodedImage& image) noexcept {
+    // Queued draws may read or write this texture; they were submitted before the upload.
+    if (surface.cpu_needs_upload || (surface.palette && surface.palette_needs_upload && !image.palette.empty()))
+        flush_pending();
     if (surface.cpu_needs_upload) {
         const long long started = performance_counter();
         std::vector<std::uint8_t> converted;
@@ -197,7 +200,9 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
     src = &surfaces_.at(source_id);
     if (mask) mask_surface = &surfaces_.at(mask_id);
     dst = &surfaces_.at(target_id);
-    // The previous draw leaves its target bound. Unbind it only when this draw reads it; binding a bound render
+    // Queued draws belong to one target; recording them before switching keeps the GPU order intact.
+    if (pending_target_ && pending_target_ != dst->texture.Get()) flush_pending();
+    // The last recorded draw leaves its target bound. Unbind it only when this draw reads it; binding a bound render
     // target as a shader resource would silently null the input, while re-binding per draw costs driver time.
     if (bound_target_ && (bound_target_ == src->texture.Get() || (mask && bound_target_ == mask_surface->texture.Get()))) {
         context_->OMSetRenderTargets(0, nullptr, nullptr);
@@ -215,83 +220,105 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
     if (failure_stage) *failure_stage = "destination texture upload";
     hr = upload_cpu_image(*dst, target);
     if (FAILED(hr)) return hr;
-    if (blend != BlendMode::Opaque) {
-        if (!dst->background) {
-            if (failure_stage) *failure_stage = "alpha background allocation";
-            D3D11_TEXTURE2D_DESC desc = dst->description;
-            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-            ComPtr<ID3D11Texture2D> background;
-            ComPtr<ID3D11ShaderResourceView> view;
-            hr = device_->CreateTexture2D(&desc, nullptr, &background);
-            if (FAILED(hr)) return hr;
-            hr = device_->CreateShaderResourceView(background.Get(), nullptr, &view);
-            if (FAILED(hr)) return hr;
-            dst->background = background;
-            dst->background_view = view;
-        }
-        const float target_width = static_cast<float>(target.width);
-        const float target_height = static_cast<float>(target.height);
-        const LONG draw_left = static_cast<LONG>(std::floor(std::clamp(target_rect.left, 0.0f, target_width)));
-        const LONG draw_top = static_cast<LONG>(std::floor(std::clamp(target_rect.top, 0.0f, target_height)));
-        const LONG draw_right = static_cast<LONG>(std::ceil(std::clamp(target_rect.right, 0.0f, target_width)));
-        const LONG draw_bottom = static_cast<LONG>(std::ceil(std::clamp(target_rect.bottom, 0.0f, target_height)));
-        const LONG clip_left = std::clamp<LONG>(clip.left, 0, static_cast<LONG>(target.width));
-        const LONG clip_top = std::clamp<LONG>(clip.top, 0, static_cast<LONG>(target.height));
-        const LONG clip_right = std::clamp<LONG>(clip.right, 0, static_cast<LONG>(target.width));
-        const LONG clip_bottom = std::clamp<LONG>(clip.bottom, 0, static_cast<LONG>(target.height));
-        const LONG copy_left = std::max(draw_left, clip_left);
-        const LONG copy_top = std::max(draw_top, clip_top);
-        const LONG copy_right = std::min(draw_right, clip_right);
-        const LONG copy_bottom = std::min(draw_bottom, clip_bottom);
-        if (copy_left < copy_right && copy_top < copy_bottom) {
-            const D3D11_BOX region = {static_cast<UINT>(copy_left), static_cast<UINT>(copy_top), 0,
-                static_cast<UINT>(copy_right), static_cast<UINT>(copy_bottom), 1};
-            context_->CopySubresourceRegion(dst->background.Get(), 0, static_cast<UINT>(copy_left),
-                static_cast<UINT>(copy_top), 0, dst->texture.Get(), 0, &region);
-        }
+    const LONG width = static_cast<LONG>(target.width), height = static_cast<LONG>(target.height);
+    const auto bound = [](float value, LONG low, LONG high, bool up) {
+        const float rounded = up ? std::ceil(value) : std::floor(value);
+        return std::clamp(static_cast<LONG>(std::clamp(rounded, -1.0e9f, 1.0e9f)), low, high);
+    };
+    // Pixels this draw can write, which for blended draws are also the background pixels it reads.
+    const RECT written{std::max(bound(target_rect.left, 0, width, false), std::clamp<LONG>(clip.left, 0, width)),
+        std::max(bound(target_rect.top, 0, height, false), std::clamp<LONG>(clip.top, 0, height)),
+        std::min(bound(target_rect.right, 0, width, true), std::clamp<LONG>(clip.right, 0, width)),
+        std::min(bound(target_rect.bottom, 0, height, true), std::clamp<LONG>(clip.bottom, 0, height))};
+    const bool writes = written.left < written.right && written.top < written.bottom;
+    if (blend != BlendMode::Opaque && !dst->background) {
+        if (failure_stage) *failure_stage = "alpha background allocation";
+        D3D11_TEXTURE2D_DESC desc = dst->description;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        ComPtr<ID3D11Texture2D> background;
+        ComPtr<ID3D11ShaderResourceView> view;
+        hr = device_->CreateTexture2D(&desc, nullptr, &background);
+        if (FAILED(hr)) return hr;
+        hr = device_->CreateShaderResourceView(background.Get(), nullptr, &view);
+        if (FAILED(hr)) return hr;
+        dst->background = background;
+        dst->background_view = view;
     }
     if (failure_stage) *failure_stage = "compositor draw";
     const Compositor::RendererSource renderer_source{source.width, source.height,
         source.format == ImageFormat::Indexed8 ? DXGI_FORMAT_R8_UINT : DXGI_FORMAT_B8G8R8A8_UNORM};
+    PendingDraw pending;
     if (mask) {
-        hr = compositor_.copy_impl(context_.Get(), dst->target.Get(), src->view.Get(),
+        hr = compositor_.prepare(context_.Get(), dst->target.Get(), src->view.Get(),
             src->palette_view.Get(), mask_surface->view.Get(), target.width, target.height,
             source_rect, target_rect, clip, std::nullopt, Sampling::SglFixedPoint,
-            dst->background_view.Get(), modulation_color, BlendMode::AlphaMask, failure_stage, &renderer_source);
-    } else if (source.format == ImageFormat::Indexed8) {
-        hr = compositor_.copy_impl(context_.Get(), dst->target.Get(), src->view.Get(), src->palette_view.Get(), nullptr,
-            target.width, target.height, source_rect, target_rect, clip, key, sampling,
-            blend != BlendMode::Opaque ? dst->background_view.Get() : nullptr,
-            modulation_color, blend, failure_stage, &renderer_source);
+            dst->background_view.Get(), modulation_color, BlendMode::AlphaMask, failure_stage, &renderer_source,
+            pending.draw);
     } else {
-        hr = compositor_.copy_impl(context_.Get(), dst->target.Get(), src->view.Get(), nullptr, nullptr,
+        hr = compositor_.prepare(context_.Get(), dst->target.Get(), src->view.Get(),
+            source.format == ImageFormat::Indexed8 ? src->palette_view.Get() : nullptr, nullptr,
             target.width, target.height, source_rect, target_rect, clip, key, sampling,
             blend != BlendMode::Opaque ? dst->background_view.Get() : nullptr,
-            modulation_color, blend, failure_stage, &renderer_source);
+            modulation_color, blend, failure_stage, &renderer_source, pending.draw);
     }
     if (FAILED(hr)) return hr;
     ++counters_.draws;
-    bound_target_ = dst->texture.Get();
-    {
-        const auto bound = [](float value, LONG low, LONG high, bool up) {
-            const float rounded = up ? std::ceil(value) : std::floor(value);
-            return std::clamp(static_cast<LONG>(std::clamp(rounded, -1.0e9f, 1.0e9f)), low, high);
+    if (pending.draw.visible) {
+        const auto overlaps = [](const RECT& a, const RECT& b) {
+            return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
         };
-        const LONG width = static_cast<LONG>(target.width), height = static_cast<LONG>(target.height);
-        const RECT written{std::max(bound(target_rect.left, 0, width, false), std::clamp<LONG>(clip.left, 0, width)),
-            std::max(bound(target_rect.top, 0, height, false), std::clamp<LONG>(clip.top, 0, height)),
-            std::min(bound(target_rect.right, 0, width, true), std::clamp<LONG>(clip.right, 0, width)),
-            std::min(bound(target_rect.bottom, 0, height, true), std::clamp<LONG>(clip.bottom, 0, height))};
-        if (written.left < written.right && written.top < written.bottom) {
-            auto& dirty = dst->gpu_dirty;
-            if (dirty.left >= dirty.right || dirty.top >= dirty.bottom) dirty = written;
-            else dirty = {std::min(dirty.left, written.left), std::min(dirty.top, written.top),
-                std::max(dirty.right, written.right), std::max(dirty.bottom, written.bottom)};
+        if (blend != BlendMode::Opaque && writes) {
+            // The copy is recorded ahead of the queued draws, so it must not cover pixels one of them writes.
+            if (!pending_.empty() && overlaps(pending_bounds_, written) &&
+                std::any_of(pending_.begin(), pending_.end(), [&](const PendingDraw& queued) { return overlaps(queued.written, written); }))
+                flush_pending();
+            pending.background = dst->background.Get();
+            pending.copy = {static_cast<UINT>(written.left), static_cast<UINT>(written.top), 0,
+                static_cast<UINT>(written.right), static_cast<UINT>(written.bottom), 1};
         }
+        pending.texture = dst->texture.Get();
+        pending.written = writes ? written : RECT{};
+        try {
+            if (pending_.capacity() == 0) pending_.reserve(1024);
+            pending_.push_back(pending);
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
+        pending_target_ = pending.texture;
+        if (writes) {
+            pending_bounds_ = pending_.size() == 1 || pending_bounds_.left >= pending_bounds_.right ? written :
+                RECT{std::min(pending_bounds_.left, written.left), std::min(pending_bounds_.top, written.top),
+                    std::max(pending_bounds_.right, written.right), std::max(pending_bounds_.bottom, written.bottom)};
+        }
+        if (pending_.size() >= 1024) flush_pending();
+    }
+    if (writes) {
+        auto& dirty = dst->gpu_dirty;
+        if (dirty.left >= dirty.right || dirty.top >= dirty.bottom) dirty = written;
+        else dirty = {std::min(dirty.left, written.left), std::min(dirty.top, written.top),
+            std::max(dirty.right, written.right), std::max(dirty.bottom, written.bottom)};
     }
     dst->cpu_needs_upload = false;
     dst->cpu_needs_readback = true;
     return S_OK;
+}
+
+void SurfaceRenderer::flush_pending() noexcept {
+    if (pending_.empty()) {
+        pending_target_ = nullptr;
+        return;
+    }
+    for (const auto& queued : pending_) {
+        if (queued.background) {
+            context_->CopySubresourceRegion(queued.background, 0, queued.copy.left, queued.copy.top, 0,
+                queued.texture, 0, &queued.copy);
+        }
+    }
+    for (const auto& queued : pending_) compositor_.record(context_.Get(), queued.draw, true);
+    bound_target_ = pending_target_;
+    pending_.clear();
+    pending_target_ = nullptr;
+    pending_bounds_ = {};
 }
 
 HRESULT SurfaceRenderer::synchronize_to_cpu(void* id, DecodedImage& image) noexcept {
@@ -300,6 +327,7 @@ HRESULT SurfaceRenderer::synchronize_to_cpu(void* id, DecodedImage& image) noexc
     if (found == surfaces_.end()) return S_OK;
     auto& target = found->second;
     if (!target.cpu_needs_readback || target.cpu_needs_upload) return S_OK;
+    if (pending_target_ == target.texture.Get()) flush_pending();
     if (!context_ || !target.staging || image.pixels.empty() ||
         (image.format != ImageFormat::Bgra32 && image.format != ImageFormat::Bgr24) ||
         image.pitch < static_cast<std::uint64_t>(image.width) * bytes_per_pixel(image.format) ||
@@ -359,6 +387,7 @@ HRESULT SurfaceRenderer::synchronize_region_to_cpu(void* id, DecodedImage& image
     if (found == surfaces_.end()) return S_OK;
     auto& target = found->second;
     if (!target.cpu_needs_readback || target.cpu_needs_upload) return S_OK;
+    if (pending_target_ == target.texture.Get()) flush_pending();
     if (!context_ || !target.staging || image.format != ImageFormat::Bgra32 || image.pixels.empty() ||
         image.pitch < static_cast<std::uint64_t>(image.width) * 4 ||
         static_cast<std::uint64_t>(image.pitch) * image.height > image.pixels.size()) return E_INVALIDARG;
@@ -390,6 +419,7 @@ HRESULT SurfaceRenderer::synchronize_region_to_cpu(void* id, DecodedImage& image
 HRESULT SurfaceRenderer::upload_region(void* id, const DecodedImage& image, RECT region) noexcept {
     const auto found = surfaces_.find(id);
     if (found == surfaces_.end() || found->second.cpu_needs_upload) return S_OK;
+    flush_pending();
     if (!context_ || image.format != ImageFormat::Bgra32 || image.pixels.empty() ||
         static_cast<std::uint64_t>(image.pitch) * image.height > image.pixels.size()) return E_INVALIDARG;
     region = {std::max(region.left, 0L), std::max(region.top, 0L), std::min(region.right, static_cast<LONG>(image.width)),
@@ -425,6 +455,8 @@ void SurfaceRenderer::mark_palette_modified(void* id) noexcept {
 void SurfaceRenderer::forget(void* id) noexcept {
     const auto found = surfaces_.find(id);
     if (found == surfaces_.end()) return;
+    // Queued draws reference the views of this surface without holding them.
+    flush_pending();
     if (context_ && bound_target_ == found->second.texture.Get()) {
         context_->OMSetRenderTargets(0, nullptr, nullptr);
         bound_target_ = nullptr;
@@ -446,6 +478,8 @@ HRESULT SurfaceRenderer::set_screen_size(DisplaySize size) noexcept {
 void SurfaceRenderer::close_screen() noexcept { presentation_.close(); }
 
 void SurfaceRenderer::shutdown() noexcept {
+    pending_.clear();
+    pending_target_ = nullptr;
     if (context_) context_->ClearState();
     bound_target_ = nullptr;
     compositor_.invalidate_renderer_bindings();
@@ -477,6 +511,7 @@ HRESULT SurfaceRenderer::present(void* id, const DecodedImage& image) noexcept {
     Surface* source = nullptr;
     HRESULT hr = surface(id, image, source);
     if (FAILED(hr)) return hr;
+    flush_pending();
     context_->OMSetRenderTargets(0, nullptr, nullptr);
     bound_target_ = nullptr;
     compositor_.invalidate_renderer_bindings();

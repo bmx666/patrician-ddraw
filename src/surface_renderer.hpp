@@ -4,6 +4,7 @@
 #include "image_decoder.hpp"
 #include "presentation.hpp"
 #include <unordered_map>
+#include <vector>
 
 namespace sgl {
 
@@ -56,6 +57,19 @@ private:
         // Bounds of the GPU writes not yet copied to the CPU pixels; readback copies only this region.
         RECT gpu_dirty{};
     };
+    // A queued draw. Draws to one target are queued so that the background copies of blended draws are recorded
+    // together ahead of the draws instead of alternating with them; every copy and draw stalls on the one before.
+    struct PendingDraw {
+        Compositor::PreparedDraw draw;
+        ID3D11Texture2D* texture = nullptr;
+        ID3D11Texture2D* background = nullptr;
+        D3D11_BOX copy{};
+        RECT written{};
+    };
+    // Records queued draws: first every background copy, then the draws in submission order. A copy taken at the
+    // start of the batch equals one taken right before its draw because no earlier draw of the batch writes the copied
+    // region (see draw_impl). Must run before anything else reads or writes the queued resources.
+    void flush_pending() noexcept;
     HRESULT surface(void* id, const DecodedImage& image, Surface*& result) noexcept;
     HRESULT upload_cpu_image(Surface& surface, const DecodedImage& image) noexcept;
     HRESULT draw_impl(void* source_id, const DecodedImage& source, void* mask_id,
@@ -70,6 +84,9 @@ private:
     std::unordered_map<void*, Surface> surfaces_;
     FrameCounters counters_{};
     ID3D11Resource* bound_target_ = nullptr;
+    std::vector<PendingDraw> pending_;
+    ID3D11Texture2D* pending_target_ = nullptr;
+    RECT pending_bounds_{};
 };
 
 }
