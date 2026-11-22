@@ -178,7 +178,8 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
             (!mask->palette.empty() && mask->palette.size() != 1024) || mask->pixels.empty() ||
             mask->pitch < static_cast<std::uint64_t>(mask->width) ||
             static_cast<std::uint64_t>(mask->pitch) * mask->height > mask->pixels.size())) ||
-        (blend != BlendMode::Opaque && key)) return E_INVALIDARG;
+        (blend != BlendMode::Opaque && key &&
+            !(source.format == ImageFormat::Indexed8 && blend == BlendMode::Alpha))) return E_INVALIDARG;
     if (failure_stage) *failure_stage = "D3D11 initialization";
     HRESULT hr = initialize();
     if (FAILED(hr)) return hr;

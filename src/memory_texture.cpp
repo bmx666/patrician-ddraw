@@ -2220,9 +2220,13 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
         (constant_color & 0x00ffffffu) == 0x00ffffffu;
     const bool additive_modulated = (indexed || color_flags == 3) && blend == 3 &&
         (constant_color & 0x00ffffffu) != 0x00ffffffu;
+    // With a constant color other than opaque white, the original alpha-blends blend byte 1 draws of every source
+    // format with the source alpha times the constant color (town shadows use alpha 0x64).
+    const bool modulated_alpha = blend == 1 && constant_color != 0xffffffffu;
     const bool supported_bgra =
         ((color_flags == 0 || color_flags == 1 || color_flags == 3 || color_flags == 7) &&
-            blend == ((flags & 1) ? 1 : 0)) || opaque_mode0 || multiply2 || additive || additive_modulated;
+            blend == ((flags & 1) ? 1 : 0)) || opaque_mode0 || modulated_alpha || multiply2 || additive ||
+        additive_modulated;
     if (indexed ? (blend > 1 && !indexed_opaque_mode2 && !multiply && !multiply_modulated && !additive && !additive_modulated) :
         (!supported_bgra && !multiply && !multiply_modulated)) {
         char message[128] = {};
@@ -2236,7 +2240,7 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
         multiply2 ? sgl::BlendMode::Multiply2 :
         additive_modulated ? sgl::BlendMode::AdditiveModulated :
         additive ? sgl::BlendMode::Additive :
-        (color_flags == 3 && blend == 1 ? sgl::BlendMode::Alpha : sgl::BlendMode::Opaque);
+        ((color_flags == 3 && blend == 1) || modulated_alpha ? sgl::BlendMode::Alpha : sgl::BlendMode::Opaque);
     const auto sampling = multiply2 && stretched && (flags & 0x10) != 0 && dw >= width && dh >= height
         ? sgl::Sampling::SglBilinear : sgl::Sampling::SglFixedPoint;
 
@@ -2297,7 +2301,8 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
     }
     if (!lock_texture(*draw_source, nullptr, 1, false, LockIntent::GpuResource))
         sgl::unimplemented("sgl_DrawBitmapRect source lock");
-    const auto key = draw_source->keyed && blend_mode == sgl::BlendMode::Opaque
+    const auto key = draw_source->keyed && (blend_mode == sgl::BlendMode::Opaque ||
+            (indexed && blend_mode == sgl::BlendMode::Alpha))
         ? std::optional<std::uint32_t>(draw_source->key) : std::nullopt;
     for (const RECT& clip : clips) {
         if (mapped_destination.left >= static_cast<float>(clip.right) ||

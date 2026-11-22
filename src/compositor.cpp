@@ -9,6 +9,8 @@
 using Microsoft::WRL::ComPtr;
 
 namespace {
+// Color key value for draws without a key. The game keys on magenta, so the value never collides with a real key.
+constexpr std::uint32_t no_color_key = 0xffffffffu;
 
 constexpr char shader[] = R"(
 cbuffer Geometry : register(b0) {
@@ -101,15 +103,18 @@ float4 keyed_pixel_main(Vertex input) : SV_Target {
     return modulate_color(color);
 }
 float4 alpha_blend(float4 color, Vertex input) {
+    // The original scales every channel by the constant color with (source * constant) >> 8, which is also the
+    // (source * 255) >> 8 it applies for opaque white.
     int4 source = int4(round(saturate(color) * 255));
+    int4 tint = int4(round(saturate(modulation_color) * 255));
     int4 background = int4(round(saturate(background_texture.Load(int3(uint2(input.position.xy), 0))) * 255));
-    source = (source * 255) >> 8;
+    source = (source * tint) >> 8;
     int4 product = (source - background) * source.a;
     product = (product << 16) >> 16;
     return float4((background + (product >> 8)) & 255) / 255.0;
 }
 float4 alpha_pixel_main(Vertex input) : SV_Target {
-    return alpha_blend(modulate_color(sample_pixel(input)), input);
+    return alpha_blend(sample_pixel(input), input);
 }
 float4 additive_blend(float4 color, Vertex input) {
     int4 source = int4(round(saturate(color) * 255));
@@ -130,25 +135,26 @@ float4 additive_modulated_pixel_main(Vertex input) : SV_Target {
     return additive_modulated_blend(sample_pixel(input), input);
 }
 float4 multiply_blend(float4 color, Vertex input) {
-    int3 source = int3(round(saturate(color.rgb) * 255));
-    int3 background = int3(round(saturate(background_texture.Load(int3(uint2(input.position.xy), 0)).rgb) * 255));
-    return float4((source * background) >> 8, 255) / 255.0;
+    int4 source = int4(round(saturate(color) * 255));
+    int4 background = int4(round(saturate(background_texture.Load(int3(uint2(input.position.xy), 0))) * 255));
+    return float4((source * background) >> 8) / 255.0;
 }
 float4 multiply_pixel_main(Vertex input) : SV_Target {
     return multiply_blend(sample_pixel(input), input);
 }
 float4 multiply_modulated_blend(float4 color, Vertex input) {
-    int3 source = int3(round(saturate(color.rgb) * 255));
-    int3 tint = int3(round(saturate(modulation_color.rgb) * 255));
-    int3 background = int3(round(saturate(background_texture.Load(int3(uint2(input.position.xy), 0)).rgb) * 255));
+    int4 source = int4(round(saturate(color) * 255));
+    int4 tint = int4(round(saturate(modulation_color) * 255));
+    int4 background = int4(round(saturate(background_texture.Load(int3(uint2(input.position.xy), 0))) * 255));
     source = (source * tint) >> 8;
-    return float4((source * background) >> 8, 255) / 255.0;
+    return float4((source * background) >> 8) / 255.0;
 }
 float4 multiply_modulated_pixel_main(Vertex input) : SV_Target {
     return multiply_modulated_blend(sample_pixel(input), input);
 }
 float4 multiply2_pixel_main(Vertex input) : SV_Target {
-    int4 source = int4(round(saturate(modulate_color(sample_pixel(input))) * 255));
+    // The original doubled multiply ignores the constant color.
+    int4 source = int4(round(saturate(sample_pixel(input)) * 255));
     int4 background = int4(round(saturate(background_texture.Load(int3(uint2(input.position.xy), 0))) * 255));
     return float4(min((source * background * 2) >> 8, 255)) / 255.0;
 }
@@ -182,7 +188,12 @@ float4 keyed_indexed_main(Vertex input) : SV_Target {
     return modulate_color(color);
 }
 float4 alpha_indexed_main(Vertex input) : SV_Target {
-    return alpha_blend(modulate_color(sample_indexed(input)), input);
+    float4 color = sample_indexed(input);
+    // Palette entries with the color key's RGB stay transparent whatever their alpha.
+    uint3 channels = uint3(round(saturate(color.rgb) * 255));
+    if (color_key != 0xffffffff && ((channels.r << 16) | (channels.g << 8) | channels.b) == (color_key & 0xffffff))
+        discard;
+    return alpha_blend(color, input);
 }
 float4 multiply_indexed_main(Vertex input) : SV_Target {
     int4 source = int4(round(saturate(sample_indexed(input)) * 255));
@@ -526,7 +537,7 @@ HRESULT Compositor::prepare(ID3D11DeviceContext* context, ID3D11RenderTargetView
         return fail("unsupported compositor blend mode", E_INVALIDARG);
     if (blend == BlendMode::FillAlpha && palette) return fail("fill blend requires a BGRA source", E_INVALIDARG);
     if ((blend == BlendMode::Opaque) != (background == nullptr) ||
-        (blend != BlendMode::Opaque && color_key) ||
+        (blend != BlendMode::Opaque && color_key && !(palette && blend == BlendMode::Alpha)) ||
         (blend != BlendMode::Opaque && palette && blend != BlendMode::Alpha && blend != BlendMode::Multiply &&
             blend != BlendMode::MultiplyModulated && blend != BlendMode::Additive && blend != BlendMode::AdditiveModulated &&
             blend != BlendMode::AlphaMask) ||
@@ -727,7 +738,7 @@ HRESULT Compositor::prepare(ID3D11DeviceContext* context, ID3D11RenderTargetView
         {destination_rect.left, destination_rect.top, destination_rect.right, destination_rect.bottom},
         {source_rect.left / width, source_rect.top / height, source_rect.right / width, source_rect.bottom / height},
         {static_cast<float>(target_width), static_cast<float>(target_height)}, {sample_origin[0], sample_origin[1]},
-        color_key.value_or(0), fixed_sampling,
+        color_key.value_or(no_color_key), fixed_sampling,
         {fixed_origin[0], fixed_origin[1]}, {fixed_step[0], fixed_step[1]},
         {fractional_step[0], fractional_step[1]},
         {modulation[0], modulation[1], modulation[2], modulation[3]},
