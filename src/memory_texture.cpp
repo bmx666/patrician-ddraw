@@ -1445,8 +1445,18 @@ extern "C" void __cdecl sgl_DestroyActiveScreen() {
 extern "C" int __cdecl sgl_SwitchScreenMode(const std::uint32_t* requested_mode) {
     // Legacy SGL callers use 16 as a mode tag; presentation and surfaces stay 32-bit.
     if (!requested_mode || (requested_mode[2] != 16 && requested_mode[2] != 32)) return 0;
-    const auto width = requested_mode[0], height = requested_mode[1];
+    auto width = requested_mode[0], height = requested_mode[1];
     const bool logical_layout = (width == 640 && height == 480) || (width == 800 && height == 600);
+    // Game views always use the resolution chosen in the options or high_res.ini. Some code paths, such as saving
+    // with the P3Modding modloader, request the game's own resolution (1280x1024) instead; that would silently
+    // switch the game to it.
+    if (!logical_layout) {
+        const auto chosen = sgl::current_game_resolution();
+        if (sgl::is_supported_display_size(chosen)) {
+            width = chosen.width;
+            height = chosen.height;
+        }
+    }
     const sgl::DisplaySize requested_size{width, height};
     if (!logical_layout && !sgl::is_supported_display_size(requested_size)) return 0;
     {
