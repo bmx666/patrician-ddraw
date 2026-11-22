@@ -2210,37 +2210,34 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
     const auto blend = src.header[0x37];
     const bool indexed = src.image.format == sgl::ImageFormat::Indexed8;
     const auto color_flags = flags & 7;
-    const bool indexed_opaque_mode2 = indexed && color_flags == 7 && blend == 2;
-    const bool opaque_mode0 = !indexed && color_flags == 0 && blend == 1 && constant_color == 0xffffffffu;
-    const bool multiply = blend == 2 && (constant_color & 0x00ffffffu) == 0x00ffffffu;
-    const bool multiply_modulated = blend == 2 && (constant_color & 0x00ffffffu) != 0x00ffffffu;
-    const bool multiply2 = !indexed && color_flags == 0 && blend == 5;
-    const bool stretched = width != dw || height != dh;
-    const bool additive = (indexed || color_flags == 3) && blend == 3 &&
-        (constant_color & 0x00ffffffu) == 0x00ffffffu;
-    const bool additive_modulated = (indexed || color_flags == 3) && blend == 3 &&
-        (constant_color & 0x00ffffffu) != 0x00ffffffu;
-    // With a constant color other than opaque white, the original alpha-blends blend byte 1 draws of every source
-    // format with the source alpha times the constant color (town shadows use alpha 0x64).
-    const bool modulated_alpha = blend == 1 && constant_color != 0xffffffffu;
-    const bool supported_bgra =
-        ((color_flags == 0 || color_flags == 1 || color_flags == 3 || color_flags == 7) &&
-            blend == ((flags & 1) ? 1 : 0)) || opaque_mode0 || modulated_alpha || multiply2 || additive ||
-        additive_modulated;
-    if (indexed ? (blend > 1 && !indexed_opaque_mode2 && !multiply && !multiply_modulated && !additive && !additive_modulated) :
-        (!supported_bgra && !multiply && !multiply_modulated)) {
+    // The original library's behavior, measured for every source format, color flags value, blend byte and constant
+    // color (tests/blend_matrix_oracle.cpp): blend byte 1 alpha-blends with source alpha times the constant color when
+    // the color flags are 3 or the color is not opaque white, and otherwise copies the source without color-keyed
+    // pixels; 2 multiplies and 3 adds, both scaled by the constant color when its RGB is not white; 5 is a doubled
+    // multiply for BGRA sources. Every other blend byte copies the source unchanged, ignoring the constant color and
+    // the color key.
+    if (blend > 7) {
         char message[128] = {};
         std::snprintf(message, sizeof(message),
             "sgl_DrawBitmapRect unsupported: format=%u flags=0x%02X blend=%u",
             static_cast<unsigned>(src.image.format), static_cast<unsigned>(flags), static_cast<unsigned>(blend));
         sgl::unimplemented(message);
     }
+    const bool white_rgb = (constant_color & 0x00ffffffu) == 0x00ffffffu;
+    const bool alpha_blend = blend == 1 && (color_flags == 3 || constant_color != 0xffffffffu);
+    const bool keyed_copy = blend == 1 && !alpha_blend;
+    const bool multiply = blend == 2 && white_rgb;
+    const bool multiply_modulated = blend == 2 && !white_rgb;
+    const bool multiply2 = !indexed && blend == 5;
+    const bool additive = blend == 3 && white_rgb;
+    const bool additive_modulated = blend == 3 && !white_rgb;
+    const bool stretched = width != dw || height != dh;
     const auto blend_mode = multiply_modulated ? sgl::BlendMode::MultiplyModulated :
         multiply ? sgl::BlendMode::Multiply :
         multiply2 ? sgl::BlendMode::Multiply2 :
         additive_modulated ? sgl::BlendMode::AdditiveModulated :
         additive ? sgl::BlendMode::Additive :
-        ((color_flags == 3 && blend == 1) || modulated_alpha ? sgl::BlendMode::Alpha : sgl::BlendMode::Opaque);
+        alpha_blend ? sgl::BlendMode::Alpha : sgl::BlendMode::Opaque;
     const auto sampling = multiply2 && stretched && (flags & 0x10) != 0 && dw >= width && dh >= height
         ? sgl::Sampling::SglBilinear : sgl::Sampling::SglFixedPoint;
 
@@ -2301,9 +2298,9 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
     }
     if (!lock_texture(*draw_source, nullptr, 1, false, LockIntent::GpuResource))
         sgl::unimplemented("sgl_DrawBitmapRect source lock");
-    const auto key = draw_source->keyed && (blend_mode == sgl::BlendMode::Opaque ||
-            (indexed && blend_mode == sgl::BlendMode::Alpha))
+    const auto key = draw_source->keyed && (keyed_copy || (indexed && blend_mode == sgl::BlendMode::Alpha))
         ? std::optional<std::uint32_t>(draw_source->key) : std::nullopt;
+    const std::uint32_t modulation = blend_mode == sgl::BlendMode::Opaque ? 0xffffffffu : constant_color;
     for (const RECT& clip : clips) {
         if (mapped_destination.left >= static_cast<float>(clip.right) ||
             mapped_destination.top >= static_cast<float>(clip.bottom) ||
@@ -2312,7 +2309,7 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
         const char* failure_stage = nullptr;
         const HRESULT result = surface_renderer.draw(draw_source->header.data(), draw_source->image, render_destination,
             dst.image, src_rect, mapped_destination, clip, key, blend_mode, &failure_stage,
-            constant_color, sampling);
+            modulation, sampling);
         if (FAILED(result)) {
             unlock_texture(*draw_source);
             char message[256] = {};
