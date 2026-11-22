@@ -28,7 +28,8 @@ HRESULT ImageDecoder::initialize(const std::filesystem::path& library_path) noex
     const auto decode = reinterpret_cast<decltype(decode_)>(GetProcAddress(library, "?AIM_CONVERT_MEMFILE@@YAHPAUAIM_IMAGE@@PBDPAEJ@Z"));
     const auto inspect = reinterpret_cast<decltype(inspect_)>(GetProcAddress(library, "?AIM_GETFILEFORMAT_FROMMEM@@YAHPAUAIM_GFXDEF@@PBDPAEJ@Z"));
     const auto release = reinterpret_cast<decltype(release_)>(GetProcAddress(library, "?AIM_FREE@@YAXPAUAIM_IMAGE@@@Z"));
-    if (!initialize || !decode || !inspect || !release) {
+    const auto convert = reinterpret_cast<decltype(convert_)>(GetProcAddress(library, "?AIM_CONVERT_RAW@@YAHPAUAIM_IMAGE@@@Z"));
+    if (!initialize || !decode || !inspect || !release || !convert) {
         FreeLibrary(library);
         return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
     }
@@ -37,6 +38,7 @@ HRESULT ImageDecoder::initialize(const std::filesystem::path& library_path) noex
     decode_ = decode;
     inspect_ = inspect;
     release_ = release;
+    convert_ = convert;
     return S_OK;
 }
 
@@ -57,6 +59,7 @@ HRESULT ImageDecoder::process(const char* name, std::vector<std::uint8_t>& encod
     const int result = (pixels ? decode_ : inspect_)(image.data(), name, encoded.data(), static_cast<long>(encoded.size()));
     decoder_active = false;
     HRESULT status = E_FAIL;
+    last_layout_ = {image[4], image[5], image[6]};
     if (result) {
         const auto width = image[2];
         const auto height = image[3];
@@ -64,7 +67,42 @@ HRESULT ImageDecoder::process(const char* name, std::vector<std::uint8_t>& encod
         const bool bgra = image[4] == 4 && image[5] == 4;
         const bool indexed = image[4] == 1 && image[5] == 1 && (!pixels || image[1] != 0);
         const bool bgr24 = image[4] == 3 && image[5] == 6;
-        if (!pixels && width && height && width <= 65535 && height <= 65535) {
+        const bool valid_size = width && height && width <= 65535 && height <= 65535;
+        if (pixels && image[0] && valid_size && !bgra && !indexed && !bgr24) {
+            // Other source formats (such as format 15 of the creature animations) are converted to 32-bit BGRA by
+            // AIM_CONVERT_RAW, as the original library does: fields 11 to 17 describe the destination (pixels,
+            // palette, width, height, bytes per pixel, format and pitch).
+            try {
+                DecodedImage decoded;
+                decoded.width = width;
+                decoded.height = height;
+                decoded.pitch = width * 4;
+                decoded.format = ImageFormat::Bgra32;
+                decoded.pixels.assign(static_cast<std::size_t>(decoded.pitch) * height, 0);
+                std::array<std::uint8_t, 1024> palette{};
+                image[11] = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(decoded.pixels.data()));
+                image[12] = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(palette.data()));
+                image[13] = width;
+                image[14] = height;
+                image[15] = 4;
+                image[16] = 4;
+                image[17] = decoded.pitch;
+                decoder_active = true;
+                const int converted = convert_(image.data());
+                decoder_active = false;
+                image[11] = image[12] = 0;
+                if (converted) {
+                    output = std::move(decoded);
+                    status = S_OK;
+                } else {
+                    status = E_NOTIMPL;
+                }
+            } catch (const std::bad_alloc&) {
+                status = E_OUTOFMEMORY;
+            } catch (const std::length_error&) {
+                status = E_OUTOFMEMORY;
+            }
+        } else if (!pixels && valid_size) {
             const bool output_indexed = image[5] == 1;
             const auto output_bpp = output_indexed ? 1u : 4u;
             const auto output_pitch = (width * output_bpp + 3u) & ~3u;

@@ -1,0 +1,42 @@
+[
+  {
+    "suite": "fill",
+    "case": " mode=2 ",
+    "reason": "The original's multiplying fill swaps the middle two pixels of every group of four it processes together (an error in its MMX loop). The replacement writes each pixel in place."
+  },
+  {
+    "suite": "fillrow",
+    "case": "",
+    "reason": "Same multiplying fill as above, one row at every start and width; documents the original's pixel order."
+  },
+  {
+    "suite": "blt",
+    "case": " formats=0 flags=\\d same=1 position=0,0,2,2",
+    "reason": "The original corrupts an overlapping copy within one surface for this shift (bytes of neighbouring pixels are mixed). The replacement copies the pixels as they were before the call."
+  },
+  {
+    "suite": "clip",
+    "case": " mode=0 setup=\\d position=0,0,(8,9|-3,-2),",
+    "reason": "With clipping mode 0 the original writes outside the destination when the destination rectangle leaves it, which corrupts memory or faults. The replacement draws the part inside the destination."
+  },
+  {
+    "suite": "clip",
+    "case": " position=(4,2|-2,-1),",
+    "reason": "A source rectangle outside the image makes the original read memory before or after the pixels, which changes from run to run. The replacement draws the part inside the image."
+  },
+  {
+    "suite": "blt",
+    "case": " formats=[01] flags=\\d same=\\d position=-2,-1,",
+    "reason": "A negative source origin makes the original read memory before the pixels, which changes from run to run. The replacement copies the part inside the image."
+  },
+  {
+    "suite": "mask",
+    "case": " position=(4,2|-2,0)",
+    "reason": "A source rectangle outside the image makes the original read memory outside the pixels. The replacement draws the part inside the image."
+  },
+  {
+    "suite": "bltrc",
+    "case": "",
+    "reason": "With textures smaller than the screen the original writes outside them and corrupts its heap, so its pixels are not a reference. The suite checks that no flags value ends the game; screen-size copies are covered by original_sgl_oracle."
+  }
+]

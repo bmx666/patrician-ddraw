@@ -95,6 +95,9 @@ TextureLookup render_destination_lookup;
 void* render_source = nullptr;
 void* render_destination = nullptr;
 std::array<std::int32_t, 4> clip_rectangle{};
+// The mode the game set, and the mode the draws use: the original treats negative modes like mode 2 and draws
+// nothing in modes above 3.
+std::int32_t requested_clipping_mode = 0;
 std::int32_t clipping_mode = 0;
 // Incremented whenever the clipping mode, clip rectangle, active clipper or clipper contents change.
 std::uint64_t clip_state_version = 0;
@@ -524,9 +527,10 @@ extern "C" void* __cdecl sgl_LoadMemoryTexture(const char* name, std::uint32_t f
         if (FAILED(result)) {
             char message[512];
             std::snprintf(message, sizeof(message),
-                "SGL texture load failed: AIM %s, resource=%s flags=0x%08lx bytes=%zu hr=0x%08lx\n",
+                "SGL texture load failed: AIM %s, resource=%s flags=0x%08lx bytes=%zu layout=%u,%u,%u hr=0x%08lx\n",
                 (flags & 0x00010040u) != 0 ? "decode" : "inspect", name,
-                static_cast<unsigned long>(flags), texture->encoded.size(), static_cast<unsigned long>(result));
+                static_cast<unsigned long>(flags), texture->encoded.size(), decoder.last_layout()[0],
+                decoder.last_layout()[1], decoder.last_layout()[2], static_cast<unsigned long>(result));
             OutputDebugStringA(message);
             if (result == E_NOTIMPL) sgl::unimplemented(message);
             return nullptr;
@@ -642,7 +646,12 @@ static int lock_texture(Texture& texture, LockOutput* output, int flags, bool ex
                 auto decoder_input = texture.encoded;
                 result = decoder.decode(texture.name.c_str(), decoder_input, decoded);
             }
-            if (result == E_NOTIMPL) sgl::unimplemented("sgl_LockTexture format");
+            if (result == E_NOTIMPL) {
+                char message[512];
+                std::snprintf(message, sizeof(message), "sgl_LockTexture format: resource=%s layout=%u,%u,%u",
+                    texture.name.c_str(), decoder.last_layout()[0], decoder.last_layout()[1], decoder.last_layout()[2]);
+                sgl::unimplemented(message);
+            }
             if (FAILED(result)) return 0;
             if (FAILED(normalize_loaded_image(decoded))) sgl::unimplemented("sgl_LockTexture pixel format conversion");
             if (is_fast_forward_map(texture.name.c_str())) {
@@ -970,8 +979,8 @@ static void collect_draw_clips(const sgl::DecodedImage& target, std::vector<RECT
             if (intersect_with(clip, bounds)) clips.push_back(clip);
             return;
         }
-        if (clipping_mode != 2 && clipping_mode != 3)
-            sgl::unimplemented("sgl_DrawBitmapRect unsupported clipping mode");
+        // Like the original, clipping modes other than 0 to 3 leave nothing visible.
+        if (clipping_mode != 2 && clipping_mode != 3) return;
 
         auto* clipper = get_active_clipper();
         const RECT clip_bounds{clip_rectangle[0], clip_rectangle[1], clip_rectangle[2], clip_rectangle[3]};
@@ -1046,8 +1055,7 @@ static const std::vector<RECT>& cached_draw_clips(const sgl::DecodedImage& targe
             if (nonempty(clip) && map_draw_clip(clip, map_to_screen, transform, mapped)) clips.push_back(mapped);
             return clips;
         }
-        if (clipping_mode != 2 && clipping_mode != 3)
-            sgl::unimplemented("sgl_DrawBitmapRect unsupported clipping mode");
+        if (clipping_mode != 2 && clipping_mode != 3) return clips;
         auto& cache = clipper_draw_cache;
         auto* clipper = get_active_clipper();
         if (cache.clipper != clipper || cache.version != clipper_version || cache.destination != render_destination ||
@@ -1585,7 +1593,9 @@ void remove() noexcept {
 }
 
 extern "C" int __cdecl sgl_LockTexture(void* handle, LockOutput* output, int flags) {
-    if (flags < 1 || flags > 3) sgl::unimplemented("sgl_LockTexture flags");
+    // The original locks every texture the same way whatever the flags; values other than read (1), write (2) and
+    // both (3) are treated as both here, so neither the read-back nor the upload is skipped.
+    if (flags < 1 || flags > 3) flags = 3;
     const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     const bool water_lock = water_effect::installed && caller == water_effect::lock_return &&
@@ -1716,15 +1726,17 @@ extern "C" void* __cdecl sgl_SetRenderDest(void* handle) {
 
 extern "C" int __cdecl sgl_Set2dClippingMode(int mode) {
     std::lock_guard<TexturesMutex> lock(textures_mutex);
-    const int previous = clipping_mode;
-    if (clipping_mode != mode) ++clip_state_version;
-    clipping_mode = mode;
+    const int previous = requested_clipping_mode;
+    const int effective = mode < 0 ? 2 : mode;
+    if (clipping_mode != effective) ++clip_state_version;
+    requested_clipping_mode = mode;
+    clipping_mode = effective;
     return previous;
 }
 
 extern "C" int __cdecl sgl_Get2dClippingMode() {
     std::lock_guard<TexturesMutex> lock(textures_mutex);
-    return clipping_mode;
+    return requested_clipping_mode;
 }
 
 extern "C" void* __cdecl sgl_CreateClipper() {
@@ -2029,19 +2041,29 @@ extern "C" std::uint32_t __cdecl sgl_SetBlendMode(std::uint32_t mode) {
     return previous;
 }
 
+// Flag 1 clears the whole destination, ignoring the clip and the blend mode; the other flags do nothing. As measured
+// against the original, an opaque color replaces the pixels and any other color is blended by its alpha.
 extern "C" void __cdecl sgl_ClearBuffer(std::uint32_t flags, std::uint32_t color, float) {
     std::lock_guard<TexturesMutex> lock(textures_mutex);
-    if (flags > 3) sgl::unimplemented("sgl_ClearBuffer flags");
     if (!(flags & 1)) return;
     const auto entry = textures.find(render_destination);
-    if (entry == textures.end() || entry->second->image.format == sgl::ImageFormat::Indexed8)
-        sgl::unimplemented("sgl_ClearBuffer color destination");
+    if (entry == textures.end() || entry->second->image.format == sgl::ImageFormat::Indexed8) return;
     if (screen && render_destination == screen->display) return;
     auto& image = entry->second->image;
+    const auto alpha = static_cast<unsigned>(color >> 24);
+    if (alpha != 0xff && FAILED(surface_renderer.synchronize_to_cpu(render_destination, image)))
+        sgl::unimplemented("sgl_ClearBuffer D3D11 synchronization");
     const auto pixel_size = sgl::bytes_per_pixel(image.format);
+    const std::array<unsigned, 3> channels = {color & 0xffu, (color >> 8) & 0xffu, (color >> 16) & 0xffu};
     for (std::uint32_t y = 0; y < image.height; ++y) {
-        auto* row = image.pixels.data() + static_cast<std::size_t>(y) * image.pitch;
-        for (std::uint32_t x = 0; x < image.width; ++x) std::memcpy(row + x * pixel_size, &color, pixel_size);
+        auto* pixel = image.pixels.data() + static_cast<std::size_t>(y) * image.pitch;
+        for (std::uint32_t x = 0; x < image.width; ++x, pixel += pixel_size) {
+            for (std::size_t channel = 0; channel < channels.size(); ++channel) {
+                pixel[channel] = static_cast<std::uint8_t>(alpha == 0xff ? channels[channel] :
+                    ((channels[channel] * alpha) >> 8) + ((pixel[channel] * (255u - alpha)) >> 8));
+            }
+            if (pixel_size == 4) pixel[3] = 0xff;
+        }
     }
     surface_renderer.mark_cpu_modified(render_destination);
 }
@@ -2049,7 +2071,7 @@ extern "C" void __cdecl sgl_ClearBuffer(std::uint32_t flags, std::uint32_t color
 extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     const auto entry = textures.find(render_destination);
-    if (entry == textures.end()) sgl::unimplemented("sgl_FillSolidRect destination not selected");
+    if (entry == textures.end()) return;
     if (width <= 0 || height <= 0) return;
 
     auto& image = entry->second->image;
@@ -2090,16 +2112,16 @@ extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
             image.pixels.assign(4, 0);
             return image;
         }();
+        // Multiply also scales the destination alpha by the color's alpha.
         fill_pixel_bytes = {static_cast<std::uint8_t>(constant_color), static_cast<std::uint8_t>(constant_color >> 8),
-            static_cast<std::uint8_t>(constant_color >> 16), 0xff};
+            static_cast<std::uint8_t>(constant_color >> 16), active_blend_mode == 2 ? alpha : std::uint8_t{0xff}};
         std::memcpy(fill_source.pixels.data(), fill_pixel_bytes.data(), 4);
         surface_renderer.mark_cpu_modified(&fill_source);
         const auto blend = active_blend_mode == 2 ? sgl::BlendMode::Multiply :
-            active_blend_mode == 3 ? sgl::BlendMode::AdditiveModulated :
+            active_blend_mode == 3 ? sgl::BlendMode::Additive :
             alpha == 0xff ? sgl::BlendMode::Opaque : sgl::BlendMode::FillAlpha;
-        const std::uint32_t modulation = active_blend_mode == 3
-            ? 0xff000000u | (static_cast<std::uint32_t>(alpha) << 16) | (static_cast<std::uint32_t>(alpha) << 8) | alpha
-            : blend == sgl::BlendMode::FillAlpha ? (static_cast<std::uint32_t>(alpha) << 24) | 0x00ffffffu : 0xffffffffu;
+        const std::uint32_t modulation = blend == sgl::BlendMode::FillAlpha
+            ? (static_cast<std::uint32_t>(alpha) << 24) | 0x00ffffffu : 0xffffffffu;
         const sgl::Rect target_rect{static_cast<float>(fill.left), static_cast<float>(fill.top),
             static_cast<float>(fill.right), static_cast<float>(fill.bottom)};
         sgl::ScreenTransform clip_transform;
@@ -2126,15 +2148,17 @@ extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
         static_cast<std::uint8_t>(constant_color >> 16)
     };
     const auto inverse_alpha = static_cast<std::uint8_t>(255 - alpha);
+    // Blend mode 2 multiplies the color channels and the alpha; 3 adds the color, ignoring its alpha; the other
+    // modes blend the color by its alpha.
     const auto fill_pixel = [&](std::uint8_t* pixel) {
         if (active_blend_mode == 2) {
             for (std::size_t channel = 0; channel < color.size(); ++channel)
                 pixel[channel] = static_cast<std::uint8_t>((static_cast<unsigned>(pixel[channel]) * color[channel]) >> 8);
+            if (pixel_size == 4) pixel[3] = static_cast<std::uint8_t>((static_cast<unsigned>(pixel[3]) * alpha) >> 8);
+            return;
         } else if (active_blend_mode == 3) {
-            for (std::size_t channel = 0; channel < color.size(); ++channel) {
-                const auto contribution = (static_cast<unsigned>(color[channel]) * alpha) >> 8;
-                pixel[channel] = static_cast<std::uint8_t>(std::min<unsigned>(255, pixel[channel] + contribution));
-            }
+            for (std::size_t channel = 0; channel < color.size(); ++channel)
+                pixel[channel] = static_cast<std::uint8_t>(std::min<unsigned>(255, pixel[channel] + color[channel]));
         } else if (alpha == 0xff) {
             std::memcpy(pixel, color.data(), color.size());
         } else {
@@ -2177,13 +2201,30 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     Texture* const source_texture = find_texture_cached(render_source_lookup, render_source);
     Texture* const target_texture = find_texture_cached(render_destination_lookup, render_destination);
-    if (!source_texture) sgl::unimplemented("sgl_DrawBitmapRect source not selected");
-    if (!target_texture) sgl::unimplemented("sgl_DrawBitmapRect destination not selected");
-    if (clipping_mode < 0 || clipping_mode > 3)
-        sgl::unimplemented("sgl_DrawBitmapRect unsupported clipping mode");
-    if (sx < 0 || sy < 0 || width < 0 || height < 0 || dw < 0 || dh < 0)
-        sgl::unimplemented("sgl_DrawBitmapRect invalid rectangle");
-    if (width == 0 || height == 0 || dw == 0 || dh == 0) return;
+    // Without a source or destination (an indexed destination is never selected) the original draws nothing.
+    if (!source_texture || !target_texture) return;
+    // The original draws nothing in clipping modes other than 0 to 3.
+    if (clipping_mode < 0 || clipping_mode > 3) return;
+    // Like the original, an empty or negative size draws nothing. A negative source origin makes the original read
+    // memory before the pixels, which has no defined result; the part inside the image is drawn.
+    if (width <= 0 || height <= 0 || dw <= 0 || dh <= 0) return;
+    if (sx < 0) {
+        const auto cut = static_cast<int>(static_cast<std::int64_t>(-static_cast<std::int64_t>(sx)) * dw / width);
+        if (-static_cast<std::int64_t>(sx) >= width) return;
+        width += sx;
+        dx += cut;
+        dw -= cut;
+        sx = 0;
+    }
+    if (sy < 0) {
+        const auto cut = static_cast<int>(static_cast<std::int64_t>(-static_cast<std::int64_t>(sy)) * dh / height);
+        if (-static_cast<std::int64_t>(sy) >= height) return;
+        height += sy;
+        dy += cut;
+        dh -= cut;
+        sy = 0;
+    }
+    if (dw <= 0 || dh <= 0) return;
     // Full-surface copies (the fast-forward map and the expanded menu background) ignore the clip region, and the
     // fast-forward overlay maps destinations differently; every other draw outside the clips draws nothing.
     if (!fast_forward_overlay && !(sx == 0 && sy == 0 && width == dw && height == dh && width >= 800) &&
@@ -2195,14 +2236,20 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
                 height == static_cast<int>(source_texture->image.height))) &&
         source_texture->image.width == target_texture->image.width &&
         source_texture->image.height == target_texture->image.height && target_texture->image.width > 1280;
+    // A source rectangle beyond the image makes the original read memory after the pixels, which has no defined
+    // result. The part inside the image is drawn, with the destination shortened in proportion.
     if (!full_map && (static_cast<std::uint64_t>(sx) + width > source_texture->image.width ||
         static_cast<std::uint64_t>(sy) + height > source_texture->image.height)) {
-        char message[768];
-        std::snprintf(message, sizeof(message),
-            "sgl_DrawBitmapRect source bounds: resource=%s image=%ux%u source=(%d,%d,%d,%d) destination=(%d,%d,%d,%d) target=%ux%u",
-            source_texture->name.c_str(), source_texture->image.width, source_texture->image.height,
-            sx, sy, width, height, dx, dy, dw, dh, target_texture->image.width, target_texture->image.height);
-        sgl::unimplemented(message);
+        const auto image_width = static_cast<std::int64_t>(source_texture->image.width);
+        const auto image_height = static_cast<std::int64_t>(source_texture->image.height);
+        if (sx >= image_width || sy >= image_height) return;
+        const auto inside_width = static_cast<int>(std::min<std::int64_t>(width, image_width - sx));
+        const auto inside_height = static_cast<int>(std::min<std::int64_t>(height, image_height - sy));
+        dw = static_cast<int>(static_cast<std::int64_t>(dw) * inside_width / width);
+        dh = static_cast<int>(static_cast<std::int64_t>(dh) * inside_height / height);
+        width = inside_width;
+        height = inside_height;
+        if (dw == 0 || dh == 0) return;
     }
     auto& src = *source_texture;
     auto& dst = *target_texture;
@@ -2214,15 +2261,8 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
     // color (tests/blend_matrix_oracle.cpp): blend byte 1 alpha-blends with source alpha times the constant color when
     // the color flags are 3 or the color is not opaque white, and otherwise copies the source without color-keyed
     // pixels; 2 multiplies and 3 adds, both scaled by the constant color when its RGB is not white; 5 is a doubled
-    // multiply for BGRA sources. Every other blend byte copies the source unchanged, ignoring the constant color and
-    // the color key.
-    if (blend > 7) {
-        char message[128] = {};
-        std::snprintf(message, sizeof(message),
-            "sgl_DrawBitmapRect unsupported: format=%u flags=0x%02X blend=%u",
-            static_cast<unsigned>(src.image.format), static_cast<unsigned>(flags), static_cast<unsigned>(blend));
-        sgl::unimplemented(message);
-    }
+    // multiply for BGRA sources. Every other blend byte, including all values above 7, copies the source unchanged,
+    // ignoring the constant color and the color key.
     const bool white_rgb = (constant_color & 0x00ffffffu) == 0x00ffffffu;
     const bool alpha_blend = blend == 1 && (color_flags == 3 || constant_color != 0xffffffffu);
     const bool keyed_copy = blend == 1 && !alpha_blend;
@@ -2238,7 +2278,11 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
         additive_modulated ? sgl::BlendMode::AdditiveModulated :
         additive ? sgl::BlendMode::Additive :
         alpha_blend ? sgl::BlendMode::Alpha : sgl::BlendMode::Opaque;
-    const auto sampling = multiply2 && stretched && (flags & 0x10) != 0 && dw >= width && dh >= height
+    // Texture flag 0x10 makes the original filter enlarged BGRA sources bilinearly for copies without color key and
+    // for the multiplying modes without a constant color; the other modes sample the nearest pixel.
+    const bool filtered_mode = (blend_mode == sgl::BlendMode::Opaque && !(keyed_copy && src.keyed)) ||
+        blend_mode == sgl::BlendMode::Multiply || blend_mode == sgl::BlendMode::Multiply2;
+    const auto sampling = !indexed && filtered_mode && stretched && (flags & 0x10) != 0 && dw >= width && dh >= height
         ? sgl::Sampling::SglBilinear : sgl::Sampling::SglFixedPoint;
 
     Texture* draw_source = &src;
@@ -2340,14 +2384,13 @@ extern "C" int __cdecl sgl_DrawBitmapRectWithAlphaMask(std::uint32_t mask_handle
     const auto target = textures.find(render_destination);
     const auto mask_id = reinterpret_cast<void*>(static_cast<std::uintptr_t>(mask_handle));
     const auto mask = textures.find(mask_id);
-    if (source == textures.end()) sgl::unimplemented("sgl_DrawBitmapRectWithAlphaMask source not selected");
-    if (target == textures.end()) sgl::unimplemented("sgl_DrawBitmapRectWithAlphaMask destination not selected");
+    if (source == textures.end() || target == textures.end()) return 1;
     if (mask == textures.end()) sgl::unimplemented("sgl_DrawBitmapRectWithAlphaMask mask handle");
     if (mask_id == render_destination) sgl::unimplemented("sgl_DrawBitmapRectWithAlphaMask mask aliases destination");
-    if (clipping_mode < 0 || clipping_mode > 3)
-        sgl::unimplemented("sgl_DrawBitmapRectWithAlphaMask unsupported clipping mode");
-    if (sx < 0 || sy < 0 || width <= 0 || height <= 0)
-        sgl::unimplemented("sgl_DrawBitmapRectWithAlphaMask invalid rectangle");
+    if (clipping_mode < 0 || clipping_mode > 3) return 1;
+    if (width <= 0 || height <= 0) return 1;
+    if (sx < 0) { if (-static_cast<std::int64_t>(sx) >= width) return 1; width += sx; dx -= sx; sx = 0; }
+    if (sy < 0) { if (-static_cast<std::int64_t>(sy) >= height) return 1; height += sy; dy -= sy; sy = 0; }
 
     auto& src = *source->second;
     auto& alpha = *mask->second;
@@ -2355,9 +2398,7 @@ extern "C" int __cdecl sgl_DrawBitmapRectWithAlphaMask(std::uint32_t mask_handle
     if (src.image.format != sgl::ImageFormat::Indexed8 || alpha.image.format != sgl::ImageFormat::Indexed8 ||
         src.image.width != alpha.image.width || src.image.height != alpha.image.height ||
         src.image.pitch != alpha.image.pitch || src.image.palette.size() != 1024 ||
-        dst.image.format == sgl::ImageFormat::Indexed8 ||
-        static_cast<std::uint64_t>(sx) + width > src.image.width ||
-        static_cast<std::uint64_t>(sy) + height > src.image.height) {
+        dst.image.format == sgl::ImageFormat::Indexed8) {
         char message[256] = {};
         std::snprintf(message, sizeof(message),
             "sgl_DrawBitmapRectWithAlphaMask texture contract: src=%u %ux%u p%u pal%zu; mask=%u %ux%u p%u pal%zu; dst=%u; rect=%d,%d %dx%d",
@@ -2367,6 +2408,10 @@ extern "C" int __cdecl sgl_DrawBitmapRectWithAlphaMask(std::uint32_t mask_handle
             static_cast<unsigned>(dst.image.format), sx, sy, width, height);
         sgl::unimplemented(message);
     }
+    // As with sgl_DrawBitmapRect, only the part of the source rectangle inside the image is drawn.
+    if (static_cast<std::uint64_t>(sx) >= src.image.width || static_cast<std::uint64_t>(sy) >= src.image.height) return 1;
+    width = static_cast<int>(std::min<std::uint64_t>(width, src.image.width - static_cast<std::uint64_t>(sx)));
+    height = static_cast<int>(std::min<std::uint64_t>(height, src.image.height - static_cast<std::uint64_t>(sy)));
 
     sgl::ScreenTransform destination_transform;
     const bool destination_mapped = make_screen_transform(render_destination, dst.image, destination_transform);
@@ -2430,7 +2475,9 @@ extern "C" void __cdecl sgl_DrawText(int x, int y, const unsigned char* text) {
         std::lock_guard<TexturesMutex> lock(textures_mutex);
         font = active_font;
         mode = text_mode;
-        old_clipping = clipping_mode;
+        // Text uses the clipping mode as set: as measured against the original, modes other than 1 to 3 (negative
+        // ones included) clip text to the destination only.
+        old_clipping = requested_clipping_mode;
         old_clip = clip_rectangle;
         if (old_clipping == 2 || old_clipping == 3) {
             try {
@@ -2519,30 +2566,16 @@ extern "C" void __cdecl sgl_DrawText_Rect(int x, int y, const std::int32_t* rect
 static void blit_bitmap(int sx, int sy, int dx, int dy, int width, int height, std::uint32_t flags) {
     const auto source = textures.find(render_source);
     const auto target = textures.find(render_destination);
-    char message[192]{};
-    if (source == textures.end()) {
-        std::snprintf(message, sizeof(message), "sgl_Blt missing source (handle=%p, destination=%p)",
-            render_source, render_destination);
-        sgl::unimplemented(message);
-    }
-    if (target == textures.end()) {
-        std::snprintf(message, sizeof(message), "sgl_Blt missing destination (source=%p, handle=%p)",
-            render_source, render_destination);
-        sgl::unimplemented(message);
-    }
-    if (flags != 0 && flags != 2 && flags != 4) {
-        std::snprintf(message, sizeof(message), "sgl_Blt unsupported flags=0x%08lX", static_cast<unsigned long>(flags));
-        sgl::unimplemented(message);
-    }
-    if (sx < 0 || sy < 0) {
-        std::snprintf(message, sizeof(message), "sgl_Blt negative source origin (%d,%d)", sx, sy);
-        sgl::unimplemented(message);
-    }
-    if (source->second->image.format == sgl::ImageFormat::Indexed8 || target->second->image.format == sgl::ImageFormat::Indexed8) {
-        std::snprintf(message, sizeof(message), "sgl_Blt indexed surface formats (source=%u, destination=%u)",
-            static_cast<unsigned>(source->second->image.format), static_cast<unsigned>(target->second->image.format));
-        sgl::unimplemented(message);
-    }
+    // As measured against the original: without a source or destination (an indexed destination is never
+    // selected) nothing is copied, the flags make no difference, and an indexed source is copied through its
+    // palette. A negative source origin makes the original read memory before the pixels; the part inside the
+    // image is copied.
+    if (source == textures.end() || target == textures.end()) return;
+    static_cast<void>(flags);
+    if (target->second->image.format == sgl::ImageFormat::Indexed8) return;
+    if (sx < 0) { dx -= sx; width += sx; sx = 0; }
+    if (sy < 0) { dy -= sy; height += sy; sy = 0; }
+    if (width <= 0 || height <= 0) return;
     auto& src = *source->second;
     auto& dst = *target->second;
     const bool source_is_screen = is_screen_texture(render_source);
@@ -2609,7 +2642,7 @@ extern "C" void __cdecl sgl_Blt(int sx, int sy, int dx, int dy, int width, int h
 
 extern "C" void __cdecl sgl_Blt_RC(std::uint32_t flags) {
     std::lock_guard<TexturesMutex> lock(textures_mutex);
-    if (flags != 0 && flags != 2) sgl::unimplemented("sgl_Blt_RC flags");
+    // The flags go to the same copy as sgl_Blt, which ignores them.
     const auto source = textures.find(render_source);
     const auto target = textures.find(render_destination);
     if (source == textures.end() || target == textures.end()) sgl::unimplemented("sgl_Blt_RC state");

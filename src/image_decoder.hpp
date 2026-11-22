@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <vector>
@@ -40,6 +41,8 @@ public:
     HRESULT initialize(const std::filesystem::path& library_path) noexcept;
     HRESULT inspect(const char* name, std::vector<std::uint8_t>& encoded, DecodedImage& output) noexcept;
     HRESULT decode(const char* name, std::vector<std::uint8_t>& encoded, DecodedImage& output) noexcept;
+    // AIM's pixel layout fields (bytes per pixel, format and pitch) of the last image, for failure messages.
+    const std::array<std::uint32_t, 3>& last_layout() const noexcept { return last_layout_; }
 
 private:
     HRESULT process(const char* name, std::vector<std::uint8_t>& encoded, DecodedImage& output, bool pixels) noexcept;
@@ -47,7 +50,9 @@ private:
     void (__cdecl* initialize_)(void*) = nullptr;
     int (__cdecl* decode_)(void*, const char*, unsigned char*, long) = nullptr;
     int (__cdecl* inspect_)(void*, const char*, unsigned char*, long) = nullptr;
+    int (__cdecl* convert_)(void*) = nullptr;
     void (__cdecl* release_)(void*) = nullptr;
+    std::array<std::uint32_t, 3> last_layout_{};
 };
 
 }

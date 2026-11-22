@@ -34,12 +34,14 @@ for (const name of ['sgl_GetProjectionData']) {
     assert.equal(result.status, 127, `${name} returned ${result.status}`);
     assert.equal(result.stderr, `Unimplemented SGL export: ${name}\n`);
 }
-for (const [mode, name] of [['image_flags_without_archiver', 'sgl_LoadMemoryTexture archiver'], ['image_high_flags_without_archiver', 'sgl_LoadMemoryTexture archiver'], ['unsupported_lock', 'sgl_LockTexture flags'],
-    ['unsupported_draw', 'sgl_DrawBitmapRect source not selected']]) {
+for (const [mode, name] of [['image_flags_without_archiver', 'sgl_LoadMemoryTexture archiver'], ['image_high_flags_without_archiver', 'sgl_LoadMemoryTexture archiver'], ['unsupported_lock', 'sgl_LockTexture object']]) {
     const result = spawnSync(probe, [library, mode, 'unused'], {encoding: 'utf8'});
     assert.equal(result.status, 127, `${mode} returned ${result.status}`);
     assert.equal(result.stderr, `Unimplemented SGL export: ${name}\n`);
 }
+// Like the original, a draw without a selected source or destination draws nothing.
+const unselectedDraw = spawnSync(probe, [library, 'unsupported_draw', 'unused'], {encoding: 'utf8'});
+assert.equal(unselectedDraw.status, 5, `Draw without a source returned ${unselectedDraw.status}: ${unselectedDraw.stderr}`);
 const oversize = spawnSync(probe, [library, 'oversize_create', 'unused'], {encoding: 'utf8'});
 assert.equal(oversize.status, 0, `Oversize texture returned ${oversize.status}`);
 console.log('All 180 exports resolve; archive, blend, solid-rectangle and clip state, nine no-op contracts and explicit unimplemented failures match.');
