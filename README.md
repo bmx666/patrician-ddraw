@@ -2,6 +2,10 @@
 
 A replacement for `ddraw_Dll.dll`, the graphics library of *Patrician III*, built on Direct3D 11. It runs the game at 16:9 resolutions up to 2560×1440, in a borderless or normal window, without the original frame limit. The game executable is not modified on disk.
 
+![Gdańsk at 2560×1440 with the frame counter enabled](docs/images/gdansk-2560x1440.jpg)
+
+*Gdańsk at 2560×1440, frame counter enabled.*
+
 > **Beta, work in progress.** The renderer is playable but not finished. Crashes, error messages and drawing errors are expected, especially in game situations that have not been tested yet. Testers and feedback are very welcome.
 
 ## Testing and feedback
