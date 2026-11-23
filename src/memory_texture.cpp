@@ -2207,7 +2207,8 @@ extern "C" void __cdecl sgl_DrawLine(int, int, int, int) {
     // The original SGL backend dispatches this export to a `ret 0x10` stub.
 }
 
-static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, int dw, int dh) {
+static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, int dw, int dh,
+    bool smooth_menu_text = false) {
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     Texture* const source_texture = find_texture_cached(render_source_lookup, render_source);
     Texture* const target_texture = find_texture_cached(render_destination_lookup, render_destination);
@@ -2292,8 +2293,11 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
     // for the multiplying modes without a constant color; the other modes sample the nearest pixel.
     const bool filtered_mode = (blend_mode == sgl::BlendMode::Opaque && !(keyed_copy && src.keyed)) ||
         blend_mode == sgl::BlendMode::Multiply || blend_mode == sgl::BlendMode::Multiply2;
-    const auto sampling = !indexed && filtered_mode && stretched && (flags & 0x10) != 0 && dw >= width && dh >= height
-        ? sgl::Sampling::SglBilinear : sgl::Sampling::SglFixedPoint;
+    auto sampling = sgl::Sampling::SglFixedPoint;
+    if (smooth_menu_text && !indexed && !src.keyed && blend_mode == sgl::BlendMode::Alpha)
+        sampling = sgl::Sampling::PresentSharp;
+    else if (!indexed && filtered_mode && stretched && (flags & 0x10) != 0 && dw >= width && dh >= height)
+        sampling = sgl::Sampling::SglBilinear;
 
     Texture* draw_source = &src;
     bool expanded_menu_background = false;
@@ -2535,7 +2539,9 @@ extern "C" void __cdecl sgl_DrawText(int x, int y, const unsigned char* text) {
             const auto next = font[0x20 + *current];
             const auto width = widths[glyph];
             const auto advance = kerning && next ? kerning[glyph * glyph_count + next] : width;
-            if (width) draw_bitmap(glyph * glyph_width, 0, position, y, width, glyph_height, width, glyph_height);
+            if (width) draw_bitmap(glyph * glyph_width, 0, position, y, width, glyph_height, width, glyph_height,
+                view_state.logical_width == 800 && view_state.logical_height == 600 &&
+                    is_screen_texture(render_destination));
             position += advance;
         }
     }
