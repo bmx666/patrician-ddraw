@@ -3,6 +3,8 @@
 #include "compositor.hpp"
 #include "image_decoder.hpp"
 #include "presentation.hpp"
+#include <cstdint>
+#include <filesystem>
 #include <unordered_map>
 #include <vector>
 
@@ -45,6 +47,10 @@ public:
     DisplayMode display_mode() const noexcept;
     std::optional<unsigned> max_fps() const noexcept;
     HRESULT present(void* id, const DecodedImage& image) noexcept;
+    // Names the SGL export and the game address that called it for the readbacks made until the next call; null
+    // clears it. With show_fps, readbacks are summed per site, caller and surface size into sgl_readbacks.log next to
+    // high_res.ini every two seconds.
+    void set_readback_site(const char* site, std::uintptr_t caller) noexcept;
 
 private:
     struct Surface {
@@ -81,6 +87,18 @@ private:
     void flush_pending() noexcept;
     // Places a draw that writes the given pixels of the queued target in its layer.
     HRESULT assign_layer(const Surface& target, const RECT& written, std::uint32_t& layer) noexcept;
+    struct ReadbackSource {
+        const char* site = nullptr;
+        std::uintptr_t caller = 0;
+        UINT width = 0;
+        UINT height = 0;
+        unsigned count = 0;
+        unsigned long long bytes = 0;
+        long long ticks = 0;
+    };
+    void trace_readback(const Surface& surface, unsigned long long bytes, long long ticks) noexcept;
+    // Appends the summed readbacks to the log and starts a new window once two seconds have passed.
+    void write_readback_trace() noexcept;
     HRESULT surface(void* id, const DecodedImage& image, Surface*& result) noexcept;
     HRESULT upload_cpu_image(Surface& surface, const DecodedImage& image) noexcept;
     HRESULT create_background(Surface& surface) noexcept;
@@ -116,6 +134,12 @@ private:
     std::vector<std::uint32_t> layer_cells_;
     UINT layer_grid_columns_ = 0;
     UINT layer_grid_rows_ = 0;
+    const char* readback_site_ = nullptr;
+    std::uintptr_t readback_caller_ = 0;
+    std::filesystem::path readback_log_;
+    std::vector<ReadbackSource> readback_sources_;
+    long long readback_window_start_ = 0;
+    unsigned readback_frames_ = 0;
 };
 
 }

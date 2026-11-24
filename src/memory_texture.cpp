@@ -218,6 +218,28 @@ struct Font {
 };
 std::unordered_map<void*, std::unique_ptr<Font>> fonts;
 sgl::SurfaceRenderer surface_renderer;
+// Attributes the readbacks made while it lives to an SGL export and the game address that called it (0 when unknown),
+// restoring the enclosing attribution afterwards.
+class ReadbackSite {
+public:
+    ReadbackSite(const char* site, const void* caller) noexcept : previous_site_(current_site), previous_caller_(current_caller) {
+        set(site, reinterpret_cast<std::uintptr_t>(caller));
+    }
+    ~ReadbackSite() { set(previous_site_, previous_caller_); }
+    ReadbackSite(const ReadbackSite&) = delete;
+    ReadbackSite& operator=(const ReadbackSite&) = delete;
+
+private:
+    static void set(const char* site, std::uintptr_t caller) noexcept {
+        current_site = site;
+        current_caller = caller;
+        surface_renderer.set_readback_site(site, caller);
+    }
+    static inline const char* current_site = nullptr;
+    static inline std::uintptr_t current_caller = 0;
+    const char* previous_site_;
+    std::uintptr_t previous_caller_;
+};
 struct Screen {
     void* offscreen = nullptr;
     void* display = nullptr;
@@ -1375,6 +1397,7 @@ extern "C" void __cdecl sgl_DestroyActiveScreen() {
 }
 
 extern "C" int __cdecl sgl_SwitchScreenMode(const std::uint32_t* requested_mode) {
+    const ReadbackSite readback_site("sgl_SwitchScreenMode", _ReturnAddress());
     // Legacy SGL callers use 16 as a mode tag; presentation and surfaces stay 32-bit.
     if (!requested_mode || (requested_mode[2] != 16 && requested_mode[2] != 32)) return 0;
     auto width = requested_mode[0], height = requested_mode[1];
@@ -1500,6 +1523,7 @@ void __fastcall hook(void* self, void* unused, std::uint8_t* pixels, int offset_
     int pitch) {
     RECT written{};
     bool partial = false;
+    const ReadbackSite readback_site("water effect", reinterpret_cast<const void*>(call_site));
     {
         std::lock_guard<TexturesMutex> lock(textures_mutex);
         const auto entry = lock_deferred ? textures.find(deferred_texture) : textures.end();
@@ -1604,6 +1628,7 @@ extern "C" int __cdecl sgl_LockTexture(void* handle, LockOutput* output, int fla
     // both (3) are treated as both here, so neither the read-back nor the upload is skipped.
     if (flags < 1 || flags > 3) flags = 3;
     const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+    const ReadbackSite readback_site("sgl_LockTexture", _ReturnAddress());
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     const bool water_lock = water_effect::installed && caller == water_effect::lock_return &&
         reinterpret_cast<std::intptr_t>(handle) == -4 && flags == 3;
@@ -1629,6 +1654,7 @@ extern "C" int __cdecl sgl_LockTexture(void* handle, LockOutput* output, int fla
 }
 
 extern "C" void __cdecl sgl_UnlockTexture(void* handle) {
+    const ReadbackSite readback_site("sgl_UnlockTexture", _ReturnAddress());
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     handle = screen_alias(handle);
     const auto entry = textures.find(handle);
@@ -1654,6 +1680,7 @@ extern "C" void __cdecl sgl_UnlockTexture(void* handle) {
 }
 
 extern "C" int __cdecl sgl_ChangePalette(void* handle, std::uint32_t* palette) {
+    const ReadbackSite readback_site("sgl_ChangePalette", _ReturnAddress());
     if (!handle) return 0;
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     const auto entry = textures.find(handle);
@@ -1715,6 +1742,7 @@ extern "C" void* __cdecl sgl_SetRenderSource(void* handle) {
 }
 
 extern "C" void* __cdecl sgl_SetRenderDest(void* handle) {
+    const ReadbackSite readback_site("sgl_SetRenderDest", _ReturnAddress());
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     handle = screen_alias(handle);
     auto next = textures.end();
@@ -1911,6 +1939,7 @@ extern "C" void __cdecl sgl_SetFont(const void* font) {
 
 static void* create_font(const unsigned char* characters, void* texture_handle, int glyph_width,
     int glyph_height, int spacing, int space_width, bool kerned, int fixed_width) {
+    const ReadbackSite readback_site("create_font", nullptr);
     if (!characters || !texture_handle) return nullptr;
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     const auto entry = textures.find(texture_handle);
@@ -2064,6 +2093,7 @@ extern "C" std::uint32_t __cdecl sgl_SetBlendMode(std::uint32_t mode) {
 // Flag 1 clears the whole destination, ignoring the clip and the blend mode; the other flags do nothing. As measured
 // against the original, an opaque color replaces the pixels and any other color is blended by its alpha.
 extern "C" void __cdecl sgl_ClearBuffer(std::uint32_t flags, std::uint32_t color, float) {
+    const ReadbackSite readback_site("sgl_ClearBuffer", _ReturnAddress());
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     if (!(flags & 1)) return;
     const auto entry = textures.find(render_destination);
@@ -2089,6 +2119,7 @@ extern "C" void __cdecl sgl_ClearBuffer(std::uint32_t flags, std::uint32_t color
 }
 
 extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
+    const ReadbackSite readback_site("sgl_FillSolidRect", _ReturnAddress());
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     const auto entry = textures.find(render_destination);
     if (entry == textures.end()) return;
@@ -2279,6 +2310,7 @@ static void clear_display_border() {
 
 static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, int dw, int dh,
     bool smooth_menu_text = false) {
+    const ReadbackSite readback_site("draw_bitmap", nullptr);
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     Texture* const source_texture = find_texture_cached(render_source_lookup, render_source);
     Texture* const target_texture = find_texture_cached(render_destination_lookup, render_destination);
@@ -2640,6 +2672,7 @@ extern "C" void __cdecl sgl_DrawText_Rect(int x, int y, const std::int32_t* rect
 }
 
 static void blit_bitmap(int sx, int sy, int dx, int dy, int width, int height, std::uint32_t flags) {
+    const ReadbackSite readback_site("blit_bitmap", nullptr);
     const auto source = textures.find(render_source);
     const auto target = textures.find(render_destination);
     // As measured against the original: without a source or destination (an indexed destination is never
