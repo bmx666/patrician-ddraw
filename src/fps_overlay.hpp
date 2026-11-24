@@ -16,6 +16,11 @@ struct FrameCounters {
     unsigned draws = 0;
     unsigned draw_calls = 0;
     unsigned batches = 0;
+    // Queue flushes forced by a draw to another target, by a blended draw overlapping a queued one and by a texture
+    // upload a queued draw uses; the rest come from readbacks, presents and full queues.
+    unsigned target_flushes = 0;
+    unsigned overlap_flushes = 0;
+    unsigned upload_flushes = 0;
     unsigned readbacks = 0;
     unsigned uploads = 0;
     unsigned long long transfer_bytes = 0;
@@ -34,7 +39,7 @@ public:
     void reset() noexcept;
     const std::string& text() const noexcept { return text_; }
 
-    static constexpr UINT max_characters = 100;
+    static constexpr UINT max_characters = 112;
     static constexpr UINT glyph_width = 5;
     static constexpr UINT glyph_height = 7;
     static constexpr UINT padding = 2;

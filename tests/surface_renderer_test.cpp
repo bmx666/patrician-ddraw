@@ -26,6 +26,8 @@ int main() {
 
     int source_id = 0, bgra_id = 0, bgr_target_id = 0;
     sgl::SurfaceRenderer renderer;
+    // The expected pixels follow the original integer blend formulas.
+    renderer.set_exact_blend(true);
     const RECT clip{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     const sgl::Rect bounds{0, 0, static_cast<float>(width), static_cast<float>(height)};
     HRESULT result = renderer.draw(&source_id, source, &bgra_id, bgra, bounds, bounds, clip,
@@ -116,6 +118,7 @@ int main() {
         const sgl::DecodedImage translucent{2, 1, 8, sgl::ImageFormat::Bgra32, {200, 100, 50, 128, 30, 250, 170, 77}, {}};
         int opaque_id = 0, translucent_id = 0, target_id = 0;
         sgl::SurfaceRenderer sequence_renderer;
+        sequence_renderer.set_exact_blend(true);
         const RECT full{0, 0, static_cast<LONG>(sequence_width), 1};
         struct Step { const sgl::DecodedImage* source; int* id; float left; float width; sgl::BlendMode blend; };
         const Step steps[] = {

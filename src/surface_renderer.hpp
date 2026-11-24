@@ -41,6 +41,10 @@ public:
     DisplayMode display_mode() const noexcept;
     std::optional<unsigned> max_fps() const noexcept;
     HRESULT present(void* id, const DecodedImage& image) noexcept;
+    // Exact blending copies the target under every translucent draw and reproduces the original integer formulas;
+    // otherwise hardware blend states combine the draws with the target in one pass. open_screen applies the
+    // [display] exact_blend setting.
+    void set_exact_blend(bool exact) noexcept;
 
 private:
     struct Surface {
@@ -72,6 +76,8 @@ private:
     // start of the batch equals one taken right before its draw because no earlier draw of the batch writes the copied
     // region (see draw_impl). Must run before anything else reads or writes the queued resources.
     void flush_pending() noexcept;
+    // flush_pending, counted under reason when the queue holds draws.
+    void flush_pending(unsigned& reason) noexcept;
     // True when a queued draw reads or writes the surface, so changing its textures must flush the queue first.
     bool pending_uses(const Surface& surface) const noexcept;
     HRESULT surface(void* id, const DecodedImage& image, Surface*& result) noexcept;
@@ -93,6 +99,7 @@ private:
     std::vector<Compositor::PreparedDraw> pending_draws_;
     ID3D11Texture2D* pending_target_ = nullptr;
     RECT pending_bounds_{};
+    bool exact_blend_ = false;
 };
 
 }

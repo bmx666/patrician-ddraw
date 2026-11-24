@@ -31,6 +31,7 @@ public:
     DisplaySize output_size() const noexcept { return {output_width_, output_height_}; }
     DisplayMode display_mode() const noexcept { return mode_; }
     std::optional<unsigned> max_fps() const noexcept { return max_fps_; }
+    bool exact_blend() const noexcept { return exact_blend_; }
     void set_show_fps(bool show) noexcept { show_fps_ = show; fps_overlay_.reset(); }
     const FpsOverlay& fps_overlay() const noexcept { return fps_overlay_; }
 
@@ -60,6 +61,7 @@ private:
     int revealed_cursor_count_ = 0;
     std::optional<unsigned> max_fps_;
     bool show_fps_ = false;
+    bool exact_blend_ = false;
     FpsOverlay fps_overlay_;
 };
 

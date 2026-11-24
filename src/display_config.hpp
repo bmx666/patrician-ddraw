@@ -19,6 +19,9 @@ struct DisplayConfig {
     std::optional<unsigned> max_fps;
     // [display] show_fps=1 draws frame rate and frame times into the top-left corner.
     bool show_fps = false;
+    // [display] exact_blend=1 blends translucent draws through a copy of the target with the original integer formulas.
+    // The default 0 uses hardware blending, one step apart at most, which keeps a frame's draws in one GPU pass.
+    bool exact_blend = false;
 };
 
 bool is_supported_display_size(DisplaySize size) noexcept;

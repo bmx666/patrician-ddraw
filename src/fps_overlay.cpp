@@ -26,6 +26,7 @@ constexpr Glyph glyphs[] = {
     {'d', {0x01, 0x01, 0x0d, 0x13, 0x11, 0x11, 0x0f}}, {'r', {0x00, 0x00, 0x16, 0x19, 0x10, 0x10, 0x10}},
     {'b', {0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x1e}}, {'u', {0x00, 0x00, 0x11, 0x11, 0x11, 0x13, 0x0d}},
     {'c', {0x00, 0x00, 0x0e, 0x10, 0x10, 0x11, 0x0e}}, {'l', {0x0c, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e}},
+    {'t', {0x08, 0x08, 0x1c, 0x08, 0x08, 0x09, 0x06}}, {'o', {0x00, 0x00, 0x0e, 0x11, 0x11, 0x11, 0x0e}},
 };
 
 const Glyph* find_glyph(char character) noexcept {
@@ -64,6 +65,9 @@ void FpsOverlay::frame_presented(const FrameCounters& counters) noexcept {
         totals_.draws += counters.draws;
         totals_.draw_calls += counters.draw_calls;
         totals_.batches += counters.batches;
+        totals_.target_flushes += counters.target_flushes;
+        totals_.overlap_flushes += counters.overlap_flushes;
+        totals_.upload_flushes += counters.upload_flushes;
         totals_.readbacks += counters.readbacks;
         totals_.uploads += counters.uploads;
         totals_.transfer_bytes += counters.transfer_bytes;
@@ -89,8 +93,9 @@ void FpsOverlay::update_text(double fps, double average_ms, double longest_ms) n
     const double frames = frames_ ? static_cast<double>(frames_) : 1.0;
     const double tick_ms = frequency_ ? 1000.0 / static_cast<double>(frequency_) / frames : 0.0;
     std::snprintf(buffer, sizeof(buffer),
-        "%.0f fps %.1f ms max %.1f dr %.0f dc %.0f fl %.0f rb %.1f %.1fms up %.1f %.1fms mb %.1f", fps, average_ms,
-        longest_ms, totals_.draws / frames, totals_.draw_calls / frames, totals_.batches / frames,
+        "%.0f fps %.1f ms max %.1f dr %.0f dc %.0f fl %.0f t%.0f o%.0f u%.0f rb %.1f %.1fms up %.1f %.1fms mb %.1f",
+        fps, average_ms, longest_ms, totals_.draws / frames, totals_.draw_calls / frames, totals_.batches / frames,
+        totals_.target_flushes / frames, totals_.overlap_flushes / frames, totals_.upload_flushes / frames,
         totals_.readbacks / frames, totals_.readback_ticks * tick_ms,
         totals_.uploads / frames, totals_.upload_ticks * tick_ms, static_cast<double>(totals_.transfer_bytes) / frames / 1048576.0);
     text_ = buffer;

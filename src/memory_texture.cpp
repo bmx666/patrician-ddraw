@@ -2136,7 +2136,8 @@ extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
 
     const auto alpha = static_cast<std::uint8_t>(constant_color >> 24);
     // A surface whose current pixels are on the GPU is filled there: the CPU path would first read back the whole
-    // surface and then upload it again. The GPU blend modes reproduce the integer formulas of the CPU path below.
+    // surface and then upload it again. With exact_blend the GPU blend modes reproduce the integer formulas of the CPU path
+    // below; hardware blending comes within one step of them.
     if (surface_renderer.gpu_holds_newer_pixels(render_destination)) {
         static std::array<std::uint8_t, 4> fill_pixel_bytes{};
         static sgl::DecodedImage fill_source = [] {

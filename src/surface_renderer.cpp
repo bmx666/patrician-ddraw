@@ -142,7 +142,7 @@ HRESULT SurfaceRenderer::upload_cpu_image(Surface& surface, const DecodedImage& 
     // recorded after it, which keeps uploads out of the run of draws.
     if ((surface.cpu_needs_upload || (surface.palette && surface.palette_needs_upload && !image.palette.empty())) &&
         pending_uses(surface))
-        flush_pending();
+        flush_pending(counters_.upload_flushes);
     if (surface.cpu_needs_upload) {
         const long long started = performance_counter();
         std::vector<std::uint8_t> converted;
@@ -225,7 +225,7 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
     if (mask) mask_surface = &surfaces_.at(mask_id);
     dst = &surfaces_.at(target_id);
     // Queued draws belong to one target; recording them before switching keeps the GPU order intact.
-    if (pending_target_ && pending_target_ != dst->texture.Get()) flush_pending();
+    if (pending_target_ && pending_target_ != dst->texture.Get()) flush_pending(counters_.target_flushes);
     // The last recorded draw leaves its target bound. Unbind it only when this draw reads it; binding a bound render
     // target as a shader resource would silently null the input, while re-binding per draw costs driver time.
     if (bound_target_ && (bound_target_ == src->texture.Get() || (mask && bound_target_ == mask_surface->texture.Get()))) {
@@ -255,7 +255,9 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
         std::min(bound(target_rect.right, 0, width, true), std::clamp<LONG>(clip.right, 0, width)),
         std::min(bound(target_rect.bottom, 0, height, true), std::clamp<LONG>(clip.bottom, 0, height))};
     const bool writes = written.left < written.right && written.top < written.bottom;
-    if (blend != BlendMode::Opaque && !dst->background) {
+    // Only exact blending reads the target through a background copy; hardware blending reads it in place.
+    const bool copies_background = blend != BlendMode::Opaque && exact_blend_;
+    if (copies_background && !dst->background) {
         if (failure_stage) *failure_stage = "alpha background allocation";
         D3D11_TEXTURE2D_DESC desc = dst->description;
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -277,13 +279,14 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
         hr = compositor_.prepare(context_.Get(), dst->target.Get(), src->view.Get(),
             src->palette_view.Get(), mask_surface->view.Get(), target.width, target.height,
             source_rect, target_rect, clip, std::nullopt, Sampling::SglFixedPoint,
-            dst->background_view.Get(), modulation_color, BlendMode::AlphaMask, failure_stage, &renderer_source,
+            copies_background ? dst->background_view.Get() : nullptr, modulation_color, BlendMode::AlphaMask,
+            failure_stage, &renderer_source,
             prepared);
     } else {
         hr = compositor_.prepare(context_.Get(), dst->target.Get(), src->view.Get(),
             source.format == ImageFormat::Indexed8 ? src->palette_view.Get() : nullptr, nullptr,
             target.width, target.height, source_rect, target_rect, clip, key, sampling,
-            blend != BlendMode::Opaque ? dst->background_view.Get() : nullptr,
+            copies_background ? dst->background_view.Get() : nullptr,
             modulation_color, blend, failure_stage, &renderer_source, prepared);
     }
     if (FAILED(hr)) return hr;
@@ -292,11 +295,11 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
         const auto overlaps = [](const RECT& a, const RECT& b) {
             return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
         };
-        if (blend != BlendMode::Opaque && writes) {
+        if (copies_background && writes) {
             // The copy is recorded ahead of the queued draws, so it must not cover pixels one of them writes.
             if (!pending_.empty() && overlaps(pending_bounds_, written) &&
                 std::any_of(pending_.begin(), pending_.end(), [&](const PendingDraw& queued) { return overlaps(queued.written, written); }))
-                flush_pending();
+                flush_pending(counters_.overlap_flushes);
             pending.background = dst->background.Get();
             pending.copy = {static_cast<UINT>(written.left), static_cast<UINT>(written.top), 0,
                 static_cast<UINT>(written.right), static_cast<UINT>(written.bottom), 1};
@@ -341,6 +344,11 @@ bool SurfaceRenderer::pending_uses(const Surface& surface) const noexcept {
             return resource && (resource == view || resource == palette);
         });
     });
+}
+
+void SurfaceRenderer::flush_pending(unsigned& reason) noexcept {
+    if (!pending_.empty()) ++reason;
+    flush_pending();
 }
 
 void SurfaceRenderer::flush_pending() noexcept {
@@ -462,7 +470,7 @@ HRESULT SurfaceRenderer::synchronize_region_to_cpu(void* id, DecodedImage& image
 HRESULT SurfaceRenderer::upload_region(void* id, const DecodedImage& image, RECT region) noexcept {
     const auto found = surfaces_.find(id);
     if (found == surfaces_.end() || found->second.cpu_needs_upload) return S_OK;
-    if (pending_uses(found->second)) flush_pending();
+    if (pending_uses(found->second)) flush_pending(counters_.upload_flushes);
     if (!context_ || image.format != ImageFormat::Bgra32 || image.pixels.empty() ||
         static_cast<std::uint64_t>(image.pitch) * image.height > image.pixels.size()) return E_INVALIDARG;
     region = {std::max(region.left, 0L), std::max(region.top, 0L), std::min(region.right, static_cast<LONG>(image.width)),
@@ -511,7 +519,16 @@ void SurfaceRenderer::forget(void* id) noexcept {
 HRESULT SurfaceRenderer::open_screen(HWND window, const std::filesystem::path& config, std::string& error) {
     HRESULT hr = initialize();
     if (FAILED(hr)) { error = "Cannot initialize D3D11 device"; return hr; }
-    return presentation_.initialize_configured(device_.Get(), window, config, error);
+    hr = presentation_.initialize_configured(device_.Get(), window, config, error);
+    if (SUCCEEDED(hr)) set_exact_blend(presentation_.exact_blend());
+    return hr;
+}
+
+void SurfaceRenderer::set_exact_blend(bool exact) noexcept {
+    // Queued draws were prepared for the current mode; blended ones carry either a background copy or a blend state.
+    if (exact == exact_blend_) return;
+    flush_pending();
+    exact_blend_ = exact;
 }
 
 HRESULT SurfaceRenderer::set_screen_size(DisplaySize size) noexcept {

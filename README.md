@@ -84,6 +84,7 @@ height=1080
 mode=borderless
 max_fps=0
 show_fps=0
+exact_blend=0
 ```
 
 | Key | Values |
@@ -91,7 +92,8 @@ show_fps=0
 | `width`, `height` | 1280×1024, 1600×900, 1920×1080 or 2560×1440. Changing the resolution in the game's options updates the file. |
 | `mode` | `borderless` (default) or `windowed` |
 | `max_fps` | `0` removes the limit, `10`–`1000` sets one; without the key the game keeps its own limit of 50 |
-| `show_fps` | `1` shows frame rate, frame times, draws (`dr`), the draw calls and queue flushes that recorded them (`dc`, `fl`) and transfers in the top-left corner |
+| `show_fps` | `1` shows frame rate, frame times, draws (`dr`), the draw calls and queue flushes that recorded them (`dc`, `fl`; of the flushes, `t` switched target, `o` were overlapping translucent draws, `u` were texture uploads) and transfers in the top-left corner |
+| `exact_blend` | `1` blends translucent draws with the original integer formulas through a copy of the target, which splits a frame into many GPU passes; `0` (default) uses hardware blending, at most one color step apart, and is much faster on tile-based GPUs such as Apple Silicon |
 
 ## Building
 

@@ -183,6 +183,7 @@ HRESULT Presentation::initialize_configured(ID3D11Device* device, HWND window, c
     if (SUCCEEDED(hr)) {
         max_fps_ = config.max_fps;
         set_show_fps(config.show_fps);
+        exact_blend_ = config.exact_blend;
     }
     if (FAILED(hr)) {
         error = hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) ?
@@ -295,6 +296,7 @@ void Presentation::close() noexcept {
     window_change_in_progress_ = false;
     max_fps_.reset();
     show_fps_ = false;
+    exact_blend_ = false;
     fps_overlay_.reset();
 }
 

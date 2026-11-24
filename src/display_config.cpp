@@ -55,7 +55,8 @@ bool sgl::display_config(HWND window, const std::filesystem::path& path, Display
     } else {
         std::ifstream file(path, std::ios::binary);
         if (!file) { error = "Cannot read high_res.ini"; return false; }
-        bool in_display = false, has_width = false, has_height = false, has_mode = false, has_max_fps = false, has_show_fps = false;
+        bool in_display = false, has_width = false, has_height = false, has_mode = false, has_max_fps = false, has_show_fps = false,
+            has_exact_blend = false;
         std::string line;
         unsigned line_number = 0;
         while (std::getline(file, line)) {
@@ -87,6 +88,12 @@ bool sgl::display_config(HWND window, const std::filesystem::path& path, Display
                 has_show_fps = true;
                 if (value == "1") selected.show_fps = true;
                 else if (value != "0") { error = "high_res.ini line " + std::to_string(line_number) + ": show_fps must be 0 or 1"; return false; }
+                continue;
+            } else if (equal_ascii(key, "exact_blend")) {
+                if (has_exact_blend) { error = "high_res.ini line " + std::to_string(line_number) + ": duplicate setting"; return false; }
+                has_exact_blend = true;
+                if (value == "1") selected.exact_blend = true;
+                else if (value != "0") { error = "high_res.ini line " + std::to_string(line_number) + ": exact_blend must be 0 or 1"; return false; }
                 continue;
             } else if (equal_ascii(key, "max_fps")) {
                 if (has_max_fps) { error = "high_res.ini line " + std::to_string(line_number) + ": duplicate setting"; return false; }
