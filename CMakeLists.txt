@@ -79,7 +79,7 @@ target_compile_features(sgl_compositor PUBLIC cxx_std_17)
 target_compile_definitions(sgl_compositor PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(sgl_compositor PRIVATE /W4 /WX /permissive-)
 target_include_directories(sgl_compositor PUBLIC src)
-target_link_libraries(sgl_compositor PUBLIC d3d11 d3dcompiler dxgi comctl32)
+target_link_libraries(sgl_compositor PUBLIC d3d11 dxgi comctl32)
 target_link_libraries(PatricianSGL PRIVATE sgl_compositor)
 
 add_library(sgl_image_decoder STATIC src/image_decoder.cpp)

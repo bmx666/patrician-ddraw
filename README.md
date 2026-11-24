@@ -28,6 +28,7 @@ Comparison screenshots with the original `ddraw_Dll.dll` help a lot with drawing
 - Scaling to any screen size with the aspect ratio kept.
 - Adjustable or unlimited frame rate and an optional on-screen frame counter.
 - Works with the GOG and Steam releases and with the P3Modding modloader.
+- Starts under Wine, including macOS with the Game Porting Toolkit.
 
 ## How it works
 

@@ -258,10 +258,28 @@ bool valid_rect(sgl::Rect rect) noexcept {
 
 namespace sgl {
 
+// D3DCompile is resolved at run time instead of imported: a missing d3dcompiler_47.dll (some Wine/Proton
+// prefixes) would otherwise stop the game from loading this library at all. Any of these versions compiles
+// the shaders below (shader model 4.0).
+static pD3DCompile d3d_compile_function() noexcept {
+    static const pD3DCompile function = [] {
+        for (const wchar_t* name : {L"d3dcompiler_47.dll", L"d3dcompiler_46.dll", L"d3dcompiler_43.dll"}) {
+            const HMODULE module = LoadLibraryW(name);
+            if (!module) continue;
+            if (const auto found = reinterpret_cast<pD3DCompile>(GetProcAddress(module, "D3DCompile"))) return found;
+            FreeLibrary(module);
+        }
+        return pD3DCompile{};
+    }();
+    return function;
+}
+
 HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     renderer_state_context_ = nullptr;
     renderer_pixel_shader_ = nullptr;
     if (!device) return E_INVALIDARG;
+    const pD3DCompile compile = d3d_compile_function();
+    if (!compile) return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
     ComPtr<ID3DBlob> vertex_code;
     ComPtr<ID3DBlob> pixel_code;
     ComPtr<ID3DBlob> keyed_pixel_code;
@@ -302,58 +320,58 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     ComPtr<ID3D11SamplerState> sampler_state;
     ComPtr<ID3D11SamplerState> present_sampler_state;
     ComPtr<ID3D11RasterizerState> rasterizer_state;
-    HRESULT result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    HRESULT result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "vertex_main", "vs_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &vertex_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &pixel_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "keyed_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &keyed_pixel_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "alpha_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &alpha_pixel_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "multiply_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &multiply_pixel_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "multiply_modulated_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &multiply_modulated_pixel_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "multiply2_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &multiply2_pixel_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "fill_alpha_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &fill_alpha_pixel_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "additive_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &additive_pixel_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "additive_modulated_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &additive_modulated_pixel_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "indexed_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &indexed_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "keyed_indexed_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &keyed_indexed_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "alpha_indexed_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &alpha_indexed_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "multiply_indexed_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &multiply_indexed_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "multiply_modulated_indexed_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &multiply_modulated_indexed_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "additive_indexed_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &additive_indexed_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "additive_modulated_indexed_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &additive_modulated_indexed_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "alpha_masked_indexed_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &alpha_masked_indexed_code, nullptr);
     if (FAILED(result)) return result;
     result = device->CreateVertexShader(vertex_code->GetBufferPointer(), vertex_code->GetBufferSize(),

@@ -11,6 +11,8 @@ namespace sgl {
 class SurfaceRenderer {
 public:
     HRESULT initialize() noexcept;
+    // Step of the last failed initialize(), for the error message.
+    const char* init_failure_stage() const noexcept { return init_failure_stage_; }
     HRESULT draw(void* source_id, const DecodedImage& source, void* target_id,
         DecodedImage& target, Rect source_rect, Rect target_rect, RECT clip,
         std::optional<std::uint32_t> key, BlendMode blend, const char** failure_stage = nullptr,
@@ -80,6 +82,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
     Compositor compositor_;
+    const char* init_failure_stage_ = "";
     Presentation presentation_;
     std::unordered_map<void*, Surface> surfaces_;
     FrameCounters counters_{};

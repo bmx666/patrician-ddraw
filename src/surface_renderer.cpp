@@ -1,9 +1,11 @@
 #include "surface_renderer.hpp"
+#include <dxgi.h>
 #include <algorithm>
 #include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <new>
 #include <stdexcept>
 #include <vector>
@@ -52,11 +54,30 @@ HRESULT SurfaceRenderer::initialize() noexcept {
     if (device_) return S_OK;
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
-    HRESULT result = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-        nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, &context);
-    if (FAILED(result)) return result;
+    // The shaders need feature level 10_0. Wine translates D3D11 to OpenGL (wined3d) or Vulkan (DXVK, wined3d
+    // with renderer=vulkan); some of those reject a request without a level list or the hardware driver type.
+    static constexpr D3D_FEATURE_LEVEL levels[] = {
+        D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
+    HRESULT result = E_FAIL;
+    for (const D3D_DRIVER_TYPE type : {D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP}) {
+        ComPtr<IDXGIFactory1> factory;
+        ComPtr<IDXGIAdapter1> adapter;
+        if (type == D3D_DRIVER_TYPE_UNKNOWN) {
+            // Explicit first adapter: needed by some layers that do not map a null adapter.
+            if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) || FAILED(factory->EnumAdapters1(0, &adapter)))
+                continue;
+        }
+        result = D3D11CreateDevice(adapter.Get(), type, nullptr, 0, levels, static_cast<UINT>(std::size(levels)),
+            D3D11_SDK_VERSION, &device, nullptr, &context);
+        if (SUCCEEDED(result)) break;
+    }
+    if (FAILED(result)) { init_failure_stage_ = "creating the Direct3D 11 device (feature level 10_0 or higher)"; return result; }
     result = compositor_.initialize(device.Get());
-    if (FAILED(result)) return result;
+    if (FAILED(result)) {
+        init_failure_stage_ = result == HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND) ?
+            "loading d3dcompiler_47/46/43.dll" : "compiling or creating the shaders";
+        return result;
+    }
     device_ = device;
     context_ = context;
     return S_OK;
