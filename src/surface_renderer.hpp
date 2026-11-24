@@ -59,10 +59,10 @@ private:
         // Bounds of the GPU writes not yet copied to the CPU pixels; readback copies only this region.
         RECT gpu_dirty{};
     };
-    // A queued draw. Draws to one target are queued so that the background copies of blended draws are recorded
-    // together ahead of the draws instead of alternating with them; every copy and draw stalls on the one before.
+    // A queued draw's target bookkeeping; its prepared draw is at the same index of pending_draws_. Draws to one
+    // target are queued so that the background copies of blended draws are recorded together ahead of the draws
+    // instead of alternating with them; every copy and draw stalls on the one before.
     struct PendingDraw {
-        Compositor::PreparedDraw draw;
         ID3D11Texture2D* texture = nullptr;
         ID3D11Texture2D* background = nullptr;
         D3D11_BOX copy{};
@@ -72,6 +72,8 @@ private:
     // start of the batch equals one taken right before its draw because no earlier draw of the batch writes the copied
     // region (see draw_impl). Must run before anything else reads or writes the queued resources.
     void flush_pending() noexcept;
+    // True when a queued draw reads or writes the surface, so changing its textures must flush the queue first.
+    bool pending_uses(const Surface& surface) const noexcept;
     HRESULT surface(void* id, const DecodedImage& image, Surface*& result) noexcept;
     HRESULT upload_cpu_image(Surface& surface, const DecodedImage& image) noexcept;
     HRESULT draw_impl(void* source_id, const DecodedImage& source, void* mask_id,
@@ -88,6 +90,7 @@ private:
     FrameCounters counters_{};
     ID3D11Resource* bound_target_ = nullptr;
     std::vector<PendingDraw> pending_;
+    std::vector<Compositor::PreparedDraw> pending_draws_;
     ID3D11Texture2D* pending_target_ = nullptr;
     RECT pending_bounds_{};
 };

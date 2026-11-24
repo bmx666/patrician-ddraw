@@ -91,7 +91,7 @@ show_fps=0
 | `width`, `height` | 1280×1024, 1600×900, 1920×1080 or 2560×1440. Changing the resolution in the game's options updates the file. |
 | `mode` | `borderless` (default) or `windowed` |
 | `max_fps` | `0` removes the limit, `10`–`1000` sets one; without the key the game keeps its own limit of 50 |
-| `show_fps` | `1` shows frame rate, frame times, draw calls and transfers in the top-left corner |
+| `show_fps` | `1` shows frame rate, frame times, draws (`dr`), the draw calls and queue flushes that recorded them (`dc`, `fl`) and transfers in the top-left corner |
 
 ## Building
 

@@ -138,8 +138,10 @@ long long performance_counter() noexcept {
 }
 
 HRESULT SurfaceRenderer::upload_cpu_image(Surface& surface, const DecodedImage& image) noexcept {
-    // Queued draws may read or write this texture; they were submitted before the upload.
-    if (surface.cpu_needs_upload || (surface.palette && surface.palette_needs_upload && !image.palette.empty()))
+    // Queued draws that read or write this texture were submitted before the upload. Other queued draws may be
+    // recorded after it, which keeps uploads out of the run of draws.
+    if ((surface.cpu_needs_upload || (surface.palette && surface.palette_needs_upload && !image.palette.empty())) &&
+        pending_uses(surface))
         flush_pending();
     if (surface.cpu_needs_upload) {
         const long long started = performance_counter();
@@ -270,22 +272,23 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
     const Compositor::RendererSource renderer_source{source.width, source.height,
         source.format == ImageFormat::Indexed8 ? DXGI_FORMAT_R8_UINT : DXGI_FORMAT_B8G8R8A8_UNORM};
     PendingDraw pending;
+    Compositor::PreparedDraw prepared;
     if (mask) {
         hr = compositor_.prepare(context_.Get(), dst->target.Get(), src->view.Get(),
             src->palette_view.Get(), mask_surface->view.Get(), target.width, target.height,
             source_rect, target_rect, clip, std::nullopt, Sampling::SglFixedPoint,
             dst->background_view.Get(), modulation_color, BlendMode::AlphaMask, failure_stage, &renderer_source,
-            pending.draw);
+            prepared);
     } else {
         hr = compositor_.prepare(context_.Get(), dst->target.Get(), src->view.Get(),
             source.format == ImageFormat::Indexed8 ? src->palette_view.Get() : nullptr, nullptr,
             target.width, target.height, source_rect, target_rect, clip, key, sampling,
             blend != BlendMode::Opaque ? dst->background_view.Get() : nullptr,
-            modulation_color, blend, failure_stage, &renderer_source, pending.draw);
+            modulation_color, blend, failure_stage, &renderer_source, prepared);
     }
     if (FAILED(hr)) return hr;
     ++counters_.draws;
-    if (pending.draw.visible) {
+    if (prepared.visible) {
         const auto overlaps = [](const RECT& a, const RECT& b) {
             return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
         };
@@ -302,8 +305,11 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
         pending.written = writes ? written : RECT{};
         try {
             if (pending_.capacity() == 0) pending_.reserve(1024);
+            if (pending_draws_.capacity() == 0) pending_draws_.reserve(1024);
+            pending_draws_.push_back(prepared);
             pending_.push_back(pending);
         } catch (const std::bad_alloc&) {
+            if (pending_draws_.size() > pending_.size()) pending_draws_.pop_back();
             return E_OUTOFMEMORY;
         }
         pending_target_ = pending.texture;
@@ -325,6 +331,18 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
     return S_OK;
 }
 
+bool SurfaceRenderer::pending_uses(const Surface& surface) const noexcept {
+    if (pending_draws_.empty()) return false;
+    if (pending_target_ == surface.texture.Get()) return true;
+    ID3D11ShaderResourceView* const view = surface.view.Get();
+    ID3D11ShaderResourceView* const palette = surface.palette_view.Get();
+    return std::any_of(pending_draws_.begin(), pending_draws_.end(), [&](const Compositor::PreparedDraw& draw) {
+        return std::any_of(std::begin(draw.resources), std::end(draw.resources), [&](ID3D11ShaderResourceView* resource) {
+            return resource && (resource == view || resource == palette);
+        });
+    });
+}
+
 void SurfaceRenderer::flush_pending() noexcept {
     if (pending_.empty()) {
         pending_target_ = nullptr;
@@ -336,9 +354,12 @@ void SurfaceRenderer::flush_pending() noexcept {
                 queued.texture, 0, &queued.copy);
         }
     }
-    for (const auto& queued : pending_) compositor_.record(context_.Get(), queued.draw, true);
+    // A failed write of the instance ring drops the batch; the next draws start a fresh one.
+    (void)compositor_.record(context_.Get(), pending_draws_.data(), pending_draws_.size(), true, &counters_.draw_calls);
+    ++counters_.batches;
     bound_target_ = pending_target_;
     pending_.clear();
+    pending_draws_.clear();
     pending_target_ = nullptr;
     pending_bounds_ = {};
 }
@@ -441,7 +462,7 @@ HRESULT SurfaceRenderer::synchronize_region_to_cpu(void* id, DecodedImage& image
 HRESULT SurfaceRenderer::upload_region(void* id, const DecodedImage& image, RECT region) noexcept {
     const auto found = surfaces_.find(id);
     if (found == surfaces_.end() || found->second.cpu_needs_upload) return S_OK;
-    flush_pending();
+    if (pending_uses(found->second)) flush_pending();
     if (!context_ || image.format != ImageFormat::Bgra32 || image.pixels.empty() ||
         static_cast<std::uint64_t>(image.pitch) * image.height > image.pixels.size()) return E_INVALIDARG;
     region = {std::max(region.left, 0L), std::max(region.top, 0L), std::min(region.right, static_cast<LONG>(image.width)),
@@ -478,7 +499,7 @@ void SurfaceRenderer::forget(void* id) noexcept {
     const auto found = surfaces_.find(id);
     if (found == surfaces_.end()) return;
     // Queued draws reference the views of this surface without holding them.
-    flush_pending();
+    if (pending_uses(found->second)) flush_pending();
     if (context_ && bound_target_ == found->second.texture.Get()) {
         context_->OMSetRenderTargets(0, nullptr, nullptr);
         bound_target_ = nullptr;
@@ -501,6 +522,7 @@ void SurfaceRenderer::close_screen() noexcept { presentation_.close(); }
 
 void SurfaceRenderer::shutdown() noexcept {
     pending_.clear();
+    pending_draws_.clear();
     pending_target_ = nullptr;
     if (context_) context_->ClearState();
     bound_target_ = nullptr;

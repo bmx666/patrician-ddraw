@@ -2,6 +2,7 @@
 
 #include <d3d11.h>
 #include <wrl/client.h>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 
@@ -82,9 +83,14 @@ private:
         std::optional<std::uint32_t> color_key, Sampling sampling, ID3D11ShaderResourceView* background,
         std::uint32_t modulation_color, BlendMode blend, const char** failure_stage,
         const RendererSource* renderer_source, PreparedDraw& prepared) noexcept;
-    // Records a prepared draw. Renderer-owned draws keep their bindings cached between draws; other draws unbind
-    // their shader resources afterwards.
-    void record(ID3D11DeviceContext* context, const PreparedDraw& prepared, bool renderer_owned) noexcept;
+    // Records prepared draws in order. Their per-draw data goes into one write of the instance ring, so no buffer or
+    // texture update separates the draws, and each run of neighbours with the same target, shader and resources is
+    // one instanced draw. Renderer-owned draws keep their bindings cached between calls; other draws unbind their
+    // shader resources afterwards. draw_calls, when set, is increased by the draw calls issued.
+    HRESULT record(ID3D11DeviceContext* context, const PreparedDraw* draws, std::size_t count, bool renderer_owned,
+        unsigned* draw_calls = nullptr) noexcept;
+    // Instances of per-draw data the ring holds; a write that does not fit after the last one restarts it.
+    static constexpr UINT instance_capacity = 4096;
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> vertex_shader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> pixel_shader_;
@@ -104,7 +110,9 @@ private:
     Microsoft::WRL::ComPtr<ID3D11PixelShader> additive_indexed_shader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> additive_modulated_indexed_shader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> alpha_masked_indexed_shader_;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> constants_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> instances_;
+    Microsoft::WRL::ComPtr<ID3D11InputLayout> input_layout_;
+    UINT instance_position_ = instance_capacity;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler_;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> present_sampler_;
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> rasterizer_;

@@ -10,10 +10,12 @@
 
 namespace sgl {
 
-// Renderer work between two presents: compositor draws, GPU-to-CPU readbacks, CPU-to-GPU texture uploads and the
-// bytes those two transfers moved.
+// Renderer work between two presents: compositor draws, the instanced draw calls and queue flushes that recorded
+// them, GPU-to-CPU readbacks, CPU-to-GPU texture uploads and the bytes those two transfers moved.
 struct FrameCounters {
     unsigned draws = 0;
+    unsigned draw_calls = 0;
+    unsigned batches = 0;
     unsigned readbacks = 0;
     unsigned uploads = 0;
     unsigned long long transfer_bytes = 0;
@@ -32,7 +34,7 @@ public:
     void reset() noexcept;
     const std::string& text() const noexcept { return text_; }
 
-    static constexpr UINT max_characters = 80;
+    static constexpr UINT max_characters = 100;
     static constexpr UINT glyph_width = 5;
     static constexpr UINT glyph_height = 7;
     static constexpr UINT padding = 2;
