@@ -104,12 +104,26 @@ std::uint64_t clip_state_version = 0;
 // Changes whenever the active clipper or its rectangles change; keys the cached clipper bounds.
 std::uint64_t clipper_version = 0;
 
+// Also shown once in a message box: the game only reports a generic driver or SGL error, and under Wine the
+// debug output is not visible without extra logging.
 void report_screen_init_failure(const char* stage, const char* detail) noexcept {
     OutputDebugStringA("Patrician III D3D11: ");
     OutputDebugStringA(stage);
     OutputDebugStringA(": ");
     OutputDebugStringA(detail);
     OutputDebugStringA("\n");
+    static bool shown = false;
+    if (shown) return;
+    shown = true;
+    char text[1024] = {};
+    std::snprintf(text, sizeof(text), "%s:\n%s", stage, detail);
+    MessageBoxA(nullptr, text, "Patrician III D3D11 renderer", MB_OK | MB_ICONERROR | MB_TASKMODAL | MB_SETFOREGROUND);
+}
+
+void report_hresult_failure(const char* stage, const char* detail, HRESULT result) noexcept {
+    char text[512] = {};
+    std::snprintf(text, sizeof(text), "%s (HRESULT 0x%08lX)", detail, static_cast<unsigned long>(result));
+    report_screen_init_failure(stage, text);
 }
 
 struct Clipper {
@@ -1182,16 +1196,27 @@ extern "C" int __cdecl sgl_InitHardware() {
     if (hardware_initialized) return 1;
     try {
         HMODULE aim = load_game_library(L"AIM.dll");
-        if (!aim) return 0;
+        if (!aim) { report_screen_init_failure("initializing SGL hardware", "AIM.dll could not be loaded"); return 0; }
         HMODULE archive = nullptr;
         try { archive = load_game_library(L"archiver.dll"); }
         catch (...) { FreeLibrary(aim); throw; }
-        if (!archive) { FreeLibrary(aim); return 0; }
+        if (!archive) {
+            FreeLibrary(aim);
+            report_screen_init_failure("initializing SGL hardware", "archiver.dll could not be loaded");
+            return 0;
+        }
         const auto aim_vendor = reinterpret_cast<int (__cdecl*)(int, int)>(GetProcAddress(aim, "?AIM_SETVENDOR@@YAHHH@Z"));
         const auto archive_vendor = reinterpret_cast<int (__cdecl*)(int, int)>(GetProcAddress(archive, "arc_SetVendor"));
-        if (!aim_vendor || !archive_vendor || !aim_vendor(0, 0) || !archive_vendor(0, 0) || FAILED(surface_renderer.initialize())) {
+        if (!aim_vendor || !archive_vendor || !aim_vendor(0, 0) || !archive_vendor(0, 0)) {
             FreeLibrary(archive);
             FreeLibrary(aim);
+            report_screen_init_failure("initializing SGL hardware", "AIM.dll or archiver.dll rejected the vendor call");
+            return 0;
+        }
+        if (const HRESULT renderer = surface_renderer.initialize(); FAILED(renderer)) {
+            FreeLibrary(archive);
+            FreeLibrary(aim);
+            report_hresult_failure("initializing the Direct3D 11 renderer", surface_renderer.init_failure_stage(), renderer);
             return 0;
         }
         aim_library = aim;
@@ -1230,7 +1255,7 @@ extern "C" void* __cdecl sgl_InitScreen(HWND window, int fullscreen, const char*
         const auto config_path = std::filesystem::path(path.data()).parent_path() / L"high_res.ini";
         const HRESULT hr = surface_renderer.open_screen(window, config_path, error);
         if (FAILED(hr)) {
-            report_screen_init_failure("opening D3D11 screen", error.c_str());
+            report_hresult_failure("opening D3D11 screen", error.empty() ? "window or swap chain setup failed" : error.c_str(), hr);
             return nullptr;
         }
         display_config_path = config_path;
