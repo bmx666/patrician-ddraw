@@ -33,6 +33,7 @@ public:
     std::optional<unsigned> max_fps() const noexcept { return max_fps_; }
     bool exact_blend() const noexcept { return exact_blend_; }
     void set_show_fps(bool show) noexcept { show_fps_ = show; fps_overlay_.reset(); }
+    bool show_fps() const noexcept { return show_fps_; }
     const FpsOverlay& fps_overlay() const noexcept { return fps_overlay_; }
 
 private:

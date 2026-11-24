@@ -4,6 +4,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <new>
@@ -419,10 +420,14 @@ HRESULT SurfaceRenderer::synchronize_to_cpu(void* id, DecodedImage& image) noexc
         }
     }
     context_->Unmap(target.staging.Get(), 0);
+    const unsigned long long bytes = static_cast<unsigned long long>(columns) * 4 *
+        static_cast<unsigned long long>(dirty.bottom - dirty.top);
+    const long long ticks = performance_counter() - started;
     ++counters_.readbacks;
-    counters_.transfer_bytes += static_cast<unsigned long long>(columns) * 4 * static_cast<unsigned long long>(dirty.bottom - dirty.top);
+    counters_.transfer_bytes += bytes;
     target.gpu_dirty = {};
-    counters_.readback_ticks += performance_counter() - started;
+    counters_.readback_ticks += ticks;
+    trace_readback(target, bytes, ticks);
     target.cpu_needs_upload = false;
     target.cpu_needs_readback = false;
     return S_OK;
@@ -461,9 +466,13 @@ HRESULT SurfaceRenderer::synchronize_region_to_cpu(void* id, DecodedImage& image
                 static_cast<std::size_t>(region.left) * 4, columns);
     }
     context_->Unmap(target.staging.Get(), 0);
+    const unsigned long long bytes = static_cast<unsigned long long>(columns) *
+        static_cast<unsigned long long>(region.bottom - region.top);
+    const long long ticks = performance_counter() - started;
     ++counters_.readbacks;
-    counters_.transfer_bytes += static_cast<unsigned long long>(columns) * static_cast<unsigned long long>(region.bottom - region.top);
-    counters_.readback_ticks += performance_counter() - started;
+    counters_.transfer_bytes += bytes;
+    counters_.readback_ticks += ticks;
+    trace_readback(target, bytes, ticks);
     return S_OK;
 }
 
@@ -521,7 +530,76 @@ HRESULT SurfaceRenderer::open_screen(HWND window, const std::filesystem::path& c
     if (FAILED(hr)) { error = "Cannot initialize D3D11 device"; return hr; }
     hr = presentation_.initialize_configured(device_.Get(), window, config, error);
     if (SUCCEEDED(hr)) set_exact_blend(presentation_.exact_blend());
+    readback_sources_.clear();
+    readback_window_start_ = 0;
+    readback_frames_ = 0;
+    readback_log_.clear();
+    if (SUCCEEDED(hr) && presentation_.show_fps()) {
+        readback_log_ = config.parent_path() / L"sgl_readbacks.log";
+        // Each screen opening starts a fresh log.
+        std::FILE* log = nullptr;
+        if (!_wfopen_s(&log, readback_log_.c_str(), L"w") && log) std::fclose(log);
+    }
     return hr;
+}
+
+void SurfaceRenderer::set_readback_site(const char* site, std::uintptr_t caller) noexcept {
+    readback_site_ = site;
+    readback_caller_ = caller;
+}
+
+void SurfaceRenderer::trace_readback(const Surface& surface, unsigned long long bytes, long long ticks) noexcept {
+    if (readback_log_.empty()) return;
+    const UINT width = surface.description.Width, height = surface.description.Height;
+    auto found = std::find_if(readback_sources_.begin(), readback_sources_.end(), [&](const ReadbackSource& source) {
+        return source.site == readback_site_ && source.caller == readback_caller_ && source.width == width &&
+            source.height == height;
+    });
+    if (found == readback_sources_.end()) {
+        try {
+            readback_sources_.push_back({readback_site_, readback_caller_, width, height});
+        } catch (const std::bad_alloc&) { return; }
+        found = readback_sources_.end() - 1;
+    }
+    ++found->count;
+    found->bytes += bytes;
+    found->ticks += ticks;
+}
+
+void SurfaceRenderer::write_readback_trace() noexcept {
+    if (readback_log_.empty()) return;
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    const long long now = performance_counter();
+    if (!readback_window_start_) {
+        readback_window_start_ = now;
+        readback_frames_ = 0;
+        readback_sources_.clear();
+        return;
+    }
+    ++readback_frames_;
+    if (!frequency.QuadPart || now - readback_window_start_ < 2 * frequency.QuadPart) return;
+    std::sort(readback_sources_.begin(), readback_sources_.end(), [](const ReadbackSource& a, const ReadbackSource& b) {
+        return a.ticks > b.ticks;
+    });
+    std::FILE* log = nullptr;
+    if (!_wfopen_s(&log, readback_log_.c_str(), L"a") && log) {
+        const double frames = readback_frames_;
+        const double tick_ms = 1000.0 / static_cast<double>(frequency.QuadPart);
+        std::fprintf(log, "%u frames in %.2f s\n", readback_frames_,
+            static_cast<double>(now - readback_window_start_) * tick_ms / 1000.0);
+        if (readback_sources_.empty()) std::fprintf(log, "  no readbacks\n");
+        for (const auto& source : readback_sources_) {
+            std::fprintf(log, "  %-20s caller %08x %4ux%-4u %6.2f per frame %7.2f ms per frame %8.1f KiB per frame\n",
+                source.site ? source.site : "(other)", static_cast<unsigned>(source.caller), source.width, source.height,
+                source.count / frames, static_cast<double>(source.ticks) * tick_ms / frames,
+                static_cast<double>(source.bytes) / 1024.0 / frames);
+        }
+        std::fclose(log);
+    }
+    readback_window_start_ = now;
+    readback_frames_ = 0;
+    readback_sources_.clear();
 }
 
 void SurfaceRenderer::set_exact_blend(bool exact) noexcept {
@@ -541,6 +619,8 @@ void SurfaceRenderer::shutdown() noexcept {
     pending_.clear();
     pending_draws_.clear();
     pending_target_ = nullptr;
+    readback_sources_.clear();
+    readback_log_.clear();
     if (context_) context_->ClearState();
     bound_target_ = nullptr;
     compositor_.invalidate_renderer_bindings();
@@ -586,6 +666,7 @@ HRESULT SurfaceRenderer::present(void* id, const DecodedImage& image) noexcept {
     if (FAILED(hr)) return hr;
     const FrameCounters counters = counters_;
     counters_ = {};
+    write_readback_trace();
     return presentation_.present(counters);
 }
 

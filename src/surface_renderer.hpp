@@ -3,6 +3,8 @@
 #include "compositor.hpp"
 #include "image_decoder.hpp"
 #include "presentation.hpp"
+#include <cstdint>
+#include <filesystem>
 #include <unordered_map>
 #include <vector>
 
@@ -45,6 +47,10 @@ public:
     // otherwise hardware blend states combine the draws with the target in one pass. open_screen applies the
     // [display] exact_blend setting.
     void set_exact_blend(bool exact) noexcept;
+    // Names the SGL export and the game address that called it for the readbacks made until the next call; null
+    // clears it. With show_fps, readbacks are summed per site, caller and surface size into sgl_readbacks.log next to
+    // high_res.ini every two seconds.
+    void set_readback_site(const char* site, std::uintptr_t caller) noexcept;
 
 private:
     struct Surface {
@@ -80,6 +86,18 @@ private:
     void flush_pending(unsigned& reason) noexcept;
     // True when a queued draw reads or writes the surface, so changing its textures must flush the queue first.
     bool pending_uses(const Surface& surface) const noexcept;
+    struct ReadbackSource {
+        const char* site = nullptr;
+        std::uintptr_t caller = 0;
+        UINT width = 0;
+        UINT height = 0;
+        unsigned count = 0;
+        unsigned long long bytes = 0;
+        long long ticks = 0;
+    };
+    void trace_readback(const Surface& surface, unsigned long long bytes, long long ticks) noexcept;
+    // Appends the summed readbacks to the log and starts a new window once two seconds have passed.
+    void write_readback_trace() noexcept;
     HRESULT surface(void* id, const DecodedImage& image, Surface*& result) noexcept;
     HRESULT upload_cpu_image(Surface& surface, const DecodedImage& image) noexcept;
     HRESULT draw_impl(void* source_id, const DecodedImage& source, void* mask_id,
@@ -100,6 +118,12 @@ private:
     ID3D11Texture2D* pending_target_ = nullptr;
     RECT pending_bounds_{};
     bool exact_blend_ = false;
+    const char* readback_site_ = nullptr;
+    std::uintptr_t readback_caller_ = 0;
+    std::filesystem::path readback_log_;
+    std::vector<ReadbackSource> readback_sources_;
+    long long readback_window_start_ = 0;
+    unsigned readback_frames_ = 0;
 };
 
 }
