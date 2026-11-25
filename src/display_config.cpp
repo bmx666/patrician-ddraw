@@ -90,6 +90,10 @@ bool sgl::display_config(HWND window, const std::filesystem::path& path, Display
                 if (value != "0" && value != "1") { error = "high_res.ini line " + std::to_string(line_number) + ": exact_blend must be 0 or 1"; return false; }
                 selected.exact_blend = value == "1";
                 continue;
+            } else if (equal_ascii(key, "vsync")) {
+                if (value != "0" && value != "1") { error = "high_res.ini line " + std::to_string(line_number) + ": vsync must be 0 or 1"; return false; }
+                selected.vsync = value == "1";
+                continue;
             } else if (equal_ascii(key, "max_fps")) {
                 unsigned fps = 0;
                 const auto parsed = std::from_chars(value.data(), value.data() + value.size(), fps);

@@ -83,6 +83,7 @@ width=1920
 height=1080
 mode=borderless
 max_fps=0
+vsync=1
 show_fps=0
 exact_blend=0
 ```
@@ -92,6 +93,7 @@ exact_blend=0
 | `width`, `height` | 1280×1024, 1600×900, 1920×1080 or 2560×1440. Changing the resolution in the game's options updates the file. |
 | `mode` | `borderless` (default) or `windowed` |
 | `max_fps` | `0` removes the limit, `10`–`1000` sets one; without the key the game keeps its own limit of 50 |
+| `vsync` | `1` (default) waits for the vertical blank on every frame, so frames are evenly paced and capped at the refresh rate; `0` does not, and only `max_fps` limits the frame rate |
 | `show_fps` | `1` shows the frame rate and frame times in the top-left corner. Debug builds also show draws (`dr`), the draw calls and queue flushes that recorded them (`dc`, `fl`; of the flushes, `t` switched target, `o` were overlapping translucent draws, `u` were texture uploads) and transfers, and write `sgl_readbacks.log` next to `high_res.ini`, which every two seconds lists the GPU readbacks per frame by SGL export, calling game address and surface size |
 | `exact_blend` | `1` blends translucent draws with the original integer formulas through a copy of the target, which splits a frame into many GPU passes; `0` (default) uses hardware blending, at most one color step apart, and is much faster on tile-based GPUs such as Apple Silicon |
 
