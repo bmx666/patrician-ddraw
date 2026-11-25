@@ -6,6 +6,12 @@ if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
 endif()
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+# Build variant: SGL_DIAGNOSTICS adds the renderer counters to the show_fps overlay and writes sgl_readbacks.log.
+option(SGL_DIAGNOSTICS "Show renderer counters with show_fps and write sgl_readbacks.log" OFF)
+if(SGL_DIAGNOSTICS)
+    add_compile_definitions(SGL_DIAGNOSTICS)
+endif()
+
 set(manifest "${CMAKE_CURRENT_SOURCE_DIR}/research/sgl-original/dispatch.json")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${manifest}")
 file(READ "${manifest}" dispatch)
