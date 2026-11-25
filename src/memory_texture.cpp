@@ -2,6 +2,7 @@
 #include "archive_state.hpp"
 #include "build_config.hpp"
 #include "color_key.hpp"
+#include "game_executable.hpp"
 #include "image_decoder.hpp"
 #include "game_resolution.hpp"
 #include "game_window_binding.hpp"
@@ -108,7 +109,8 @@ std::uint64_t clipper_version = 0;
 // Also shown once in a message box: the game only reports a generic driver or SGL error, and under Wine the
 // debug output is not visible without extra logging.
 void report_screen_init_failure(const char* stage, const char* detail) noexcept {
-    OutputDebugStringA("Patrician III D3D11: ");
+    OutputDebugStringA(sgl::game::renderer_name());
+    OutputDebugStringA(": ");
     OutputDebugStringA(stage);
     OutputDebugStringA(": ");
     OutputDebugStringA(detail);
@@ -118,7 +120,7 @@ void report_screen_init_failure(const char* stage, const char* detail) noexcept 
     shown = true;
     char text[1024] = {};
     std::snprintf(text, sizeof(text), "%s:\n%s", stage, detail);
-    MessageBoxA(nullptr, text, "Patrician III D3D11 renderer", MB_OK | MB_ICONERROR | MB_TASKMODAL | MB_SETFOREGROUND);
+    MessageBoxA(nullptr, text, sgl::game::renderer_name(), MB_OK | MB_ICONERROR | MB_TASKMODAL | MB_SETFOREGROUND);
 }
 
 void report_hresult_failure(const char* stage, const char* detail, HRESULT result) noexcept {
@@ -1142,12 +1144,16 @@ static void verify_city_scroll_executable() noexcept {
         0x6A, 0xFD, 0xE8, 0xEA, 0x89, 0xF2, 0xFF, 0x6A, 0xFD, 0xE8, 0xD3, 0x89, 0xF2, 0xFF, 0x8B, 0x44,
         0x24, 0x18, 0x8B, 0x4C, 0x24, 0x1C, 0x8B, 0x54, 0x24, 0x20, 0x6A, 0x04, 0x57, 0x53, 0x55, 0x50,
         0x51, 0x52, 0xE8, 0x5A, 0x83, 0xF2, 0xFF};
-    if (reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)) != 0x400000) return;
-    auto* code = reinterpret_cast<const std::uint8_t*>(address);
-    MEMORY_BASIC_INFORMATION region{};
-    if (VirtualQuery(code, &region, sizeof(region)) != sizeof(region) || region.State != MEM_COMMIT ||
-        reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize < address + sizeof(original)) return;
-    city_executable_verified = std::memcmp(code, original, sizeof(original)) == 0;
+    // Patrician II has its own executable: none of the Patrician3.exe hooks apply, and the City Map patch is
+    // installed only after this check.
+    if (!sgl::game::patrician2()) {
+        if (reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)) != 0x400000) return;
+        auto* code = reinterpret_cast<const std::uint8_t*>(address);
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(code, &region, sizeof(region)) != sizeof(region) || region.State != MEM_COMMIT ||
+            reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize < address + sizeof(original)) return;
+        city_executable_verified = std::memcmp(code, original, sizeof(original)) == 0;
+    }
 }
 
 // City Map bottom band (R2). Three City Map passes in Patrician3.exe walk tile rows, 11 pixels apart, down to
@@ -1332,12 +1338,16 @@ extern "C" void* __cdecl sgl_InitScreen(HWND window, int fullscreen, const char*
             view_state.logical_height = previous_logical_height;
             return nullptr;
         }
-        if (!sgl::install_game_resolution(size, error)) {
-            report_screen_init_failure("installing game resolution", error.c_str());
-            destroy_screen();
-            view_state.logical_width = previous_logical_width;
-            view_state.logical_height = previous_logical_height;
-            return nullptr;
+        // Patrician III: without the game resolution hooks the game is not bound, so water_effect::install does
+        // nothing either. Patrician II has no resolution hooks; water_effect::install checks its executable itself.
+        if (!sgl::game::patrician2()) {
+            if (!sgl::install_game_resolution(size, error)) {
+                report_screen_init_failure("installing game resolution", error.c_str());
+                destroy_screen();
+                view_state.logical_width = previous_logical_width;
+                view_state.logical_height = previous_logical_height;
+                return nullptr;
+            }
         }
         if (!sgl::set_game_frame_limit(surface_renderer.max_fps()))
             OutputDebugStringA("Frame limit: the game's frame limiter does not match the verified executable\n");
@@ -1483,10 +1493,16 @@ extern "C" int __cdecl sgl_SwapBuffer(std::uint32_t flags) {
 // defers synchronization and the effect runs on the GPU (SurfaceRenderer::draw_water) with the original's in-place
 // write order, so the CPU never waits for the GPU. When the GPU pass cannot run, the original runs on the CPU after a
 // readback of the tiles plus the largest displacement, and the tiles it wrote are uploaded.
+// Patrician 2.exe has the same effect function (0x56c0d0) instruction for instruction, apart from the address of its
+// saturation table, and the same lock, effect call and unlock in its city view (0x555f78 to 0x555fc4).
 namespace water_effect {
-constexpr std::uintptr_t lock_return = 0x5889e7;
-constexpr std::uintptr_t call_site = 0x588a25;
-constexpr std::uintptr_t function = 0x59e8e0;
+// Chosen once when the DLL loads, from the running executable.
+const bool patrician2 = sgl::game::patrician2();
+const std::uintptr_t lock_return = patrician2 ? 0x555f7d : 0x5889e7;
+// The game's sgl_LockTexture stub called right before lock_return.
+const std::uintptr_t lock_stub = patrician2 ? 0x4a7d20 : 0x4bbb00;
+const std::uintptr_t call_site = patrician2 ? 0x555fbd : 0x588a25;
+const std::uintptr_t function = patrician2 ? 0x56c0d0 : 0x59e8e0;
 // Object layout: width and height at +4 and +8, height bytes at +0x24 in rows of width + 2 bytes, tile list count at
 // +0x2c and (x, y) shorts every 8 bytes from +0x34, clamp tables at +0xbbb8 (x, byte offsets) and +0xbbbc (y, row
 // offsets) with the pitch they were built for at +0xbbc0, pixel offsets at +0xbbc4 and +0xbbc8.
@@ -1501,7 +1517,7 @@ constexpr std::size_t table_pitch_offset = 0xbbc0;
 constexpr std::size_t offset_x_offset = 0xbbc4;
 constexpr std::size_t offset_y_offset = 0xbbc8;
 // The color channels go through a saturation table indexed from -255 to 510.
-constexpr std::uintptr_t saturation_table = 0x6e52c7;
+const std::uintptr_t saturation_table = patrician2 ? 0x752d3f : 0x6e52c7;
 // Height differences of -255..255 displace reads by at most 126 pixels horizontally and 127 vertically.
 constexpr LONG read_margin = 128;
 bool installed = false;
@@ -1610,14 +1626,34 @@ void __fastcall hook(void* self, void* unused, std::uint8_t* pixels, int offset_
     lock_deferred = false;
 }
 
-// Redirects the effect call after checking both call sites against the verified executable.
+// Patrician 2.exe at its preferred base with the expected timestamp, with both call sites in committed memory.
+bool patrician2_executable() noexcept {
+    if (!patrician2) return false;
+    for (const std::uintptr_t address : {lock_return - 5, call_site}) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(reinterpret_cast<const void*>(address), &region, sizeof(region)) != sizeof(region) ||
+            region.State != MEM_COMMIT ||
+            reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize < address + 5) return false;
+    }
+    return true;
+}
+
+// Redirects the effect call after checking the executable and both call sites: Patrician III needs the verified
+// GOG executable's bindings, Patrician II its own executable.
 void install() noexcept {
-    if (installed || !sgl::game_binding_active()) return;
+    if (installed) return;
+    if (!patrician2) {
+        if (!sgl::game_binding_active()) return;
+    } else {
+        if (!patrician2_executable()) return;
+    }
     auto* const call = reinterpret_cast<std::uint8_t*>(call_site);
     const auto* const lock_call = reinterpret_cast<const std::uint8_t*>(lock_return - 5);
-    std::int32_t relative = 0;
+    std::int32_t relative = 0, lock_relative = 0;
     std::memcpy(&relative, call + 1, sizeof(relative));
-    if (call[0] != 0xe8 || call_site + 5 + relative != function || lock_call[0] != 0xe8) return;
+    std::memcpy(&lock_relative, lock_call + 1, sizeof(lock_relative));
+    if (call[0] != 0xe8 || call_site + 5 + relative != function || lock_call[0] != 0xe8 ||
+        lock_return + lock_relative != lock_stub) return;
     const auto hook_relative = static_cast<std::int32_t>(reinterpret_cast<std::uintptr_t>(&hook) - (call_site + 5));
     DWORD protection = 0, discarded = 0;
     if (!VirtualProtect(call + 1, sizeof(hook_relative), PAGE_EXECUTE_READWRITE, &protection)) return;

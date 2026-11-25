@@ -23,6 +23,13 @@ Before launching, move the modloader’s `high_res.dll` out of the `mods` folder
 
 </details>
 
+<details>
+<summary>Playing Patrician II?</summary>
+
+The same `ddraw_Dll.dll` also runs *Patrician II* (`Patrician 2.exe`). Install it into that game’s folder the same way, then set `width=0` and `height=0` in `high_res.ini`.
+
+</details>
+
 Start the game and choose your resolution in the game options. The main menu stays centred. Enter a city to see the wider view.
 
 ## Settings
