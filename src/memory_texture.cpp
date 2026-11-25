@@ -156,24 +156,37 @@ void subtract_rectangle(const RECT& source, const RECT& cut, std::vector<RECT>& 
     append_rectangle(output, {right, top, source.right, bottom});
 }
 
-std::vector<RECT> combine_clip_rectangles(const std::vector<RECT>& current,
-    const RECT& rectangle, int operation) {
-    std::vector<RECT> result;
+// Scratch lists of change_clip_rectangles, kept to reuse their allocations; guarded by the texture lock.
+std::vector<RECT> clip_pieces;
+std::vector<RECT> clip_remaining;
+
+// Adds (RGN_OR) or removes (RGN_DIFF) a non-empty rectangle. A union appends the parts of the rectangle outside every
+// existing rectangle, cut against them in list order; a difference replaces each rectangle by its parts outside the
+// cut. The game adds the same dirty rectangles thousands of times per frame on the Hanse map, so a rectangle inside an
+// existing one leaves the list unchanged, and existing rectangles that miss it are skipped: every piece lies inside the
+// rectangle, so cutting by them would keep the pieces as they are. The result equals the plain cut in list order.
+// Returns whether the list changed.
+bool change_clip_rectangles(std::vector<RECT>& rectangles, const RECT& rectangle, int operation) {
     if (operation == RGN_OR) {
-        result = current;
-        std::vector<RECT> additions{rectangle};
-        for (const auto& existing : current) {
-            std::vector<RECT> remaining;
-            for (const auto& addition : additions) subtract_rectangle(addition, existing, remaining);
-            additions.swap(remaining);
-            if (additions.empty()) break;
+        for (const auto& existing : rectangles)
+            if (existing.left <= rectangle.left && existing.top <= rectangle.top &&
+                existing.right >= rectangle.right && existing.bottom >= rectangle.bottom) return false;
+        clip_pieces.assign(1, rectangle);
+        for (const auto& existing : rectangles) {
+            if (!intersects(existing, rectangle)) continue;
+            clip_remaining.clear();
+            for (const auto& piece : clip_pieces) subtract_rectangle(piece, existing, clip_remaining);
+            clip_pieces.swap(clip_remaining);
+            if (clip_pieces.empty()) return false;
         }
-        result.insert(result.end(), additions.begin(), additions.end());
-        return result;
+        rectangles.insert(rectangles.end(), clip_pieces.begin(), clip_pieces.end());
+        return true;
     }
     if (operation == RGN_DIFF) {
-        for (const auto& existing : current) subtract_rectangle(existing, rectangle, result);
-        return result;
+        clip_remaining.clear();
+        for (const auto& existing : rectangles) subtract_rectangle(existing, rectangle, clip_remaining);
+        rectangles.swap(clip_remaining);
+        return true;
     }
     sgl::unimplemented("clip rectangle operation");
 }
@@ -1886,8 +1899,7 @@ static void change_clip(const RECT* rectangle, int operation) {
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     auto* clipper = get_active_clipper();
     try {
-        auto combined = combine_clip_rectangles(clipper->rectangles, *rectangle, operation);
-        clipper->rectangles.swap(combined);
+        if (!change_clip_rectangles(clipper->rectangles, *rectangle, operation)) return;
         ++clip_state_version;
         ++clipper_version;
     } catch (const std::bad_alloc&) {
@@ -2178,20 +2190,31 @@ extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
     // A surface whose current pixels are on the GPU is filled there: the CPU path would first read back the whole
     // surface and then upload it again. The GPU blend modes reproduce the integer formulas of the CPU path below.
     if (surface_renderer.gpu_holds_newer_pixels(render_destination)) {
-        static std::array<std::uint8_t, 4> fill_pixel_bytes{};
-        static sgl::DecodedImage fill_source = [] {
-            sgl::DecodedImage image;
-            image.width = image.height = 1;
-            image.pitch = 4;
-            image.format = sgl::ImageFormat::Bgra32;
-            image.pixels.assign(4, 0);
-            return image;
-        }();
         // Multiply also scales the destination alpha by the color's alpha.
-        fill_pixel_bytes = {static_cast<std::uint8_t>(constant_color), static_cast<std::uint8_t>(constant_color >> 8),
-            static_cast<std::uint8_t>(constant_color >> 16), active_blend_mode == 2 ? alpha : std::uint8_t{0xff}};
-        std::memcpy(fill_source.pixels.data(), fill_pixel_bytes.data(), 4);
-        surface_renderer.mark_cpu_modified(&fill_source);
+        const std::array<std::uint8_t, 4> fill_pixel_bytes{static_cast<std::uint8_t>(constant_color),
+            static_cast<std::uint8_t>(constant_color >> 8), static_cast<std::uint8_t>(constant_color >> 16),
+            active_blend_mode == 2 ? alpha : std::uint8_t{0xff}};
+        // One 1x1 source per fill pixel, uploaded once: rewriting a shared source uploaded it before every fill, and
+        // each upload ends the renderer's draw queue (about 1,300 fills per frame on a busy Hanse map).
+        static std::unordered_map<std::uint32_t, std::unique_ptr<sgl::DecodedImage>> fill_sources;
+        std::uint32_t fill_key = 0;
+        std::memcpy(&fill_key, fill_pixel_bytes.data(), sizeof(fill_key));
+        auto found_source = fill_sources.find(fill_key);
+        if (found_source == fill_sources.end()) {
+            if (fill_sources.size() >= 1024) {
+                for (auto& cached : fill_sources) surface_renderer.forget(cached.second.get());
+                fill_sources.clear();
+            }
+            try {
+                auto source = std::make_unique<sgl::DecodedImage>();
+                source->width = source->height = 1;
+                source->pitch = 4;
+                source->format = sgl::ImageFormat::Bgra32;
+                source->pixels.assign(fill_pixel_bytes.begin(), fill_pixel_bytes.end());
+                found_source = fill_sources.emplace(fill_key, std::move(source)).first;
+            } catch (const std::bad_alloc&) { sgl::unimplemented("sgl_FillSolidRect source allocation"); }
+        }
+        sgl::DecodedImage* const fill_source = found_source->second.get();
         const auto blend = active_blend_mode == 2 ? sgl::BlendMode::Multiply :
             active_blend_mode == 3 ? sgl::BlendMode::Additive :
             alpha == 0xff ? sgl::BlendMode::Opaque : sgl::BlendMode::FillAlpha;
@@ -2206,7 +2229,7 @@ extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
                 std::min(fill.right, clip.right), std::min(fill.bottom, clip.bottom)};
             if (!intersect_with(region, {0, 0, static_cast<LONG>(image.width), static_cast<LONG>(image.height)})) continue;
             const char* failure_stage = nullptr;
-            if (FAILED(surface_renderer.draw(&fill_source, fill_source, render_destination, image, {0, 0, 1, 1},
+            if (FAILED(surface_renderer.draw(fill_source, *fill_source, render_destination, image, {0, 0, 1, 1},
                 target_rect, region, std::nullopt, blend, &failure_stage, modulation)))
                 sgl::unimplemented(failure_stage ? failure_stage : "sgl_FillSolidRect D3D11 fill");
         }
@@ -2550,7 +2573,9 @@ extern "C" void __cdecl sgl_DrawText(int x, int y, const unsigned char* text) {
     const std::uint8_t* font;
     int mode, old_clipping;
     std::array<std::int32_t, 4> old_clip;
-    std::vector<RECT> regions;
+    // Reused between calls: the Hanse map draws about a thousand labels per frame under a large clipper.
+    thread_local std::vector<RECT> regions;
+    regions.clear();
     {
         std::lock_guard<TexturesMutex> lock(textures_mutex);
         font = active_font;
