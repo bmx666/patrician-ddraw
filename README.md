@@ -29,6 +29,8 @@ Start the game and choose your resolution in the game options. The main menu sta
 
 **For resolution changes, use the in-game options.** Choose **1280×1024**, **1600×900**, **1920×1080**, or **2560×1440**. The game saves your choice for the next launch.
 
+If your game executable is patched to lay out wide screens itself, set `width=0` and `height=0` in `high_res.ini`. The renderer then leaves the game’s screen layout alone and renders at the size the game requests.
+
 For window and frame-rate settings, open `high_res.ini` in the game folder with Notepad. Find the setting you want to change under `[display]`, edit its value, and save the file.
 
 | What you want | What to put in `high_res.ini` |

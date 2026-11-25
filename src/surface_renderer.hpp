@@ -42,7 +42,8 @@ public:
     bool gpu_holds_newer_pixels(void* id) const noexcept;
     void mark_palette_modified(void* id) noexcept;
     void forget(void* id) noexcept;
-    HRESULT open_screen(HWND window, const std::filesystem::path& config, std::string& error);
+    HRESULT open_screen(HWND window, const std::filesystem::path& config, std::string& error,
+        std::optional<DisplaySize> game_size = std::nullopt);
     HRESULT set_screen_size(DisplaySize size) noexcept;
     void close_screen() noexcept;
     void shutdown() noexcept;
