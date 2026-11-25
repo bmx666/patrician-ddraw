@@ -242,6 +242,12 @@ HRESULT SurfaceRenderer::draw(void* source_id, const DecodedImage& source, void*
         target_rect, clip, key, blend, failure_stage, modulation_color, sampling);
 }
 
+HRESULT SurfaceRenderer::copy_within(void* id, DecodedImage& image, Rect source_rect, Rect target_rect, RECT clip,
+    const char** failure_stage) noexcept {
+    return draw_impl(id, image, nullptr, nullptr, id, image, source_rect, target_rect, clip, std::nullopt,
+        BlendMode::Opaque, failure_stage, 0xffffffff, Sampling::SglFixedPoint, true);
+}
+
 HRESULT SurfaceRenderer::draw_masked(void* source_id, const DecodedImage& source, void* mask_id,
     const DecodedImage& mask, void* target_id, DecodedImage& target, Rect source_rect,
     Rect target_rect, RECT clip, std::uint32_t modulation_color, const char** failure_stage) noexcept {
@@ -252,9 +258,11 @@ HRESULT SurfaceRenderer::draw_masked(void* source_id, const DecodedImage& source
 HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, void* mask_id,
     const DecodedImage* mask, void* target_id, DecodedImage& target, Rect source_rect,
     Rect target_rect, RECT clip, std::optional<std::uint32_t> key, BlendMode blend,
-    const char** failure_stage, std::uint32_t modulation_color, Sampling sampling) noexcept {
+    const char** failure_stage, std::uint32_t modulation_color, Sampling sampling, bool self_copy) noexcept {
     if (failure_stage) *failure_stage = "argument validation";
-    if (!source_id || !target_id || source_id == target_id ||
+    if (!source_id || !target_id ||
+        (self_copy ? source_id != target_id || mask || blend != BlendMode::Opaque || key.has_value() :
+            source_id == target_id) ||
         (mask && mask_id == target_id) ||
         ((mask == nullptr) != (mask_id == nullptr)) ||
         ((blend == BlendMode::AlphaMask) != (mask != nullptr)) ||
@@ -297,7 +305,7 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
     if (pending_target_ && pending_target_ != dst->texture.Get()) flush_pending();
     // The last recorded draw leaves its target bound. Unbind it only when this draw reads it; binding a bound render
     // target as a shader resource would silently null the input, while re-binding per draw costs driver time.
-    if (bound_target_ && (bound_target_ == src->texture.Get() || (mask && bound_target_ == mask_surface->texture.Get()))) {
+    if (!self_copy && bound_target_ && (bound_target_ == src->texture.Get() || (mask && bound_target_ == mask_surface->texture.Get()))) {
         context_->OMSetRenderTargets(0, nullptr, nullptr);
         bound_target_ = nullptr;
         compositor_.invalidate_renderer_bindings();
@@ -313,6 +321,39 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
     if (failure_stage) *failure_stage = "destination texture upload";
     hr = upload_cpu_image(*dst, target);
     if (FAILED(hr)) return hr;
+    if (self_copy) {
+        if (!dst->snapshot) {
+            if (failure_stage) *failure_stage = "self-copy snapshot allocation";
+            D3D11_TEXTURE2D_DESC desc = dst->description;
+            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            ComPtr<ID3D11Texture2D> snapshot;
+            ComPtr<ID3D11ShaderResourceView> view;
+            hr = device_->CreateTexture2D(&desc, nullptr, &snapshot);
+            if (FAILED(hr)) return hr;
+            hr = device_->CreateShaderResourceView(snapshot.Get(), nullptr, &view);
+            if (FAILED(hr)) return hr;
+            dst->snapshot = snapshot;
+            dst->snapshot_view = view;
+        }
+        // Queued draws to this surface come before the copy; a queued draw reading the snapshot does not exist
+        // because every self-copy flushes here first. The box covers the sampled pixels plus a filtering margin.
+        flush_pending();
+        const LONG surface_width = static_cast<LONG>(dst->description.Width);
+        const LONG surface_height = static_cast<LONG>(dst->description.Height);
+        const auto edge = [](float value, LONG offset, LONG high) {
+            return std::clamp(static_cast<LONG>(std::clamp(std::floor(value), -1.0e9f, 1.0e9f)) + offset, 0L, high);
+        };
+        const LONG left = edge(std::min(source_rect.left, source_rect.right), -2, surface_width);
+        const LONG top = edge(std::min(source_rect.top, source_rect.bottom), -2, surface_height);
+        const LONG right = edge(std::max(source_rect.left, source_rect.right), 3, surface_width);
+        const LONG bottom = edge(std::max(source_rect.top, source_rect.bottom), 3, surface_height);
+        if (left < right && top < bottom) {
+            const D3D11_BOX box{static_cast<UINT>(left), static_cast<UINT>(top), 0,
+                static_cast<UINT>(right), static_cast<UINT>(bottom), 1};
+            context_->CopySubresourceRegion(dst->snapshot.Get(), 0, box.left, box.top, 0, dst->texture.Get(), 0, &box);
+        }
+    }
+    ID3D11ShaderResourceView* const source_view = self_copy ? dst->snapshot_view.Get() : src->view.Get();
     const LONG width = static_cast<LONG>(target.width), height = static_cast<LONG>(target.height);
     const auto bound = [](float value, LONG low, LONG high, bool up) {
         const float rounded = up ? std::ceil(value) : std::floor(value);
@@ -334,13 +375,13 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
         source.format == ImageFormat::Indexed8 ? DXGI_FORMAT_R8_UINT : DXGI_FORMAT_B8G8R8A8_UNORM};
     PendingDraw pending;
     if (mask) {
-        hr = compositor_.prepare(context_.Get(), dst->target.Get(), src->view.Get(),
+        hr = compositor_.prepare(context_.Get(), dst->target.Get(), source_view,
             src->palette_view.Get(), mask_surface->view.Get(), target.width, target.height,
             source_rect, target_rect, clip, std::nullopt, Sampling::SglFixedPoint,
             dst->background_view.Get(), modulation_color, BlendMode::AlphaMask, failure_stage, &renderer_source,
             pending.draw);
     } else {
-        hr = compositor_.prepare(context_.Get(), dst->target.Get(), src->view.Get(),
+        hr = compositor_.prepare(context_.Get(), dst->target.Get(), source_view,
             source.format == ImageFormat::Indexed8 ? src->palette_view.Get() : nullptr, nullptr,
             target.width, target.height, source_rect, target_rect, clip, key, sampling,
             blend != BlendMode::Opaque ? dst->background_view.Get() : nullptr,
