@@ -27,6 +27,12 @@ public:
     // of the surface, so overlapping regions copy as from the pixels before the call, without a CPU readback.
     HRESULT copy_within(void* id, DecodedImage& image, Rect source_rect, Rect target_rect, RECT clip,
         const char** failure_stage = nullptr) noexcept;
+    // Applies the city water effect (Compositor::WaterDraw) to the tiles of a BGRA surface on the GPU, reading the
+    // displaced pixels from a snapshot of the surface taken before the call. heights points at the height byte of
+    // pixel (area.left, area.top); tiles lie inside area, and area inside the surface. The CPU pixels of the tiles
+    // become stale like after any draw.
+    HRESULT draw_water(void* id, DecodedImage& image, const RECT* tiles, std::size_t tile_count, RECT area,
+        const std::uint8_t* heights, UINT height_pitch, UINT limit_width, UINT limit_height) noexcept;
     HRESULT synchronize_to_cpu(void* id, DecodedImage& image) noexcept;
     // Partial transfers for CPU work confined to a known region of a GPU-current BGRA surface: the readback copies
     // the region's GPU-written pixels to the CPU; the upload copies the region's CPU pixels to the GPU. Neither
@@ -108,6 +114,7 @@ private:
     void write_readback_trace() noexcept;
     HRESULT surface(void* id, const DecodedImage& image, Surface*& result) noexcept;
     HRESULT upload_cpu_image(Surface& surface, const DecodedImage& image) noexcept;
+    HRESULT create_snapshot(Surface& surface) noexcept;
     HRESULT draw_impl(void* source_id, const DecodedImage& source, void* mask_id,
         const DecodedImage* mask, void* target_id, DecodedImage& target, Rect source_rect,
         Rect target_rect, RECT clip, std::optional<std::uint32_t> key, BlendMode blend,

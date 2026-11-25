@@ -1553,13 +1553,19 @@ extern "C" int __cdecl sgl_SwapBuffer(std::uint32_t flags) {
 // City water effect. Once per frame the city view (0x588960) locks the offscreen surface (handle -4, flags 3) and calls
 // FUN_0059e8e0, which redraws its listed 8x8 water tiles in place from displaced pixels of the same surface. A whole-
 // surface lock costs a full readback (waiting for the GPU) and a full upload per frame. With this binding the lock
-// defers synchronization; the effect call reads back only the tiles plus the largest displacement and uploads only
-// the tiles it wrote.
+// defers synchronization and the effect runs on the GPU (SurfaceRenderer::draw_water) without touching the CPU
+// pixels. The original reads pixels it already rewrote in the same call where a displacement points at an earlier
+// tile or row; the GPU pass reads them as they were before the call. When the GPU pass cannot run, the original runs
+// on the CPU after a readback of the tiles plus the largest displacement and the tiles it wrote are uploaded.
 namespace water_effect {
 constexpr std::uintptr_t lock_return = 0x5889e7;
 constexpr std::uintptr_t call_site = 0x588a25;
 constexpr std::uintptr_t function = 0x59e8e0;
-// Tile list: count at +0x2c, (x, y) shorts every 8 bytes from +0x34, pixel offsets at +0xbbc4 and +0xbbc8.
+// Width and height at +4 and +8 (displaced reads are clamped to them), height bytes at +0x24 with rows of width + 2
+// bytes. Tile list: count at +0x2c, (x, y) shorts every 8 bytes from +0x34, pixel offsets at +0xbbc4 and +0xbbc8.
+constexpr std::size_t width_offset = 0x4;
+constexpr std::size_t height_offset = 0x8;
+constexpr std::size_t heights_offset = 0x24;
 constexpr std::size_t tile_count_offset = 0x2c;
 constexpr std::size_t tile_list_offset = 0x34;
 constexpr std::size_t offset_x_offset = 0xbbc4;
@@ -1569,6 +1575,8 @@ constexpr LONG read_margin = 128;
 bool installed = false;
 bool lock_deferred = false;
 void* deferred_texture = nullptr;
+// Clipped tiles of the current call, kept between calls to reuse the allocation.
+std::vector<RECT> tiles;
 
 using Function = void(__fastcall*)(void*, void*, std::uint8_t*, int, int, const RECT*, int);
 
@@ -1582,11 +1590,17 @@ void __fastcall hook(void* self, void* unused, std::uint8_t* pixels, int offset_
         const auto entry = lock_deferred ? textures.find(deferred_texture) : textures.end();
         if (entry != textures.end() && self && bounds) {
             const auto* object = static_cast<const std::uint8_t*>(self);
-            int count = 0, shift_x = 0, shift_y = 0;
+            int count = 0, shift_x = 0, shift_y = 0, width = 0, height = 0;
+            const std::uint8_t* heights = nullptr;
             std::memcpy(&count, object + tile_count_offset, sizeof(count));
             std::memcpy(&shift_x, object + offset_x_offset, sizeof(shift_x));
             std::memcpy(&shift_y, object + offset_y_offset, sizeof(shift_y));
+            std::memcpy(&width, object + width_offset, sizeof(width));
+            std::memcpy(&height, object + height_offset, sizeof(height));
+            std::memcpy(&heights, object + heights_offset, sizeof(heights));
             written = {LONG_MAX, LONG_MAX, LONG_MIN, LONG_MIN};
+            tiles.clear();
+            bool listed = true;
             for (int index = 0; index < count && index < 1 << 20; ++index) {
                 std::int16_t tile[2]{};
                 std::memcpy(tile, object + tile_list_offset + static_cast<std::size_t>(index) * 8, sizeof(tile));
@@ -1597,8 +1611,23 @@ void __fastcall hook(void* self, void* unused, std::uint8_t* pixels, int offset_
                 if (left >= right || top >= bottom) continue;
                 written = {std::min(written.left, left), std::min(written.top, top),
                     std::max(written.right, right), std::max(written.bottom, bottom)};
+                try {
+                    if (listed) tiles.push_back({left, top, right, bottom});
+                } catch (const std::bad_alloc&) { listed = false; }
             }
             auto& image = entry->second->image;
+            // h(x, y) is heights[(y + shift_y + offset_y) * (width + 2) + x + shift_x + offset_x].
+            const long long height_row = static_cast<long long>(written.top) + shift_y + offset_y;
+            const long long height_column = static_cast<long long>(written.left) + shift_x + offset_x;
+            if (written.left < written.right && listed && heights && width > 0 && height > 0 &&
+                pixels == image.pixels.data() && pitch > 0 && static_cast<std::uint32_t>(pitch) == image.pitch &&
+                height_row >= 0 && height_column >= 0 &&
+                SUCCEEDED(surface_renderer.draw_water(deferred_texture, image, tiles.data(), tiles.size(), written,
+                    heights + static_cast<std::ptrdiff_t>(height_row * (width + 2) + height_column), static_cast<UINT>(width) + 2,
+                    static_cast<UINT>(width), static_cast<UINT>(height)))) {
+                lock_deferred = false;
+                return;
+            }
             partial = true;
             if (written.left < written.right) {
                 const RECT read{written.left - read_margin, written.top - read_margin,

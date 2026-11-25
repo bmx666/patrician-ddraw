@@ -2,6 +2,7 @@
 
 #include <d3dcompiler.h>
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -1152,6 +1153,198 @@ HRESULT Compositor::record(ID3D11DeviceContext* context, const PreparedDraw* dra
         invalidate_renderer_bindings();
     }
     return result;
+}
+
+namespace {
+constexpr char water_shader[] = R"(
+Buffer<int4> water_tiles : register(t0);
+Texture2D source_texture : register(t1);
+Texture2D<uint> height_texture : register(t2);
+cbuffer WaterConstants : register(b0) {
+    int4 area_limit; // area origin, limit size
+    float4 target_size;
+};
+float4 water_vertex(uint id : SV_VertexID) : SV_Position {
+    static const float2 corners[6] = {
+        float2(0, 0), float2(1, 0), float2(0, 1),
+        float2(0, 1), float2(1, 0), float2(1, 1)
+    };
+    int4 tile = water_tiles.Load(int(id / 6));
+    float2 pixel = lerp(float2(tile.xy), float2(tile.zw), corners[id % 6]);
+    return float4(pixel.x / target_size.x * 2 - 1, 1 - pixel.y / target_size.y * 2, 0, 1);
+}
+float4 water_pixel(float4 position : SV_Position) : SV_Target {
+    int2 pixel = int2(position.xy);
+    int2 local = pixel - area_limit.xy;
+    int height = int(height_texture.Load(int3(local, 0)));
+    int dx = int(height_texture.Load(int3(local.x + 1, local.y, 0))) - height;
+    int dy = int(height_texture.Load(int3(local.x, local.y + 1, 0))) - height;
+    // The original's divisions rounded toward zero: the bias of a negative dividend, then an arithmetic shift.
+    int2 shift = int2(((dx + (dx < 0 ? 3 : 0)) >> 2) * 2, (dy + (dy < 0 ? 1 : 0)) >> 1);
+    int2 sampled = clamp(pixel + shift, int2(0, 0), area_limit.zw - 1);
+    int3 color = int3(round(source_texture.Load(int3(sampled, 0)).rgb * 255)) - dy;
+    return float4(float3(clamp(color, 0, 255)) / 255.0, 0);
+}
+)";
+
+struct WaterConstants {
+    std::int32_t area_limit[4];
+    float target_size[4];
+};
+}
+
+HRESULT Compositor::create_water_pipeline() noexcept {
+    if (water_vertex_shader_) return S_OK;
+    if (!device_) return E_FAIL;
+    const pD3DCompile compile = d3d_compile_function();
+    if (!compile) return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
+    ComPtr<ID3DBlob> vertex_code;
+    ComPtr<ID3DBlob> pixel_code;
+    ComPtr<ID3D11VertexShader> vertex_shader;
+    ComPtr<ID3D11PixelShader> pixel_shader;
+    ComPtr<ID3D11BlendState> blend_state;
+    ComPtr<ID3D11Buffer> constants;
+    HRESULT result = compile(water_shader, sizeof(water_shader) - 1, nullptr, nullptr, nullptr,
+        "water_vertex", "vs_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &vertex_code, nullptr);
+    if (FAILED(result)) return result;
+    result = compile(water_shader, sizeof(water_shader) - 1, nullptr, nullptr, nullptr,
+        "water_pixel", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &pixel_code, nullptr);
+    if (FAILED(result)) return result;
+    result = device_->CreateVertexShader(vertex_code->GetBufferPointer(), vertex_code->GetBufferSize(), nullptr,
+        &vertex_shader);
+    if (FAILED(result)) return result;
+    result = device_->CreatePixelShader(pixel_code->GetBufferPointer(), pixel_code->GetBufferSize(), nullptr,
+        &pixel_shader);
+    if (FAILED(result)) return result;
+    // Replaces the color channels and keeps the target alpha.
+    D3D11_BLEND_DESC blend = {};
+    blend.RenderTarget[0].BlendEnable = FALSE;
+    blend.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN |
+        D3D11_COLOR_WRITE_ENABLE_BLUE;
+    result = device_->CreateBlendState(&blend, &blend_state);
+    if (FAILED(result)) return result;
+    D3D11_BUFFER_DESC buffer = {};
+    buffer.ByteWidth = sizeof(WaterConstants);
+    buffer.Usage = D3D11_USAGE_DYNAMIC;
+    buffer.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    buffer.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    result = device_->CreateBuffer(&buffer, nullptr, &constants);
+    if (FAILED(result)) return result;
+    water_pixel_shader_ = pixel_shader;
+    water_blend_state_ = blend_state;
+    water_constants_ = constants;
+    water_vertex_shader_ = vertex_shader;
+    return S_OK;
+}
+
+HRESULT Compositor::draw_water(ID3D11DeviceContext* context, const WaterDraw& draw, unsigned* draw_calls) noexcept {
+    const LONG area_width = draw.area.right - draw.area.left;
+    const LONG area_height = draw.area.bottom - draw.area.top;
+    if (!context || !draw.target || !draw.source || !draw.tiles || !draw.heights || !draw.tile_count ||
+        draw.tile_count > UINT_MAX / 6 || area_width <= 0 || area_height <= 0 || area_width >= 8192 ||
+        area_height >= 8192 || draw.height_pitch <= static_cast<UINT>(area_width) || !draw.limit_width ||
+        !draw.limit_height || !draw.target_width || !draw.target_height) return E_INVALIDARG;
+    HRESULT result = create_water_pipeline();
+    if (FAILED(result)) return result;
+    const UINT heights_width = static_cast<UINT>(area_width) + 1;
+    const UINT heights_height = static_cast<UINT>(area_height) + 1;
+    if (heights_width > water_heights_width_ || heights_height > water_heights_height_) {
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = std::min(std::max(water_heights_width_, (heights_width + 255) & ~255u), 8192u);
+        desc.Height = std::min(std::max(water_heights_height_, (heights_height + 255) & ~255u), 8192u);
+        desc.MipLevels = desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8_UINT;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        ComPtr<ID3D11Texture2D> texture;
+        ComPtr<ID3D11ShaderResourceView> view;
+        result = device_->CreateTexture2D(&desc, nullptr, &texture);
+        if (FAILED(result)) return result;
+        result = device_->CreateShaderResourceView(texture.Get(), nullptr, &view);
+        if (FAILED(result)) return result;
+        water_heights_ = texture;
+        water_heights_view_ = view;
+        water_heights_width_ = desc.Width;
+        water_heights_height_ = desc.Height;
+    }
+    const UINT tile_count = static_cast<UINT>(draw.tile_count);
+    if (tile_count > water_tile_capacity_) {
+        UINT capacity = std::max(water_tile_capacity_, 1024u);
+        while (capacity < tile_count) capacity *= 2;
+        D3D11_BUFFER_DESC buffer = {};
+        buffer.ByteWidth = capacity * 16;
+        buffer.Usage = D3D11_USAGE_DYNAMIC;
+        buffer.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        buffer.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        D3D11_SHADER_RESOURCE_VIEW_DESC view_desc = {};
+        view_desc.Format = DXGI_FORMAT_R32G32B32A32_SINT;
+        view_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+        view_desc.Buffer.FirstElement = 0;
+        view_desc.Buffer.NumElements = capacity;
+        ComPtr<ID3D11Buffer> tiles;
+        ComPtr<ID3D11ShaderResourceView> view;
+        result = device_->CreateBuffer(&buffer, nullptr, &tiles);
+        if (FAILED(result)) return result;
+        result = device_->CreateShaderResourceView(tiles.Get(), &view_desc, &view);
+        if (FAILED(result)) return result;
+        water_tiles_ = tiles;
+        water_tiles_view_ = view;
+        water_tile_capacity_ = capacity;
+    }
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    result = context->Map(water_tiles_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(result)) return result;
+    auto* const tiles = static_cast<std::int32_t*>(mapped.pData);
+    for (UINT index = 0; index < tile_count; ++index) {
+        const RECT& tile = draw.tiles[index];
+        tiles[index * 4] = static_cast<std::int32_t>(tile.left);
+        tiles[index * 4 + 1] = static_cast<std::int32_t>(tile.top);
+        tiles[index * 4 + 2] = static_cast<std::int32_t>(tile.right);
+        tiles[index * 4 + 3] = static_cast<std::int32_t>(tile.bottom);
+    }
+    context->Unmap(water_tiles_.Get(), 0);
+    result = context->Map(water_constants_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(result)) return result;
+    const WaterConstants constants = {
+        {static_cast<std::int32_t>(draw.area.left), static_cast<std::int32_t>(draw.area.top),
+            static_cast<std::int32_t>(draw.limit_width),
+            static_cast<std::int32_t>(draw.limit_height)},
+        {static_cast<float>(draw.target_width), static_cast<float>(draw.target_height), 0, 0}};
+    std::memcpy(mapped.pData, &constants, sizeof(constants));
+    context->Unmap(water_constants_.Get(), 0);
+    const D3D11_BOX heights_box{0, 0, 0, heights_width, heights_height, 1};
+    context->UpdateSubresource(water_heights_.Get(), 0, &heights_box, draw.heights, draw.height_pitch, 0);
+
+    context->IASetInputLayout(nullptr);
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->VSSetShader(water_vertex_shader_.Get(), nullptr, 0);
+    context->GSSetShader(nullptr, nullptr, 0);
+    context->HSSetShader(nullptr, nullptr, 0);
+    context->DSSetShader(nullptr, nullptr, 0);
+    ID3D11Buffer* const constant_buffer = water_constants_.Get();
+    context->VSSetConstantBuffers(0, 1, &constant_buffer);
+    context->PSSetConstantBuffers(0, 1, &constant_buffer);
+    ID3D11ShaderResourceView* const tile_view = water_tiles_view_.Get();
+    context->VSSetShaderResources(0, 1, &tile_view);
+    context->RSSetState(rasterizer_.Get());
+    const D3D11_VIEWPORT viewport = {0, 0, static_cast<float>(draw.target_width),
+        static_cast<float>(draw.target_height), 0, 1};
+    context->RSSetViewports(1, &viewport);
+    ID3D11RenderTargetView* const target = draw.target;
+    context->OMSetRenderTargets(1, &target, nullptr);
+    context->OMSetBlendState(water_blend_state_.Get(), nullptr, 0xffffffff);
+    context->PSSetShader(water_pixel_shader_.Get(), nullptr, 0);
+    ID3D11ShaderResourceView* const resources[5] = {nullptr, draw.source, water_heights_view_.Get(), nullptr, nullptr};
+    context->PSSetShaderResources(0, 5, resources);
+    context->Draw(tile_count * 6, 0);
+    if (draw_calls) ++*draw_calls;
+    ID3D11ShaderResourceView* const empty[5] = {};
+    context->PSSetShaderResources(0, 5, empty);
+    context->VSSetShaderResources(0, 1, empty);
+    // The compositor's draws rebind their vertex input, shaders, target, viewport, blend state and resources.
+    invalidate_renderer_bindings();
+    return S_OK;
 }
 
 void Compositor::invalidate_renderer_bindings() noexcept {

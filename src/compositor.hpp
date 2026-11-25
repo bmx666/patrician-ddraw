@@ -47,6 +47,31 @@ public:
     // Call after binding or unbinding pipeline state outside the compositor.
     void invalidate_renderer_bindings() noexcept;
 
+    // The city water effect (FUN_0059e8e0) on the GPU. Each target pixel (x, y) of the tiles, with h(x, y) the height
+    // byte for that pixel, dx = h(x + 1, y) - h(x, y) and dy = h(x, y + 1) - h(x, y), becomes the source pixel at
+    // (x + 2 * (dx / 4), y + dy / 2) (C division, clamped to the limit size) with dy subtracted from each color channel,
+    // saturated; the target alpha is kept.
+    struct WaterDraw {
+        ID3D11RenderTargetView* target = nullptr;
+        UINT target_width = 0;
+        UINT target_height = 0;
+        // A copy of the target's pixels; the target is not read.
+        ID3D11ShaderResourceView* source = nullptr;
+        // Target rectangles, inside area.
+        const RECT* tiles = nullptr;
+        std::size_t tile_count = 0;
+        RECT area{};
+        // h(area.left, area.top); the rows run area.top..area.bottom and the columns area.left..area.right, both
+        // inclusive.
+        const std::uint8_t* heights = nullptr;
+        UINT height_pitch = 0;
+        UINT limit_width = 0;
+        UINT limit_height = 0;
+    };
+    // Binds its own pipeline state and leaves no shader resources bound; the shaders and buffers are created on
+    // first use. draw_calls, when set, is increased by the draw calls issued.
+    HRESULT draw_water(ID3D11DeviceContext* context, const WaterDraw& draw, unsigned* draw_calls = nullptr) noexcept;
+
     // A validated draw with its pipeline inputs resolved, recorded later by record(). The views are not referenced;
     // the caller keeps them alive until the draw is recorded.
     struct PreparedDraw {
@@ -142,6 +167,21 @@ private:
     ID3D11BlendState* renderer_blend_state_ = nullptr;
     std::uint8_t renderer_blend_factor_ = 0xff;
     ID3D11ShaderResourceView* renderer_resources_[5] = {};
+
+    HRESULT create_water_pipeline() noexcept;
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> water_vertex_shader_;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> water_pixel_shader_;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> water_blend_state_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> water_constants_;
+    // Tile rectangles, grown on demand.
+    Microsoft::WRL::ComPtr<ID3D11Buffer> water_tiles_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> water_tiles_view_;
+    UINT water_tile_capacity_ = 0;
+    // Height bytes of the area, grown on demand.
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> water_heights_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> water_heights_view_;
+    UINT water_heights_width_ = 0;
+    UINT water_heights_height_ = 0;
 };
 
 }
