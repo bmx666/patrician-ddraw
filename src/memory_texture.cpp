@@ -1,5 +1,6 @@
 #include "archive_reader.hpp"
 #include "archive_state.hpp"
+#include "build_config.hpp"
 #include "color_key.hpp"
 #include "image_decoder.hpp"
 #include "game_resolution.hpp"
@@ -216,9 +217,13 @@ public:
 
 private:
     static void set(const char* site, std::uintptr_t caller) noexcept {
-        current_site = site;
-        current_caller = caller;
-        surface_renderer.set_readback_site(site, caller);
+        static_cast<void>(site);
+        static_cast<void>(caller);
+        if constexpr (sgl::build::diagnostics) {
+            current_site = site;
+            current_caller = caller;
+            surface_renderer.set_readback_site(site, caller);
+        }
     }
     static inline const char* current_site = nullptr;
     static inline std::uintptr_t current_caller = 0;

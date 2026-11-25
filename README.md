@@ -92,7 +92,7 @@ exact_blend=0
 | `width`, `height` | 1280×1024, 1600×900, 1920×1080 or 2560×1440. Changing the resolution in the game's options updates the file. |
 | `mode` | `borderless` (default) or `windowed` |
 | `max_fps` | `0` removes the limit, `10`–`1000` sets one; without the key the game keeps its own limit of 50 |
-| `show_fps` | `1` shows frame rate, frame times, draws (`dr`), the draw calls and queue flushes that recorded them (`dc`, `fl`; of the flushes, `t` switched target, `o` were overlapping translucent draws, `u` were texture uploads) and transfers in the top-left corner; it also writes `sgl_readbacks.log` next to `high_res.ini`, which every two seconds lists the GPU readbacks per frame by SGL export, calling game address and surface size |
+| `show_fps` | `1` shows the frame rate and frame times in the top-left corner. Debug builds also show draws (`dr`), the draw calls and queue flushes that recorded them (`dc`, `fl`; of the flushes, `t` switched target, `o` were overlapping translucent draws, `u` were texture uploads) and transfers, and write `sgl_readbacks.log` next to `high_res.ini`, which every two seconds lists the GPU readbacks per frame by SGL export, calling game address and surface size |
 | `exact_blend` | `1` blends translucent draws with the original integer formulas through a copy of the target, which splits a frame into many GPU passes; `0` (default) uses hardware blending, at most one color step apart, and is much faster on tile-based GPUs such as Apple Silicon |
 
 ## Building
@@ -105,6 +105,8 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 node tests/test-exports.mjs
 ```
+
+`-DSGL_DIAGNOSTICS=ON` builds the debug variant with the renderer counters and `sgl_readbacks.log` behind `show_fps`; the default `OFF` writes no log files.
 
 The DLL is written to `build\Release\ddraw_Dll.dll`. For a working installation, copy the contents of `assets\` into the game's `renderer-assets\` folder.
 
