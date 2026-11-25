@@ -52,8 +52,8 @@ public:
     std::optional<unsigned> max_fps() const noexcept;
     HRESULT present(void* id, const DecodedImage& image) noexcept;
     // Names the SGL export and the game address that called it for the readbacks made until the next call; null
-    // clears it. With show_fps, readbacks are summed per site, caller and surface size into sgl_readbacks.log next to
-    // high_res.ini every two seconds.
+    // clears it. In diagnostics builds with show_fps, readbacks are summed per site, caller and surface size into
+    // sgl_readbacks.log next to high_res.ini every two seconds.
     void set_readback_site(const char* site, std::uintptr_t caller) noexcept;
 
 private:

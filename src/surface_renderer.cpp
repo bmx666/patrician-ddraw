@@ -1,4 +1,6 @@
 #include "surface_renderer.hpp"
+
+#include "build_config.hpp"
 #include <dxgi.h>
 #include <algorithm>
 #include <climits>
@@ -718,11 +720,13 @@ HRESULT SurfaceRenderer::open_screen(HWND window, const std::filesystem::path& c
     readback_window_start_ = 0;
     readback_frames_ = 0;
     readback_log_.clear();
-    if (SUCCEEDED(hr) && presentation_.show_fps()) {
-        readback_log_ = config.parent_path() / L"sgl_readbacks.log";
-        // Each screen opening starts a fresh log.
-        std::FILE* log = nullptr;
-        if (!_wfopen_s(&log, readback_log_.c_str(), L"w") && log) std::fclose(log);
+    if constexpr (build::diagnostics) {
+        if (SUCCEEDED(hr) && presentation_.show_fps()) {
+            readback_log_ = config.parent_path() / L"sgl_readbacks.log";
+            // Each screen opening starts a fresh log.
+            std::FILE* log = nullptr;
+            if (!_wfopen_s(&log, readback_log_.c_str(), L"w") && log) std::fclose(log);
+        }
     }
     return hr;
 }
