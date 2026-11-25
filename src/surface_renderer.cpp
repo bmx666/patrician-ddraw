@@ -143,6 +143,75 @@ HRESULT SurfaceRenderer::upload_cpu_image(Surface& surface, const DecodedImage& 
     return S_OK;
 }
 
+HRESULT SurfaceRenderer::create_background(Surface& surface) noexcept {
+    if (surface.background) return S_OK;
+    D3D11_TEXTURE2D_DESC desc = surface.description;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    ComPtr<ID3D11Texture2D> background;
+    ComPtr<ID3D11ShaderResourceView> view;
+    HRESULT hr = device_->CreateTexture2D(&desc, nullptr, &background);
+    if (FAILED(hr)) return hr;
+    hr = device_->CreateShaderResourceView(background.Get(), nullptr, &view);
+    if (FAILED(hr)) return hr;
+    surface.background = background;
+    surface.background_view = view;
+    return S_OK;
+}
+
+HRESULT SurfaceRenderer::draw_water(void* id, const DecodedImage& image, const RECT* tiles, UINT tile_count, RECT area,
+    const std::uint8_t* heights, UINT height_pitch, UINT limit_width, UINT limit_height) noexcept {
+    if (!id || !tiles || !tile_count || !heights || !limit_width || !limit_height || image.format != ImageFormat::Bgra32 ||
+        image.pixels.empty() || image.pitch < static_cast<std::uint64_t>(image.width) * 4 ||
+        static_cast<std::uint64_t>(image.pitch) * image.height > image.pixels.size() ||
+        area.left < 0 || area.top < 0 || area.left >= area.right || area.top >= area.bottom ||
+        area.right > static_cast<LONG>(image.width) || area.bottom > static_cast<LONG>(image.height)) return E_INVALIDARG;
+    HRESULT hr = initialize();
+    if (FAILED(hr)) return hr;
+    Surface* dst = nullptr;
+    hr = surface(id, image, dst);
+    if (FAILED(hr)) return hr;
+    if (!dst->target) return E_INVALIDARG;
+    hr = create_background(*dst);
+    if (FAILED(hr)) return hr;
+    // Queued draws, which may write or read this surface, come before the effect.
+    flush_pending();
+    hr = upload_cpu_image(*dst, image);
+    if (FAILED(hr)) return hr;
+    // The effect reads up to 128 pixels away from a tile (see read_margin in the binding), clamped to the limit size.
+    constexpr LONG margin = 128;
+    const LONG read_right = std::min<LONG>(static_cast<LONG>(std::min(limit_width, image.width)), area.right + margin);
+    const LONG read_bottom = std::min<LONG>(static_cast<LONG>(std::min(limit_height, image.height)), area.bottom + margin);
+    const LONG read_left = std::min(std::max(area.left - margin, 0L), read_right - 1);
+    const LONG read_top = std::min(std::max(area.top - margin, 0L), read_bottom - 1);
+    if (read_left < 0 || read_top < 0 || read_left >= read_right || read_top >= read_bottom) return E_INVALIDARG;
+    const D3D11_BOX read{static_cast<UINT>(read_left), static_cast<UINT>(read_top), 0,
+        static_cast<UINT>(read_right), static_cast<UINT>(read_bottom), 1};
+    context_->CopySubresourceRegion(dst->background.Get(), 0, read.left, read.top, 0, dst->texture.Get(), 0, &read);
+    Compositor::WaterDraw draw;
+    draw.target = dst->target.Get();
+    draw.target_width = image.width;
+    draw.target_height = image.height;
+    draw.source = dst->background_view.Get();
+    draw.tiles = tiles;
+    draw.tile_count = tile_count;
+    draw.area = area;
+    draw.heights = heights;
+    draw.height_pitch = height_pitch;
+    draw.limit_width = std::min(limit_width, image.width);
+    draw.limit_height = std::min(limit_height, image.height);
+    hr = compositor_.draw_water(context_.Get(), draw);
+    if (FAILED(hr)) return hr;
+    bound_target_ = dst->texture.Get();
+    ++counters_.draws;
+    auto& dirty = dst->gpu_dirty;
+    dirty = dirty.left >= dirty.right || dirty.top >= dirty.bottom ? area :
+        RECT{std::min(dirty.left, area.left), std::min(dirty.top, area.top),
+            std::max(dirty.right, area.right), std::max(dirty.bottom, area.bottom)};
+    dst->cpu_needs_upload = false;
+    dst->cpu_needs_readback = true;
+    return S_OK;
+}
+
 HRESULT SurfaceRenderer::draw(void* source_id, const DecodedImage& source, void* target_id,
     DecodedImage& target, Rect source_rect, Rect target_rect, RECT clip, std::optional<std::uint32_t> key, BlendMode blend,
     const char** failure_stage, std::uint32_t modulation_color, Sampling sampling) noexcept {
@@ -232,18 +301,10 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
         std::min(bound(target_rect.right, 0, width, true), std::clamp<LONG>(clip.right, 0, width)),
         std::min(bound(target_rect.bottom, 0, height, true), std::clamp<LONG>(clip.bottom, 0, height))};
     const bool writes = written.left < written.right && written.top < written.bottom;
-    if (blend != BlendMode::Opaque && !dst->background) {
+    if (blend != BlendMode::Opaque) {
         if (failure_stage) *failure_stage = "alpha background allocation";
-        D3D11_TEXTURE2D_DESC desc = dst->description;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        ComPtr<ID3D11Texture2D> background;
-        ComPtr<ID3D11ShaderResourceView> view;
-        hr = device_->CreateTexture2D(&desc, nullptr, &background);
+        hr = create_background(*dst);
         if (FAILED(hr)) return hr;
-        hr = device_->CreateShaderResourceView(background.Get(), nullptr, &view);
-        if (FAILED(hr)) return hr;
-        dst->background = background;
-        dst->background_view = view;
     }
     if (failure_stage) *failure_stage = "compositor draw";
     const Compositor::RendererSource renderer_source{source.width, source.height,

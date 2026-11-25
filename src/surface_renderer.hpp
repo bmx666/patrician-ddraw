@@ -25,6 +25,10 @@ public:
     // changes which copy is authoritative for the rest of the surface.
     HRESULT synchronize_region_to_cpu(void* id, DecodedImage& image, RECT region) noexcept;
     HRESULT upload_region(void* id, const DecodedImage& image, RECT region) noexcept;
+    // Applies the city water effect (Compositor::WaterDraw) to distinct tiles of a BGRA surface on the GPU. Like any
+    // draw, this leaves the CPU pixels of the tiles stale.
+    HRESULT draw_water(void* id, const DecodedImage& image, const RECT* tiles, UINT tile_count, RECT area,
+        const std::uint8_t* heights, UINT height_pitch, UINT limit_width, UINT limit_height) noexcept;
     void mark_cpu_modified(void* id) noexcept;
     // True when the GPU copy of a surface is newer than its CPU pixels, so CPU access would need a readback.
     bool gpu_holds_newer_pixels(void* id) const noexcept;
@@ -72,6 +76,7 @@ private:
     void flush_pending() noexcept;
     HRESULT surface(void* id, const DecodedImage& image, Surface*& result) noexcept;
     HRESULT upload_cpu_image(Surface& surface, const DecodedImage& image) noexcept;
+    HRESULT create_background(Surface& surface) noexcept;
     HRESULT draw_impl(void* source_id, const DecodedImage& source, void* mask_id,
         const DecodedImage* mask, void* target_id, DecodedImage& target, Rect source_rect,
         Rect target_rect, RECT clip, std::optional<std::uint32_t> key, BlendMode blend,

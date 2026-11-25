@@ -1,5 +1,7 @@
 #include "surface_renderer.hpp"
 
+#include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -147,6 +149,73 @@ int main() {
     if (one_at_a_time != batched) {
         std::fprintf(stderr, "Batched blended draws differ from drawing them one at a time.\n");
         return 17;
+    }
+
+    // The GPU water effect must equal the game's routine, which rewrites its tiles in place: tiles in list order, rows
+    // from the top, pixels from the left, each reading a displaced pixel of the same image. Random heights give large
+    // displacements, so reads of already rewritten pixels form long chains; reads past the limit size are clamped.
+    {
+        constexpr LONG water_width = 96, water_height = 72, limit_width = 86, limit_height = 68;
+        std::uint32_t seed = 12345;
+        const auto next = [&seed] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+        sgl::DecodedImage water{static_cast<std::uint32_t>(water_width), static_cast<std::uint32_t>(water_height),
+            static_cast<std::uint32_t>(water_width) * 4, sgl::ImageFormat::Bgra32, {}, {}};
+        water.pixels.resize(static_cast<std::size_t>(water.pitch) * water_height);
+        for (auto& byte : water.pixels) byte = static_cast<std::uint8_t>(next());
+        const LONG height_pitch = water_width + 2;
+        std::vector<std::uint8_t> heights(static_cast<std::size_t>(height_pitch) * (water_height + 2));
+        for (LONG y = 0; y < water_height + 2; ++y)
+            for (LONG x = 0; x < height_pitch; ++x)
+                heights[static_cast<std::size_t>(y) * height_pitch + x] = static_cast<std::uint8_t>(
+                    (x * 9 + y * 5) % 120 + (next() % 4 == 0 ? next() % 136 : 0));
+        const RECT tile_bounds{3, 5, water_width - 6, water_height - 2};
+        std::vector<RECT> tiles;
+        for (LONG cell = 0; cell < (water_width / 8) * (water_height / 8); ++cell) {
+            if (next() % 5 == 0) continue;
+            const LONG x = cell % (water_width / 8) * 8, y = cell / (water_width / 8) * 8;
+            const RECT tile{std::max(x, tile_bounds.left), std::max(y, tile_bounds.top), std::min(x + 8, tile_bounds.right),
+                std::min(y + 8, tile_bounds.bottom)};
+            if (tile.left < tile.right && tile.top < tile.bottom) tiles.push_back(tile);
+        }
+        for (std::size_t index = tiles.size(); index > 1; --index) std::swap(tiles[index - 1], tiles[next() % index]);
+        RECT area{LONG_MAX, LONG_MAX, LONG_MIN, LONG_MIN};
+        for (const RECT& tile : tiles)
+            area = {std::min(area.left, tile.left), std::min(area.top, tile.top), std::max(area.right, tile.right),
+                std::max(area.bottom, tile.bottom)};
+        const auto apply = [&](std::vector<std::uint8_t>& pixels, bool in_place) {
+            const std::vector<std::uint8_t> before = pixels;
+            const auto& read = in_place ? pixels : before;
+            for (const RECT& tile : tiles) for (LONG y = tile.top; y < tile.bottom; ++y) for (LONG x = tile.left; x < tile.right; ++x) {
+                const auto h = [&](LONG hx, LONG hy) { return static_cast<int>(heights[static_cast<std::size_t>(hy) * height_pitch + hx]); };
+                const int dx = h(x + 1, y) - h(x, y), dy = h(x, y + 1) - h(x, y);
+                const LONG sx = std::clamp<LONG>(x + dx / 4 * 2, 0, limit_width - 1);
+                const LONG sy = std::clamp<LONG>(y + dy / 2, 0, limit_height - 1);
+                for (int channel = 0; channel < 3; ++channel)
+                    pixels[static_cast<std::size_t>(y) * water.pitch + x * 4 + channel] = static_cast<std::uint8_t>(
+                        std::clamp(read[static_cast<std::size_t>(sy) * water.pitch + sx * 4 + channel] - dy, 0, 255));
+            }
+        };
+        std::vector<std::uint8_t> expected = water.pixels, snapshot = water.pixels;
+        apply(expected, true);
+        apply(snapshot, false);
+        if (expected == snapshot) {
+            std::fprintf(stderr, "The water test data does not distinguish in-place from snapshot reads.\n");
+            return 18;
+        }
+        int water_id = 0;
+        sgl::SurfaceRenderer water_renderer;
+        result = water_renderer.draw_water(&water_id, water, tiles.data(), static_cast<UINT>(tiles.size()), area,
+            heights.data() + static_cast<std::size_t>(area.top) * height_pitch + area.left, height_pitch,
+            limit_width, limit_height);
+        if (FAILED(result)) return 19;
+        result = water_renderer.synchronize_to_cpu(&water_id, water);
+        if (FAILED(result)) return 20;
+        if (water.pixels != expected) {
+            std::size_t differences = 0;
+            for (std::size_t index = 0; index < expected.size(); ++index) differences += water.pixels[index] != expected[index];
+            std::fprintf(stderr, "GPU water effect differs from the in-place original in %zu bytes.\n", differences);
+            return 21;
+        }
     }
 
     std::puts("GPU region copy preserved blended pixels and untouched destination content.");
