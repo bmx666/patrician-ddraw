@@ -114,6 +114,8 @@ void report_screen_init_failure(const char* stage, const char* detail) noexcept 
 
 struct Clipper {
     std::vector<RECT> rectangles;
+    // Rectangles added since the last change that can uncover pixels: the region still covers each of them.
+    std::unordered_set<std::uint64_t> added;
 };
 std::unordered_map<void*, std::unique_ptr<Clipper>> clippers;
 std::unique_ptr<Clipper> default_clipper;
@@ -1884,6 +1886,7 @@ extern "C" void __cdecl sgl_CopyClipper(void* source_handle) {
     try {
         auto rectangles = source->rectangles;
         destination->rectangles.swap(rectangles);
+        destination->added.clear();
         ++clip_state_version;
         ++clipper_version;
     } catch (const std::bad_alloc&) {
@@ -1898,8 +1901,20 @@ static void change_clip(const RECT* rectangle, int operation) {
     if (rectangle->left >= rectangle->right || rectangle->top >= rectangle->bottom) return;
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     auto* clipper = get_active_clipper();
+    // The game adds the same few hundred rectangles thousands of times per frame; a union with one already added
+    // changes nothing. Keys hold the four edges in 16 bits each, so larger coordinates are not remembered.
+    const auto fits = [](LONG value) { return value >= SHRT_MIN && value <= SHRT_MAX; };
+    const bool keyed = fits(rectangle->left) && fits(rectangle->top) && fits(rectangle->right) && fits(rectangle->bottom);
+    const std::uint64_t key = static_cast<std::uint16_t>(rectangle->left) |
+        static_cast<std::uint64_t>(static_cast<std::uint16_t>(rectangle->top)) << 16 |
+        static_cast<std::uint64_t>(static_cast<std::uint16_t>(rectangle->right)) << 32 |
+        static_cast<std::uint64_t>(static_cast<std::uint16_t>(rectangle->bottom)) << 48;
+    if (operation == RGN_OR && keyed && clipper->added.count(key)) return;
     try {
-        if (!change_clip_rectangles(clipper->rectangles, *rectangle, operation)) return;
+        const bool changed = change_clip_rectangles(clipper->rectangles, *rectangle, operation);
+        if (operation == RGN_OR) { if (keyed) clipper->added.insert(key); }
+        else clipper->added.clear();
+        if (!changed) return;
         ++clip_state_version;
         ++clipper_version;
     } catch (const std::bad_alloc&) {
@@ -1917,6 +1932,7 @@ extern "C" void __cdecl sgl_SubClipRect_4i(int l, int t, int r, int b) { const R
 extern "C" void __cdecl sgl_ResetClipper() {
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     get_active_clipper()->rectangles.clear();
+    get_active_clipper()->added.clear();
     ++clip_state_version;
     ++clipper_version;
 }
@@ -2199,22 +2215,29 @@ extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
         static std::unordered_map<std::uint32_t, std::unique_ptr<sgl::DecodedImage>> fill_sources;
         std::uint32_t fill_key = 0;
         std::memcpy(&fill_key, fill_pixel_bytes.data(), sizeof(fill_key));
-        auto found_source = fill_sources.find(fill_key);
-        if (found_source == fill_sources.end()) {
-            if (fill_sources.size() >= 1024) {
-                for (auto& cached : fill_sources) surface_renderer.forget(cached.second.get());
-                fill_sources.clear();
+        // Fills mostly repeat the previous color, so the last source is kept at hand.
+        static std::uint32_t last_fill_key = 0;
+        static sgl::DecodedImage* last_fill_source = nullptr;
+        if (!last_fill_source || last_fill_key != fill_key) {
+            auto found_source = fill_sources.find(fill_key);
+            if (found_source == fill_sources.end()) {
+                if (fill_sources.size() >= 1024) {
+                    for (auto& cached : fill_sources) surface_renderer.forget(cached.second.get());
+                    fill_sources.clear();
+                }
+                try {
+                    auto source = std::make_unique<sgl::DecodedImage>();
+                    source->width = source->height = 1;
+                    source->pitch = 4;
+                    source->format = sgl::ImageFormat::Bgra32;
+                    source->pixels.assign(fill_pixel_bytes.begin(), fill_pixel_bytes.end());
+                    found_source = fill_sources.emplace(fill_key, std::move(source)).first;
+                } catch (const std::bad_alloc&) { sgl::unimplemented("sgl_FillSolidRect source allocation"); }
             }
-            try {
-                auto source = std::make_unique<sgl::DecodedImage>();
-                source->width = source->height = 1;
-                source->pitch = 4;
-                source->format = sgl::ImageFormat::Bgra32;
-                source->pixels.assign(fill_pixel_bytes.begin(), fill_pixel_bytes.end());
-                found_source = fill_sources.emplace(fill_key, std::move(source)).first;
-            } catch (const std::bad_alloc&) { sgl::unimplemented("sgl_FillSolidRect source allocation"); }
+            last_fill_key = fill_key;
+            last_fill_source = found_source->second.get();
         }
-        sgl::DecodedImage* const fill_source = found_source->second.get();
+        sgl::DecodedImage* const fill_source = last_fill_source;
         const auto blend = active_blend_mode == 2 ? sgl::BlendMode::Multiply :
             active_blend_mode == 3 ? sgl::BlendMode::Additive :
             alpha == 0xff ? sgl::BlendMode::Opaque : sgl::BlendMode::FillAlpha;

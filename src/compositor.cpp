@@ -3,7 +3,9 @@
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <climits>
+#include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <cstring>
 #include <cmath>
 
@@ -14,30 +16,79 @@ namespace {
 constexpr std::uint32_t no_color_key = 0xffffffffu;
 
 constexpr char shader[] = R"(
-cbuffer Geometry : register(b0) {
-    float4 destination;
-    float4 source_uv;
-    float2 output_size;
-    float2 source_origin;
-    uint color_key;
-    uint fixed_sampling;
-    uint2 fixed_origin;
-    uint2 fixed_step;
-    float2 fractional_step;
-    float4 modulation_color;
+// Per-draw data (Geometry) arrives as instance attributes, so a run of draws is one instanced draw call. The vertex
+// shader passes it on unchanged and without interpolation; every pixel shader entry first copies it into the globals.
+struct Instance {
+    float4 destination : DESTINATION;
+    float4 source_uv : SOURCE_UV;
+    float2 output_size : OUTPUT_SIZE;
+    float2 source_origin : SOURCE_ORIGIN;
+    uint color_key : COLOR_KEY;
+    uint fixed_sampling : FIXED_SAMPLING;
+    uint2 fixed_origin : FIXED_ORIGIN;
+    uint2 fixed_step : FIXED_STEP;
+    float2 fractional_step : FRACTIONAL_STEP;
+    float4 modulation_color : MODULATION_COLOR;
+    int4 clip : CLIP;
 };
-struct Vertex { float4 position : SV_Position; float2 uv : TEXCOORD0; };
-Vertex vertex_main(uint id : SV_VertexID) {
+struct Vertex {
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+    nointerpolation float4 destination : DESTINATION;
+    nointerpolation float4 source_uv : SOURCE_UV;
+    nointerpolation float2 source_origin : SOURCE_ORIGIN;
+    nointerpolation uint color_key : COLOR_KEY;
+    nointerpolation uint fixed_sampling : FIXED_SAMPLING;
+    nointerpolation uint2 fixed_origin : FIXED_ORIGIN;
+    nointerpolation uint2 fixed_step : FIXED_STEP;
+    nointerpolation float2 fractional_step : FRACTIONAL_STEP;
+    nointerpolation float4 modulation_color : MODULATION_COLOR;
+    nointerpolation int4 clip : CLIP;
+};
+static float4 destination;
+static float4 source_uv;
+static float2 source_origin;
+static uint color_key;
+static uint fixed_sampling;
+static uint2 fixed_origin;
+static uint2 fixed_step;
+static float2 fractional_step;
+static float4 modulation_color;
+// Draws of one call may have different clips; each keeps the pixels inside its own, as a scissor would.
+void load_draw(Vertex input) {
+    int2 pixel = int2(input.position.xy);
+    if (any(pixel < input.clip.xy) || any(pixel >= input.clip.zw)) discard;
+    destination = input.destination;
+    source_uv = input.source_uv;
+    source_origin = input.source_origin;
+    color_key = input.color_key;
+    fixed_sampling = input.fixed_sampling;
+    fixed_origin = input.fixed_origin;
+    fixed_step = input.fixed_step;
+    fractional_step = input.fractional_step;
+    modulation_color = input.modulation_color;
+}
+Vertex vertex_main(uint id : SV_VertexID, Instance draw) {
     static const float2 corners[6] = {
         float2(0, 0), float2(1, 0), float2(0, 1),
         float2(0, 1), float2(1, 0), float2(1, 1)
     };
     float2 corner = corners[id];
-    float2 pixel = lerp(destination.xy, destination.zw, corner);
+    float2 pixel = lerp(draw.destination.xy, draw.destination.zw, corner);
     Vertex result;
-    result.position = float4(pixel.x / output_size.x * 2 - 1,
-                             1 - pixel.y / output_size.y * 2, 0, 1);
-    result.uv = lerp(source_uv.xy, source_uv.zw, corner);
+    result.position = float4(pixel.x / draw.output_size.x * 2 - 1,
+                             1 - pixel.y / draw.output_size.y * 2, 0, 1);
+    result.uv = lerp(draw.source_uv.xy, draw.source_uv.zw, corner);
+    result.destination = draw.destination;
+    result.source_uv = draw.source_uv;
+    result.source_origin = draw.source_origin;
+    result.color_key = draw.color_key;
+    result.fixed_sampling = draw.fixed_sampling;
+    result.fixed_origin = draw.fixed_origin;
+    result.fixed_step = draw.fixed_step;
+    result.fractional_step = draw.fractional_step;
+    result.modulation_color = draw.modulation_color;
+    result.clip = draw.clip;
     return result;
 }
 Texture2D source_texture : register(t0);
@@ -91,6 +142,7 @@ float4 sample_pixel(Vertex input) {
     return source_texture.Sample(source_sampler, input.uv);
 }
 float4 pixel_main(Vertex input) : SV_Target {
+    load_draw(input);
     return modulate_color(sample_pixel(input));
 }
 bool matches_key(float4 color) {
@@ -99,6 +151,7 @@ bool matches_key(float4 color) {
     return packed == (color_key & 0xffffff);
 }
 float4 keyed_pixel_main(Vertex input) : SV_Target {
+    load_draw(input);
     float4 color = sample_pixel(input);
     if (matches_key(color)) discard;
     return modulate_color(color);
@@ -115,6 +168,7 @@ float4 alpha_blend(float4 color, Vertex input) {
     return float4((background + (product >> 8)) & 255) / 255.0;
 }
 float4 alpha_pixel_main(Vertex input) : SV_Target {
+    load_draw(input);
     return alpha_blend(sample_pixel(input), input);
 }
 float4 additive_blend(float4 color, Vertex input) {
@@ -123,6 +177,7 @@ float4 additive_blend(float4 color, Vertex input) {
     return float4(min(source.rgb + background.rgb, int3(255, 255, 255)), 255) / 255.0;
 }
 float4 additive_pixel_main(Vertex input) : SV_Target {
+    load_draw(input);
     return additive_blend(sample_pixel(input), input);
 }
 float4 additive_modulated_blend(float4 color, Vertex input) {
@@ -133,6 +188,7 @@ float4 additive_modulated_blend(float4 color, Vertex input) {
     return float4(min(source + background, int3(255, 255, 255)), 255) / 255.0;
 }
 float4 additive_modulated_pixel_main(Vertex input) : SV_Target {
+    load_draw(input);
     return additive_modulated_blend(sample_pixel(input), input);
 }
 float4 multiply_blend(float4 color, Vertex input) {
@@ -141,6 +197,7 @@ float4 multiply_blend(float4 color, Vertex input) {
     return float4((source * background) >> 8) / 255.0;
 }
 float4 multiply_pixel_main(Vertex input) : SV_Target {
+    load_draw(input);
     return multiply_blend(sample_pixel(input), input);
 }
 float4 multiply_modulated_blend(float4 color, Vertex input) {
@@ -151,15 +208,18 @@ float4 multiply_modulated_blend(float4 color, Vertex input) {
     return float4((source * background) >> 8) / 255.0;
 }
 float4 multiply_modulated_pixel_main(Vertex input) : SV_Target {
+    load_draw(input);
     return multiply_modulated_blend(sample_pixel(input), input);
 }
 float4 multiply2_pixel_main(Vertex input) : SV_Target {
+    load_draw(input);
     // The original doubled multiply ignores the constant color.
     int4 source = int4(round(saturate(sample_pixel(input)) * 255));
     int4 background = int4(round(saturate(background_texture.Load(int3(uint2(input.position.xy), 0))) * 255));
     return float4(min((source * background * 2) >> 8, 255)) / 255.0;
 }
 float4 fill_alpha_pixel_main(Vertex input) : SV_Target {
+    load_draw(input);
     int3 source = int3(round(saturate(sample_pixel(input).rgb) * 255));
     int alpha = int(round(saturate(modulation_color.a) * 255));
     int3 background = int3(round(saturate(background_texture.Load(int3(uint2(input.position.xy), 0)).rgb) * 255));
@@ -181,14 +241,17 @@ float4 sample_indexed(Vertex input) {
     return palette_texture.Load(int3(index, 0, 0));
 }
 float4 indexed_main(Vertex input) : SV_Target {
+    load_draw(input);
     return modulate_color(sample_indexed(input));
 }
 float4 keyed_indexed_main(Vertex input) : SV_Target {
+    load_draw(input);
     float4 color = sample_indexed(input);
     if (matches_key(color)) discard;
     return modulate_color(color);
 }
 float4 alpha_indexed_main(Vertex input) : SV_Target {
+    load_draw(input);
     float4 color = sample_indexed(input);
     // Palette entries with the color key's RGB stay transparent whatever their alpha.
     uint3 channels = uint3(round(saturate(color.rgb) * 255));
@@ -197,11 +260,13 @@ float4 alpha_indexed_main(Vertex input) : SV_Target {
     return alpha_blend(color, input);
 }
 float4 multiply_indexed_main(Vertex input) : SV_Target {
+    load_draw(input);
     int4 source = int4(round(saturate(sample_indexed(input)) * 255));
     int4 background = int4(round(saturate(background_texture.Load(int3(uint2(input.position.xy), 0))) * 255));
     return float4((source * background) >> 8) / 255.0;
 }
 float4 multiply_modulated_indexed_main(Vertex input) : SV_Target {
+    load_draw(input);
     int4 source = int4(round(saturate(sample_indexed(input)) * 255));
     int4 tint = int4(round(saturate(modulation_color) * 255));
     int4 background = int4(round(saturate(background_texture.Load(int3(uint2(input.position.xy), 0))) * 255));
@@ -209,9 +274,11 @@ float4 multiply_modulated_indexed_main(Vertex input) : SV_Target {
     return float4((source * background) >> 8) / 255.0;
 }
 float4 additive_indexed_main(Vertex input) : SV_Target {
+    load_draw(input);
     return additive_blend(sample_indexed(input), input);
 }
 float4 additive_modulated_indexed_main(Vertex input) : SV_Target {
+    load_draw(input);
     return additive_modulated_blend(sample_indexed(input), input);
 }
 float4 alpha_mask_blend(float4 color, uint mask_alpha, Vertex input) {
@@ -226,6 +293,7 @@ float4 alpha_mask_blend(float4 color, uint mask_alpha, Vertex input) {
     return float4(output_color) / 255.0;
 }
 float4 alpha_masked_indexed_main(Vertex input) : SV_Target {
+    load_draw(input);
     uint2 pixel = indexed_pixel(input);
     uint mask_alpha = alpha_mask_texture.Load(int3(pixel, 0));
     if (mask_alpha == 0) discard;
@@ -245,9 +313,10 @@ struct alignas(16) Geometry {
     std::uint32_t fixed_step[2];
     float fractional_step[2];
     float modulation_color[4];
+    std::int32_t clip[4];
 };
 
-static_assert(sizeof(Geometry) == 96);
+static_assert(sizeof(Geometry) == 112);
 
 // Compositor::WaterDraw. The game writes the tiles in list order, each row by row from the left, in place: a read of a
 // pixel written earlier in the same call sees the new value. Every written pixel p reads one pixel s(p) and stores
@@ -382,7 +451,7 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     ComPtr<ID3D11PixelShader> additive_indexed_shader;
     ComPtr<ID3D11PixelShader> additive_modulated_indexed_shader;
     ComPtr<ID3D11PixelShader> alpha_masked_indexed_shader;
-    ComPtr<ID3D11Buffer> constants;
+    ComPtr<ID3D11InputLayout> input_layout;
     ComPtr<ID3D11SamplerState> sampler_state;
     ComPtr<ID3D11SamplerState> present_sampler_state;
     ComPtr<ID3D11RasterizerState> rasterizer_state;
@@ -494,12 +563,24 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     result = device->CreatePixelShader(additive_modulated_pixel_code->GetBufferPointer(), additive_modulated_pixel_code->GetBufferSize(),
         nullptr, &additive_modulated_pixel_shader);
     if (FAILED(result)) return result;
-    D3D11_BUFFER_DESC buffer = {};
-    buffer.ByteWidth = sizeof(Geometry);
-    buffer.Usage = D3D11_USAGE_DEFAULT;
-    buffer.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    result = device->CreateBuffer(&buffer, nullptr, &constants);
+    // The instance attributes of vertex_main, laid out as Geometry.
+    const D3D11_INPUT_ELEMENT_DESC instance_elements[] = {
+        {"DESTINATION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, offsetof(Geometry, destination), D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        {"SOURCE_UV", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, offsetof(Geometry, source_uv), D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        {"OUTPUT_SIZE", 0, DXGI_FORMAT_R32G32_FLOAT, 0, offsetof(Geometry, output_size), D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        {"SOURCE_ORIGIN", 0, DXGI_FORMAT_R32G32_FLOAT, 0, offsetof(Geometry, source_origin), D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        {"COLOR_KEY", 0, DXGI_FORMAT_R32_UINT, 0, offsetof(Geometry, color_key), D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        {"FIXED_SAMPLING", 0, DXGI_FORMAT_R32_UINT, 0, offsetof(Geometry, fixed_sampling), D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        {"FIXED_ORIGIN", 0, DXGI_FORMAT_R32G32_UINT, 0, offsetof(Geometry, fixed_origin), D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        {"FIXED_STEP", 0, DXGI_FORMAT_R32G32_UINT, 0, offsetof(Geometry, fixed_step), D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        {"FRACTIONAL_STEP", 0, DXGI_FORMAT_R32G32_FLOAT, 0, offsetof(Geometry, fractional_step), D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        {"MODULATION_COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, offsetof(Geometry, modulation_color), D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        {"CLIP", 0, DXGI_FORMAT_R32G32B32A32_SINT, 0, offsetof(Geometry, clip), D3D11_INPUT_PER_INSTANCE_DATA, 1},
+    };
+    result = device->CreateInputLayout(instance_elements, static_cast<UINT>(std::size(instance_elements)),
+        vertex_code->GetBufferPointer(), vertex_code->GetBufferSize(), &input_layout);
     if (FAILED(result)) return result;
+    D3D11_BUFFER_DESC buffer = {};
     D3D11_SAMPLER_DESC sampler = {};
     sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
     sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -580,7 +661,9 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     additive_indexed_shader_ = additive_indexed_shader;
     additive_modulated_indexed_shader_ = additive_modulated_indexed_shader;
     alpha_masked_indexed_shader_ = alpha_masked_indexed_shader;
-    constants_ = constants;
+    input_layout_ = input_layout;
+    instances_.Reset();
+    instance_capacity_ = instance_next_ = 0;
     sampler_ = sampler_state;
     present_sampler_ = present_sampler_state;
     rasterizer_ = rasterizer_state;
@@ -655,7 +738,7 @@ HRESULT Compositor::prepare(ID3D11DeviceContext* context, ID3D11RenderTargetView
     if (failure_stage) *failure_stage = "compositor parameter validation";
     if (!context || !target || !source || !device_ || !vertex_shader_ || !pixel_shader_ || !keyed_pixel_shader_ ||
         !alpha_pixel_shader_ || !multiply_pixel_shader_ || !multiply_modulated_pixel_shader_ || !multiply2_pixel_shader_ || !fill_alpha_pixel_shader_ ||
-        !additive_pixel_shader_ || !additive_modulated_pixel_shader_ || !constants_ || !indexed_shader_ || !keyed_indexed_shader_ ||
+        !additive_pixel_shader_ || !additive_modulated_pixel_shader_ || !input_layout_ || !indexed_shader_ || !keyed_indexed_shader_ ||
         !alpha_indexed_shader_ || !multiply_indexed_shader_ || !multiply_modulated_indexed_shader_ || !additive_indexed_shader_ ||
         !additive_modulated_indexed_shader_ || !alpha_masked_indexed_shader_ || !sampler_ || !present_sampler_ || !rasterizer_ || !target_width || !target_height ||
         !valid_rect(source_rect) || !valid_rect(destination_rect)) return fail("compositor invalid/null inputs or rectangles", E_INVALIDARG);
@@ -871,6 +954,7 @@ HRESULT Compositor::prepare(ID3D11DeviceContext* context, ID3D11RenderTargetView
         {fixed_origin[0], fixed_origin[1]}, {fixed_step[0], fixed_step[1]},
         {fractional_step[0], fractional_step[1]},
         {modulation[0], modulation[1], modulation[2], modulation[3]},
+        {clip.left, clip.top, clip.right, clip.bottom},
     };
     ID3D11PixelShader* pixel_shader = mask ? alpha_masked_indexed_shader_.Get() : palette ?
         (blend == BlendMode::MultiplyModulated ? multiply_modulated_indexed_shader_.Get() :
@@ -900,53 +984,105 @@ HRESULT Compositor::prepare(ID3D11DeviceContext* context, ID3D11RenderTargetView
     return S_OK;
 }
 
-void Compositor::record(ID3D11DeviceContext* context, const PreparedDraw& prepared, bool renderer_owned) noexcept {
-    ID3D11RenderTargetView* const target = prepared.target;
-    const UINT target_width = prepared.target_width;
-    const UINT target_height = prepared.target_height;
-    ID3D11PixelShader* const pixel_shader = prepared.pixel_shader;
-    context->UpdateSubresource(constants_.Get(), 0, nullptr, prepared.constants, 0, 0);
+void Compositor::record(ID3D11DeviceContext* context, const PreparedDraw* const* draws, UINT count,
+    bool renderer_owned) noexcept {
+    if (!context || !count) return;
+    constexpr UINT instance_size = sizeof(Geometry);
+    if (count > instance_capacity_) {
+        UINT capacity = std::max(instance_capacity_, 4096u);
+        while (capacity < count) capacity *= 2;
+        D3D11_BUFFER_DESC desc = {};
+        desc.ByteWidth = capacity * instance_size;
+        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        ComPtr<ID3D11Buffer> buffer;
+        if (FAILED(device_->CreateBuffer(&desc, nullptr, &buffer))) return;
+        instances_ = buffer;
+        instance_capacity_ = capacity;
+        instance_next_ = capacity;
+        // The new buffer still has to be bound.
+        renderer_state_context_ = nullptr;
+    }
+    // Append to the ring without waiting for the GPU; start over (discarding the old contents) when it is full.
+    const bool wrap = instance_next_ + count > instance_capacity_;
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(context->Map(instances_.Get(), 0, wrap ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0,
+        &mapped))) return;
+    if (wrap) instance_next_ = 0;
+    const UINT first = instance_next_;
+    auto* const output = static_cast<std::uint8_t*>(mapped.pData) + static_cast<std::size_t>(first) * instance_size;
+    for (UINT index = 0; index < count; ++index)
+        std::memcpy(output + static_cast<std::size_t>(index) * instance_size, draws[index]->constants, instance_size);
+    context->Unmap(instances_.Get(), 0);
+    instance_next_ += count;
+
     // Renderer-owned draws keep these bindings; public compositor calls invalidate the cache.
     const bool bind_renderer_state = !renderer_owned || renderer_state_context_ != context;
-    if (bind_renderer_state || renderer_target_ != target) {
-        context->OMSetRenderTargets(1, &target, nullptr);
-        renderer_target_ = target;
-        // Binding a target unbinds any shader resource view of the same texture.
-        for (auto& resource : renderer_resources_) resource = reinterpret_cast<ID3D11ShaderResourceView*>(~std::uintptr_t{0});
-    }
-    if (bind_renderer_state || renderer_viewport_width_ != target_width || renderer_viewport_height_ != target_height) {
-        const D3D11_VIEWPORT viewport = {0, 0, static_cast<float>(target_width), static_cast<float>(target_height), 0, 1};
-        context->RSSetViewports(1, &viewport);
-        renderer_viewport_width_ = target_width;
-        renderer_viewport_height_ = target_height;
-    }
-    context->RSSetScissorRects(1, &prepared.clip);
     if (bind_renderer_state) {
         context->RSSetState(rasterizer_.Get());
         context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
-        context->IASetInputLayout(nullptr);
+        context->IASetInputLayout(input_layout_.Get());
+        ID3D11Buffer* const buffer = instances_.Get();
+        const UINT stride = instance_size, offset = 0;
+        context->IASetVertexBuffers(0, 1, &buffer, &stride, &offset);
         context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         context->VSSetShader(vertex_shader_.Get(), nullptr, 0);
         context->GSSetShader(nullptr, nullptr, 0);
         context->HSSetShader(nullptr, nullptr, 0);
         context->DSSetShader(nullptr, nullptr, 0);
-        ID3D11Buffer* constants = constants_.Get();
-        context->VSSetConstantBuffers(0, 1, &constants);
-        context->PSSetConstantBuffers(0, 1, &constants);
         ID3D11SamplerState* samplers[] = {sampler_.Get(), present_sampler_.Get()};
         context->PSSetSamplers(0, 2, samplers);
         renderer_state_context_ = renderer_owned ? context : nullptr;
         renderer_pixel_shader_ = nullptr;
+        renderer_target_ = nullptr;
+        renderer_viewport_width_ = renderer_viewport_height_ = 0;
     }
-    if (bind_renderer_state || renderer_pixel_shader_ != pixel_shader) {
-        context->PSSetShader(pixel_shader, nullptr, 0);
-        renderer_pixel_shader_ = renderer_owned ? pixel_shader : nullptr;
+    const auto same_run = [](const PreparedDraw& first_draw, const PreparedDraw& next) {
+        return next.target == first_draw.target && next.target_width == first_draw.target_width &&
+            next.target_height == first_draw.target_height && next.pixel_shader == first_draw.pixel_shader &&
+            // A run of draws without clip_in_shader shares one clip as its scissor, so they never discard.
+            ((next.clip_in_shader && first_draw.clip_in_shader) ||
+                (!next.clip_in_shader && !first_draw.clip_in_shader &&
+                    std::memcmp(&next.clip, &first_draw.clip, sizeof(RECT)) == 0)) &&
+            std::memcmp(next.resources, first_draw.resources, sizeof(next.resources)) == 0;
+    };
+    for (UINT start = 0; start < count;) {
+        const PreparedDraw& prepared = *draws[start];
+        RECT scissor = prepared.clip;
+        UINT end = start + 1;
+        for (; end < count && same_run(prepared, *draws[end]); ++end) {
+            const RECT& clip = draws[end]->clip;
+            scissor = {std::min(scissor.left, clip.left), std::min(scissor.top, clip.top),
+                std::max(scissor.right, clip.right), std::max(scissor.bottom, clip.bottom)};
+        }
+        ID3D11RenderTargetView* const target = prepared.target;
+        if (renderer_target_ != target) {
+            context->OMSetRenderTargets(1, &target, nullptr);
+            renderer_target_ = target;
+            // Binding a target unbinds any shader resource view of the same texture.
+            for (auto& resource : renderer_resources_) resource = reinterpret_cast<ID3D11ShaderResourceView*>(~std::uintptr_t{0});
+        }
+        if (renderer_viewport_width_ != prepared.target_width || renderer_viewport_height_ != prepared.target_height) {
+            const D3D11_VIEWPORT viewport = {0, 0, static_cast<float>(prepared.target_width),
+                static_cast<float>(prepared.target_height), 0, 1};
+            context->RSSetViewports(1, &viewport);
+            renderer_viewport_width_ = prepared.target_width;
+            renderer_viewport_height_ = prepared.target_height;
+        }
+        context->RSSetScissorRects(1, &scissor);
+        if (renderer_pixel_shader_ != prepared.pixel_shader) {
+            context->PSSetShader(prepared.pixel_shader, nullptr, 0);
+            renderer_pixel_shader_ = prepared.pixel_shader;
+        }
+        if (std::memcmp(prepared.resources, renderer_resources_, sizeof(prepared.resources)) != 0) {
+            context->PSSetShaderResources(0, 5, prepared.resources);
+            std::memcpy(renderer_resources_, prepared.resources, sizeof(prepared.resources));
+        }
+        // Draws of one call are rasterized and blended in instance order, as separate calls would be.
+        context->DrawInstanced(6, end - start, 0, first + start);
+        start = end;
     }
-    if (bind_renderer_state || std::memcmp(prepared.resources, renderer_resources_, sizeof(prepared.resources)) != 0) {
-        context->PSSetShaderResources(0, 5, prepared.resources);
-        std::memcpy(renderer_resources_, prepared.resources, sizeof(prepared.resources));
-    }
-    context->Draw(6, 0);
     if (!renderer_owned) {
         ID3D11ShaderResourceView* empty[] = {nullptr, nullptr, nullptr, nullptr, nullptr};
         context->PSSetShaderResources(0, 5, empty);

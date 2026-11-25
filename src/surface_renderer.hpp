@@ -61,19 +61,24 @@ private:
         // Bounds of the GPU writes not yet copied to the CPU pixels; readback copies only this region.
         RECT gpu_dirty{};
     };
-    // A queued draw. Draws to one target are queued so that the background copies of blended draws are recorded
-    // together ahead of the draws instead of alternating with them; every copy and draw stalls on the one before.
+    // A queued draw. Draws to one target are queued in layers: a draw goes one layer above the highest queued draw it
+    // may overlap, so the draws of a layer write disjoint pixels. Overlapping draws keep their order, and every pixel
+    // ends up as if the draws had been recorded one at a time.
     struct PendingDraw {
         Compositor::PreparedDraw draw;
         ID3D11Texture2D* texture = nullptr;
         ID3D11Texture2D* background = nullptr;
         D3D11_BOX copy{};
         RECT written{};
+        std::uint32_t layer = 0;
     };
-    // Records queued draws: first every background copy, then the draws in submission order. A copy taken at the
-    // start of the batch equals one taken right before its draw because no earlier draw of the batch writes the copied
-    // region (see draw_impl). Must run before anything else reads or writes the queued resources.
+    // Records the queued draws layer by layer: first the background copies of the layer's blended draws, then its draws,
+    // grouped into as few calls as possible. A copy taken at the start of a layer equals one taken right before its
+    // draw because every earlier draw that writes the copied pixels lies in a lower layer. Must run before anything
+    // else reads or writes the queued resources.
     void flush_pending() noexcept;
+    // Places a draw that writes the given pixels of the queued target in its layer.
+    HRESULT assign_layer(const Surface& target, const RECT& written, std::uint32_t& layer) noexcept;
     HRESULT surface(void* id, const DecodedImage& image, Surface*& result) noexcept;
     HRESULT upload_cpu_image(Surface& surface, const DecodedImage& image) noexcept;
     HRESULT create_background(Surface& surface) noexcept;
@@ -90,8 +95,24 @@ private:
     FrameCounters counters_{};
     ID3D11Resource* bound_target_ = nullptr;
     std::vector<PendingDraw> pending_;
+    // The queued draws handed to the compositor; reserved with pending_, so filling it does not allocate.
+    std::vector<const Compositor::PreparedDraw*> pending_draws_;
+    std::vector<std::uint32_t> pending_order_;
+    std::vector<std::uint32_t> layer_starts_;
     ID3D11Texture2D* pending_target_ = nullptr;
-    RECT pending_bounds_{};
+    // A 16x16-pixel cell of the queued target: one more than the highest layer of a queued draw touching it, and the
+    // first queued draws touching it (count above capacity: more than listed).
+    struct LayerCell {
+        static constexpr std::uint16_t capacity = 6;
+        std::uint32_t highest = 0;
+        std::uint16_t count = 0;
+        std::uint16_t draws[capacity] = {};
+    };
+    // The cells of the queued target and the cells in use.
+    std::vector<LayerCell> layer_grid_;
+    std::vector<std::uint32_t> layer_cells_;
+    UINT layer_grid_columns_ = 0;
+    UINT layer_grid_rows_ = 0;
 };
 
 }

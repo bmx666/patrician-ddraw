@@ -151,6 +151,56 @@ int main() {
         return 17;
     }
 
+    // Many draws of all blend modes, sizes and clips: queued, they are reordered into layers, share background copies
+    // and draw calls; the result must equal drawing them one at a time.
+    const auto run_random = [](bool synchronize_each, std::vector<std::uint8_t>& output) -> HRESULT {
+        constexpr std::uint32_t random_width = 192, random_height = 96;
+        std::uint32_t seed = 4242;
+        const auto next = [&seed] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+        sgl::DecodedImage target{random_width, random_height, random_width * 4, sgl::ImageFormat::Bgra32, {}, {}};
+        target.pixels.resize(static_cast<std::size_t>(target.pitch) * random_height);
+        for (auto& byte : target.pixels) byte = static_cast<std::uint8_t>(next());
+        sgl::DecodedImage sprite{12, 10, 48, sgl::ImageFormat::Bgra32, {}, {}};
+        sprite.pixels.resize(48 * 10);
+        for (auto& byte : sprite.pixels) byte = static_cast<std::uint8_t>(next());
+        int sprite_id = 0, target_id = 0;
+        sgl::SurfaceRenderer random_renderer;
+        const sgl::BlendMode modes[] = {sgl::BlendMode::Opaque, sgl::BlendMode::Alpha, sgl::BlendMode::Alpha,
+            sgl::BlendMode::Multiply, sgl::BlendMode::Additive, sgl::BlendMode::FillAlpha, sgl::BlendMode::Multiply2};
+        for (int step = 0; step < 600; ++step) {
+            const auto mode = modes[next() % std::size(modes)];
+            const bool large = next() % 10 == 0;
+            const float width = static_cast<float>(large ? 40 + next() % 120 : 4 + next() % 9);
+            const float height = static_cast<float>(large ? 20 + next() % 60 : 3 + next() % 8);
+            const float left = static_cast<float>(static_cast<int>(next() % (random_width + 8)) - 4);
+            const float top = static_cast<float>(static_cast<int>(next() % (random_height + 8)) - 4);
+            const LONG clip_left = static_cast<LONG>(next() % random_width), clip_top = static_cast<LONG>(next() % random_height);
+            const RECT clip = next() % 3 == 0 ? RECT{0, 0, static_cast<LONG>(random_width), static_cast<LONG>(random_height)} :
+                RECT{clip_left, clip_top, clip_left + 1 + static_cast<LONG>(next() % 40), clip_top + 1 + static_cast<LONG>(next() % 30)};
+            const sgl::Rect source_rect{0, 0, 12, 10};
+            const sgl::Rect destination{left, top, left + width, top + height};
+            const std::uint32_t modulation = 0xff000000u | (next() & 0x00ffffffu) | ((next() % 2) << 30);
+            HRESULT hr = random_renderer.draw(&sprite_id, sprite, &target_id, target, source_rect, destination, clip,
+                std::nullopt, mode, nullptr, mode == sgl::BlendMode::Opaque ? 0xffffffffu : modulation);
+            if (FAILED(hr)) return hr;
+            if (synchronize_each) {
+                hr = random_renderer.synchronize_to_cpu(&target_id, target);
+                if (FAILED(hr)) return hr;
+            }
+        }
+        const HRESULT hr = random_renderer.synchronize_to_cpu(&target_id, target);
+        output = target.pixels;
+        return hr;
+    };
+    std::vector<std::uint8_t> random_each, random_queued;
+    if (FAILED(run_random(true, random_each)) || FAILED(run_random(false, random_queued))) return 22;
+    if (random_each != random_queued) {
+        std::size_t differences = 0;
+        for (std::size_t index = 0; index < random_each.size(); ++index) differences += random_each[index] != random_queued[index];
+        std::fprintf(stderr, "Queued random draws differ from drawing them one at a time in %zu bytes.\n", differences);
+        return 23;
+    }
+
     // The GPU water effect must equal the game's routine, which rewrites its tiles in place: tiles in list order, rows
     // from the top, pixels from the left, each reading a displaced pixel of the same image. Random heights give large
     // displacements, so reads of already rewritten pixels form long chains; reads past the limit size are clamped.

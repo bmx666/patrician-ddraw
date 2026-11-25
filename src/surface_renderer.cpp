@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <new>
 #include <stdexcept>
 #include <vector>
@@ -326,32 +327,38 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
     if (FAILED(hr)) return hr;
     ++counters_.draws;
     if (pending.draw.visible) {
-        const auto overlaps = [](const RECT& a, const RECT& b) {
-            return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
-        };
         if (blend != BlendMode::Opaque && writes) {
-            // The copy is recorded ahead of the queued draws, so it must not cover pixels one of them writes.
-            if (!pending_.empty() && overlaps(pending_bounds_, written) &&
-                std::any_of(pending_.begin(), pending_.end(), [&](const PendingDraw& queued) { return overlaps(queued.written, written); }))
-                flush_pending();
             pending.background = dst->background.Get();
             pending.copy = {static_cast<UINT>(written.left), static_cast<UINT>(written.top), 0,
                 static_cast<UINT>(written.right), static_cast<UINT>(written.bottom), 1};
         }
         pending.texture = dst->texture.Get();
         pending.written = writes ? written : RECT{};
+        // Clipping in the pixel shader lets draws of different clips share a call; the quad is then shaded within the
+        // run's common scissor, so it is used only where the quad is small or mostly visible.
+        const auto quad_area = static_cast<std::uint64_t>(bound(target_rect.right, 0, width, true) -
+            bound(target_rect.left, 0, width, false)) * static_cast<std::uint64_t>(bound(target_rect.bottom, 0, height, true) -
+            bound(target_rect.top, 0, height, false));
+        const auto visible_area = writes ? static_cast<std::uint64_t>(written.right - written.left) *
+            static_cast<std::uint64_t>(written.bottom - written.top) : 0;
+        pending.draw.clip_in_shader = writes && sampling != Sampling::PresentSharp &&
+            quad_area <= std::max<std::uint64_t>(visible_area * 2, 4096);
+        if (writes) {
+            hr = assign_layer(*dst, written, pending.layer);
+            if (FAILED(hr)) return hr;
+        }
         try {
-            if (pending_.capacity() == 0) pending_.reserve(1024);
+            if (pending_.capacity() == 0) {
+                pending_.reserve(1024);
+                pending_draws_.reserve(1024);
+                pending_order_.reserve(1024);
+                layer_starts_.reserve(1025);
+            }
             pending_.push_back(pending);
         } catch (const std::bad_alloc&) {
             return E_OUTOFMEMORY;
         }
         pending_target_ = pending.texture;
-        if (writes) {
-            pending_bounds_ = pending_.size() == 1 || pending_bounds_.left >= pending_bounds_.right ? written :
-                RECT{std::min(pending_bounds_.left, written.left), std::min(pending_bounds_.top, written.top),
-                    std::max(pending_bounds_.right, written.right), std::max(pending_bounds_.bottom, written.bottom)};
-        }
         if (pending_.size() >= 1024) flush_pending();
     }
     if (writes) {
@@ -370,17 +377,122 @@ void SurfaceRenderer::flush_pending() noexcept {
         pending_target_ = nullptr;
         return;
     }
-    for (const auto& queued : pending_) {
-        if (queued.background) {
-            context_->CopySubresourceRegion(queued.background, 0, queued.copy.left, queued.copy.top, 0,
-                queued.texture, 0, &queued.copy);
-        }
+    // Order the draws by layer (a counting sort: a layer is below the queue length), and within a layer by pipeline
+    // inputs so that draws sharing them are neighbours; draws of one layer write disjoint pixels, so their order is free.
+    const auto count = static_cast<std::uint32_t>(pending_.size());
+    std::uint32_t layers = 0;
+    for (const auto& queued : pending_) layers = std::max(layers, queued.layer + 1);
+    layer_starts_.assign(layers + 1, 0);
+    for (const auto& queued : pending_) ++layer_starts_[queued.layer + 1];
+    for (std::uint32_t layer = 0; layer < layers; ++layer) layer_starts_[layer + 1] += layer_starts_[layer];
+    pending_order_.resize(count);
+    for (std::uint32_t index = 0; index < count; ++index) pending_order_[layer_starts_[pending_[index].layer]++] = index;
+    for (std::uint32_t start = 0; start < count;) {
+        const auto layer = pending_[pending_order_[start]].layer;
+        std::uint32_t end = start + 1;
+        while (end < count && pending_[pending_order_[end]].layer == layer) ++end;
+        std::sort(pending_order_.begin() + start, pending_order_.begin() + end, [this](std::uint32_t left, std::uint32_t right) {
+            const auto& a = pending_[left].draw;
+            const auto& b = pending_[right].draw;
+            if (a.pixel_shader != b.pixel_shader) return std::less<>()(a.pixel_shader, b.pixel_shader);
+            if (const int order = std::memcmp(a.resources, b.resources, sizeof(a.resources))) return order < 0;
+            if (a.clip_in_shader != b.clip_in_shader) return a.clip_in_shader < b.clip_in_shader;
+            if (const int order = std::memcmp(&a.clip, &b.clip, sizeof(a.clip))) return order < 0;
+            return left < right;
+        });
+        start = end;
     }
-    for (const auto& queued : pending_) compositor_.record(context_.Get(), queued.draw, true);
+    for (std::uint32_t start = 0; start < count;) {
+        const auto layer = pending_[pending_order_[start]].layer;
+        std::uint32_t end = start;
+        std::uint32_t blended = 0;
+        ID3D11Texture2D* background = nullptr;
+        D3D11_BOX bounds{UINT_MAX, UINT_MAX, 0, 0, 0, 1};
+        for (; end < count && pending_[pending_order_[end]].layer == layer; ++end) {
+            const auto& queued = pending_[pending_order_[end]];
+            if (!queued.background) continue;
+            ++blended;
+            background = queued.background;
+            bounds = {std::min(bounds.left, queued.copy.left), std::min(bounds.top, queued.copy.top), 0,
+                std::max(bounds.right, queued.copy.right), std::max(bounds.bottom, queued.copy.bottom), 1};
+        }
+        // Many blended draws in one layer share one copy of their bounding box: it holds the same pixels for each of
+        // them, because the layer's other draws are recorded after the copy.
+        if (blended >= 16) {
+            const auto& queued = pending_[pending_order_[start]];
+            context_->CopySubresourceRegion(background, 0, bounds.left, bounds.top, 0, queued.texture,
+                0, &bounds);
+        } else if (blended) {
+            for (std::uint32_t index = start; index < end; ++index) {
+                const auto& queued = pending_[pending_order_[index]];
+                if (queued.background) context_->CopySubresourceRegion(queued.background, 0, queued.copy.left,
+                    queued.copy.top, 0, queued.texture, 0, &queued.copy);
+            }
+        }
+        pending_draws_.clear();
+        for (std::uint32_t index = start; index < end; ++index) pending_draws_.push_back(&pending_[pending_order_[index]].draw);
+        compositor_.record(context_.Get(), pending_draws_.data(), static_cast<UINT>(pending_draws_.size()), true);
+        start = end;
+    }
+    for (const auto cell : layer_cells_) layer_grid_[cell] = {};
+    layer_cells_.clear();
     bound_target_ = pending_target_;
     pending_.clear();
     pending_target_ = nullptr;
-    pending_bounds_ = {};
+}
+
+HRESULT SurfaceRenderer::assign_layer(const Surface& target, const RECT& written, std::uint32_t& layer) noexcept {
+    constexpr LONG cell_size = 16;
+    const UINT columns = (target.description.Width + cell_size - 1) / cell_size;
+    const UINT rows = (target.description.Height + cell_size - 1) / cell_size;
+    if (columns != layer_grid_columns_ || rows != layer_grid_rows_) {
+        // Only one target has queued draws, and the grid is cleared with every flush.
+        try {
+            layer_grid_.assign(static_cast<std::size_t>(columns) * rows, LayerCell{});
+            layer_cells_.clear();
+            layer_cells_.reserve(layer_grid_.size());
+        } catch (const std::bad_alloc&) {
+            layer_grid_columns_ = layer_grid_rows_ = 0;
+            return E_OUTOFMEMORY;
+        }
+        layer_grid_columns_ = columns;
+        layer_grid_rows_ = rows;
+    }
+    const auto first_column = static_cast<UINT>(written.left / cell_size);
+    const auto last_column = static_cast<UINT>((written.right - 1) / cell_size);
+    const auto first_row = static_cast<UINT>(written.top / cell_size);
+    const auto last_row = static_cast<UINT>((written.bottom - 1) / cell_size);
+    // One above the highest queued draw this one overlaps: exactly for the draws listed in the cells, and through the
+    // cell's highest layer where more draws touched a cell than it lists.
+    std::uint32_t needed = 0;
+    for (UINT row = first_row; row <= last_row; ++row) {
+        for (UINT column = first_column; column <= last_column; ++column) {
+            const LayerCell& cell = layer_grid_[static_cast<std::size_t>(row) * columns + column];
+            if (cell.count > LayerCell::capacity) {
+                needed = std::max(needed, cell.highest);
+                continue;
+            }
+            for (std::uint16_t entry = 0; entry < cell.count; ++entry) {
+                const PendingDraw& queued = pending_[cell.draws[entry]];
+                if (queued.written.left < written.right && written.left < queued.written.right &&
+                    queued.written.top < written.bottom && written.top < queued.written.bottom)
+                    needed = std::max(needed, queued.layer + 1);
+            }
+        }
+    }
+    layer = needed;
+    const auto index = static_cast<std::uint16_t>(pending_.size());
+    for (UINT row = first_row; row <= last_row; ++row) {
+        for (UINT column = first_column; column <= last_column; ++column) {
+            const auto cell_index = static_cast<std::uint32_t>(static_cast<std::size_t>(row) * columns + column);
+            LayerCell& cell = layer_grid_[cell_index];
+            if (!cell.highest) layer_cells_.push_back(cell_index);
+            cell.highest = std::max(cell.highest, layer + 1);
+            if (cell.count < LayerCell::capacity) cell.draws[cell.count++] = index;
+            else cell.count = LayerCell::capacity + 1;
+        }
+    }
+    return S_OK;
 }
 
 HRESULT SurfaceRenderer::synchronize_to_cpu(void* id, DecodedImage& image) noexcept {

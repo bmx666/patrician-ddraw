@@ -79,8 +79,12 @@ public:
         RECT clip{};
         ID3D11PixelShader* pixel_shader = nullptr;
         ID3D11ShaderResourceView* resources[5] = {};
-        std::uint8_t constants[96] = {};
+        std::uint8_t constants[112] = {};
         bool visible = false;
+        // The pixel shader also keeps the draw inside its clip, so record() may draw it in one call with draws of other
+        // clips under their common bounding box. Set only where the quad is not much larger than its visible part,
+        // and never for draws that take derivatives (PresentSharp), whose neighbouring pixels must not be discarded.
+        bool clip_in_shader = false;
     };
 
 private:
@@ -107,9 +111,16 @@ private:
         std::optional<std::uint32_t> color_key, Sampling sampling, ID3D11ShaderResourceView* background,
         std::uint32_t modulation_color, BlendMode blend, const char** failure_stage,
         const RendererSource* renderer_source, PreparedDraw& prepared) noexcept;
-    // Records a prepared draw. Renderer-owned draws keep their bindings cached between draws; other draws unbind
-    // their shader resources afterwards.
-    void record(ID3D11DeviceContext* context, const PreparedDraw& prepared, bool renderer_owned) noexcept;
+    // Records prepared draws in order. Their per-draw data goes into the instance buffer with one map, and each run of
+    // neighbouring draws with the same target, pixel shader and resources, and either the same clip or all with
+    // clip_in_shader, becomes one instanced draw call under the bounding box of their clips.
+    // Renderer-owned draws keep their bindings cached between calls; other draws unbind their shader resources
+    // afterwards.
+    void record(ID3D11DeviceContext* context, const PreparedDraw* const* draws, UINT count, bool renderer_owned) noexcept;
+    void record(ID3D11DeviceContext* context, const PreparedDraw& prepared, bool renderer_owned) noexcept {
+        const PreparedDraw* const draws[] = {&prepared};
+        record(context, draws, 1, renderer_owned);
+    }
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> vertex_shader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> pixel_shader_;
@@ -129,7 +140,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D11PixelShader> additive_indexed_shader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> additive_modulated_indexed_shader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> alpha_masked_indexed_shader_;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> constants_;
+    Microsoft::WRL::ComPtr<ID3D11InputLayout> input_layout_;
+    // Per-draw data, one PreparedDraw::constants per instance, filled as a ring and grown on demand.
+    Microsoft::WRL::ComPtr<ID3D11Buffer> instances_;
+    UINT instance_capacity_ = 0;
+    UINT instance_next_ = 0;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler_;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> present_sampler_;
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> rasterizer_;
