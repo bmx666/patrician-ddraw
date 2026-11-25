@@ -95,6 +95,8 @@ exact_blend=0
 | `show_fps` | `1` shows the frame rate and frame times in the top-left corner. Debug builds also show draws (`dr`), the draw calls and queue flushes that recorded them (`dc`, `fl`; of the flushes, `t` switched target, `o` were overlapping translucent draws, `u` were texture uploads) and transfers, and write `sgl_readbacks.log` next to `high_res.ini`, which every two seconds lists the GPU readbacks per frame by SGL export, calling game address and surface size |
 | `exact_blend` | `1` blends translucent draws with the original integer formulas through a copy of the target, which splits a frame into many GPU passes; `0` (default) uses hardware blending, at most one color step apart, and is much faster on tile-based GPUs such as Apple Silicon |
 
+Other keys and sections are ignored; a key given twice takes its last value.
+
 ## Building
 
 Requirements: Windows, CMake 3.25 or newer, Visual Studio 2022 with the C++ desktop workload (x86 tools and a Windows SDK), and Node.js for the test scripts. The library is 32-bit, like the game.
