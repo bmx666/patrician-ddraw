@@ -2667,8 +2667,7 @@ static void blit_bitmap(int sx, int sy, int dx, int dy, int width, int height, s
     if (left >= right || top >= bottom) return;
     if (render_source == render_destination && sx == dx && sy == dy) return;
     const bool self_copy = render_source == render_destination;
-    if (!lock_texture(src, nullptr, 1, false,
-        self_copy ? LockIntent::CpuPixels : LockIntent::GpuResource))
+    if (!lock_texture(src, nullptr, 1, false, LockIntent::GpuResource))
         sgl::unimplemented("sgl_Blt source lock");
     sgl::Rect source_rect{static_cast<float>(sx + left), static_cast<float>(sy + top),
         static_cast<float>(sx + right), static_cast<float>(sy + bottom)};
@@ -2680,17 +2679,10 @@ static void blit_bitmap(int sx, int sy, int dx, int dy, int width, int height, s
     const RECT bounds{0, 0, static_cast<LONG>(dst.image.width), static_cast<LONG>(dst.image.height)};
     const char* failure_stage = nullptr;
     if (self_copy) {
-        sgl::DecodedImage source_snapshot;
-        try { source_snapshot = src.image; }
-        catch (const std::bad_alloc&) {
-            unlock_texture(src);
-            sgl::unimplemented("sgl_Blt source snapshot allocation");
-        }
+        // The renderer snapshots the source region on the GPU, so the copy needs no readback of the surface.
+        const HRESULT self_copy_result = surface_renderer.copy_within(render_destination, dst.image, source_rect,
+            target_rect, bounds, &failure_stage);
         unlock_texture(src);
-        const HRESULT self_copy_result = surface_renderer.draw(&source_snapshot, source_snapshot,
-            render_destination, dst.image, source_rect, target_rect, bounds, std::nullopt,
-            sgl::BlendMode::Opaque, &failure_stage);
-        surface_renderer.forget(&source_snapshot);
         if (FAILED(self_copy_result)) {
             char draw_message[160]{};
             std::snprintf(draw_message, sizeof(draw_message), "sgl_Blt self-copy D3D11: %s failed (HRESULT 0x%08lX)",
