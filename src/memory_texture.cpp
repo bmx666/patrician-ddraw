@@ -2305,13 +2305,14 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
     // fast-forward overlay maps destinations differently; every other draw outside the clips draws nothing.
     if (!fast_forward_overlay && !(sx == 0 && sy == 0 && width == dw && height == dh && width >= 800) &&
         draw_outside_clip(*target_texture, dx, dy, dw, dh)) return;
-    const bool full_map = is_fast_forward_map(source_texture->name.c_str()) && is_screen_texture(render_destination) &&
-        sx == 0 && sy == 0 && width == dw && height == dh &&
+    // The name comparison comes last: almost every draw fails the integer conditions first.
+    const bool full_map = sx == 0 && sy == 0 && width == dw && height == dh &&
         ((width == 1280 && height == 1024) ||
             (width == static_cast<int>(source_texture->image.width) &&
                 height == static_cast<int>(source_texture->image.height))) &&
         source_texture->image.width == target_texture->image.width &&
-        source_texture->image.height == target_texture->image.height && target_texture->image.width > 1280;
+        source_texture->image.height == target_texture->image.height && target_texture->image.width > 1280 &&
+        is_screen_texture(render_destination) && is_fast_forward_map(source_texture->name.c_str());
     // A source rectangle beyond the image makes the original read memory after the pixels, which has no defined
     // result. The part inside the image is drawn, with the destination shortened in proportion.
     if (!full_map && (static_cast<std::uint64_t>(sx) + width > source_texture->image.width ||
