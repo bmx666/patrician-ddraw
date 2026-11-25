@@ -1386,8 +1386,8 @@ extern "C" void* __cdecl sgl_InitScreen(HWND window, int fullscreen, const char*
             OutputDebugStringA("Frame limit: the game's frame limiter does not match the verified executable\n");
         water_effect::install();
         // Not fatal: without it the window still works, but the game can move it, keep it topmost and hold capture.
-        if (surface_renderer.display_mode() == sgl::DisplayMode::Windowed && !sgl::install_game_window_binding(window))
-            OutputDebugStringA("Windowed mode: cannot bind the game's window placement, capture and cursor calls\n");
+        if (!sgl::install_game_window_binding(window))
+            OutputDebugStringA("Cannot bind the game's window placement, capture and cursor calls\n");
         return screen.get();
     } catch (const std::bad_alloc&) {
         report_screen_init_failure("initializing SGL screen", "memory allocation failed");
