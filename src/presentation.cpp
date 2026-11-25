@@ -176,15 +176,17 @@ HRESULT place_windowed_window(HWND window, UINT render_width, UINT render_height
 
 namespace sgl {
 
-HRESULT Presentation::initialize_configured(ID3D11Device* device, HWND window, const std::filesystem::path& path, std::string& error) {
+HRESULT Presentation::initialize_configured(ID3D11Device* device, HWND window, const std::filesystem::path& path, std::string& error,
+    std::optional<DisplaySize> game_size) {
     DisplayConfig config{};
-    if (!display_config(window, path, config, error)) return E_INVALIDARG;
+    if (!display_config(window, path, config, error, game_size)) return E_INVALIDARG;
     const HRESULT hr = initialize(device, window, config.size.width, config.size.height, config.mode);
     if (SUCCEEDED(hr)) {
         max_fps_ = config.max_fps;
         sync_interval_ = config.vsync ? 1 : 0;
         set_show_fps(config.show_fps);
         exact_blend_ = config.exact_blend;
+        any_render_size_ = game_size.has_value();
     }
     if (FAILED(hr)) {
         error = hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) ?
@@ -299,6 +301,7 @@ void Presentation::close() noexcept {
     sync_interval_ = 1;
     show_fps_ = false;
     exact_blend_ = false;
+    any_render_size_ = false;
     fps_overlay_.reset();
 }
 
@@ -390,7 +393,9 @@ HRESULT Presentation::initialize(ID3D11Device* device, HWND window, UINT width, 
 }
 
 HRESULT Presentation::set_render_size(UINT width, UINT height) noexcept {
-    if (!swap_chain_ || !is_supported_display_size({width, height})) return E_INVALIDARG;
+    const DisplaySize size{width, height};
+    if (!swap_chain_ || (any_render_size_ ? !is_valid_display_size(size) : !is_supported_display_size(size)))
+        return E_INVALIDARG;
     if (mode_ == DisplayMode::Windowed) {
         // A user-maximized or minimized window keeps its state; the frame is scaled into it.
         if (!IsIconic(window_) && !IsZoomed(window_)) {

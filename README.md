@@ -90,7 +90,7 @@ exact_blend=0
 
 | Key | Values |
 |---|---|
-| `width`, `height` | 1280×1024, 1600×900, 1920×1080 or 2560×1440. Changing the resolution in the game's options updates the file. |
+| `width`, `height` | 1280×1024, 1600×900, 1920×1080 or 2560×1440. Changing the resolution in the game's options updates the file. `0` (or no key, or no file) means the executable lays out its own screen size: the renderer installs no layout hooks and renders at the size the game requests, from 640×480 to 8192×8192, or at the desktop size. |
 | `mode` | `borderless` (default) or `windowed` |
 | `max_fps` | `0` removes the limit, `10`–`1000` sets one; without the key the game keeps its own limit of 50 |
 | `vsync` | `1` (default) waits for the vertical blank on every frame, so frames are evenly paced and capped at the refresh rate; `0` does not, and only `max_fps` limits the frame rate |

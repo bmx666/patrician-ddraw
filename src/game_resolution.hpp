@@ -22,6 +22,10 @@ constexpr bool fast_forward_map_layout_matches(FastForwardMapLayoutState state,
         state.frame_width == source.width && state.frame_height == source.height;
 }
 
+// True for Patrician III when high_res.ini sets width or height to 0 (or leaves them out): the executable is
+// patched to lay out every screen size itself, so the renderer accepts any valid size the game requests and installs
+// no layout, options or map hooks.
+bool game_owns_layout() noexcept;
 bool install_game_resolution(DisplaySize size, std::string& error);
 bool update_game_resolution(DisplaySize size) noexcept;
 bool refresh_accelerated_map_layout() noexcept;
