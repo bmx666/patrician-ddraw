@@ -75,7 +75,7 @@ To uninstall, restore the original `ddraw_Dll.dll`.
 
 ## Configuration
 
-`high_res.ini` next to the game executable:
+`high_res.ini` next to `ddraw_Dll.dll`:
 
 ```ini
 [display]

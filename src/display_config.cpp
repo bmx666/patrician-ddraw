@@ -1,6 +1,7 @@
 #include "display_config.hpp"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <fstream>
 #include <iterator>
@@ -26,6 +27,19 @@ bool equal_ascii(std::string_view value, std::string_view expected) {
     return true;
 }
 
+// Its address identifies the module this file is linked into.
+const char module_marker = 0;
+
+}
+
+std::filesystem::path sgl::display_config_path() {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&module_marker), &module)) return {};
+    std::array<wchar_t, 32768> path{};
+    const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+    if (!length || length == path.size()) return {};
+    return std::filesystem::path(path.data()).parent_path() / L"high_res.ini";
 }
 
 bool sgl::is_supported_display_size(DisplaySize size) noexcept {
