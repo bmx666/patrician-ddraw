@@ -712,10 +712,11 @@ void SurfaceRenderer::forget(void* id) noexcept {
     surfaces_.erase(found);
 }
 
-HRESULT SurfaceRenderer::open_screen(HWND window, const std::filesystem::path& config, std::string& error) {
+HRESULT SurfaceRenderer::open_screen(HWND window, const std::filesystem::path& config, std::string& error,
+    std::optional<DisplaySize> game_size) {
     HRESULT hr = initialize();
     if (FAILED(hr)) { error = "Cannot initialize D3D11 device"; return hr; }
-    hr = presentation_.initialize_configured(device_.Get(), window, config, error);
+    hr = presentation_.initialize_configured(device_.Get(), window, config, error, game_size);
     readback_sources_.clear();
     readback_window_start_ = 0;
     readback_frames_ = 0;

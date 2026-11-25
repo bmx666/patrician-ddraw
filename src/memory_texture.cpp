@@ -376,7 +376,8 @@ bool is_fast_forward_map(const char* name) noexcept {
 
 bool decode_wide_fast_forward_map(const char* name, sgl::ImageDecoder& decoder,
     sgl::DisplaySize size, bool pixels, sgl::DecodedImage& image) noexcept {
-    if (!is_fast_forward_map(name) || size.width <= 1280) return false;
+    // A patched executable ships its own fast-forward map layout for every size.
+    if (sgl::game_owns_layout() || !is_fast_forward_map(name) || size.width <= 1280) return false;
     try {
         const auto directory = game_directory();
         if (directory.empty()) return false;
@@ -702,6 +703,7 @@ bool is_game_chrome(const std::string& name) noexcept {
 
 bool stage_resolution_textures(sgl::DisplaySize size,
     std::vector<ResolutionTextureReplacement>& replacements) noexcept {
+    if (sgl::game_owns_layout()) return true;
     try {
         const auto has_replacements = std::any_of(textures.begin(), textures.end(), [](const auto& entry) {
             return is_game_chrome(entry.second->name) || is_fast_forward_map(entry.second->name.c_str());
@@ -810,7 +812,8 @@ void commit_resolution_textures(std::vector<ResolutionTextureReplacement>& repla
 }
 
 static bool resize_screen(sgl::DisplaySize size) noexcept {
-    if (!screen || !sgl::is_supported_display_size(size)) return false;
+    if (!screen || (sgl::game_owns_layout() ? !sgl::is_valid_display_size(size) : !sgl::is_supported_display_size(size)))
+        return false;
     auto offscreen = textures.find(screen->offscreen);
     auto display = textures.find(screen->display);
     if (offscreen == textures.end() || display == textures.end()) return false;
@@ -1257,6 +1260,11 @@ extern "C" int __cdecl sgl_InitHardware() {
 
 static void destroy_screen();
 
+// Menu layouts the renderer scales into the render size instead of resizing the screen.
+static bool is_logical_layout_size(std::uint32_t width, std::uint32_t height) noexcept {
+    return (width == 640 && height == 480) || (width == 800 && height == 600);
+}
+
 extern "C" void* __cdecl sgl_InitScreen(HWND window, int fullscreen, const char*, const std::uint32_t* settings) {
     verify_city_scroll_executable();
     patch_city_bottom_band();
@@ -1278,7 +1286,14 @@ extern "C" void* __cdecl sgl_InitScreen(HWND window, int fullscreen, const char*
             return nullptr;
         }
         std::string error;
-        const HRESULT hr = surface_renderer.open_screen(window, config_path, error);
+        // A patched executable requests its own screen size (P2.CFG BREITE/HOEHE); render at that size.
+        std::optional<sgl::DisplaySize> game_size;
+        if (sgl::game_owns_layout()) {
+            game_size = sgl::DisplaySize{};
+            if (settings && !is_logical_layout_size(settings[0], settings[1]))
+                game_size = sgl::DisplaySize{settings[0], settings[1]};
+        }
+        const HRESULT hr = surface_renderer.open_screen(window, config_path, error, game_size);
         if (FAILED(hr)) {
             report_hresult_failure("opening D3D11 screen", error.empty() ? "window or swap chain setup failed" : error.c_str(), hr);
             return nullptr;
@@ -1404,11 +1419,12 @@ extern "C" int __cdecl sgl_SwitchScreenMode(const std::uint32_t* requested_mode)
     // Legacy SGL callers use 16 as a mode tag; presentation and surfaces stay 32-bit.
     if (!requested_mode || (requested_mode[2] != 16 && requested_mode[2] != 32)) return 0;
     auto width = requested_mode[0], height = requested_mode[1];
-    const bool logical_layout = (width == 640 && height == 480) || (width == 800 && height == 600);
+    const bool logical_layout = is_logical_layout_size(width, height);
+    const bool game_layout = sgl::game_owns_layout();
     // Game views always use the resolution chosen in the options or high_res.ini. Some code paths, such as saving
     // with the P3Modding modloader, request the game's own resolution (1280x1024) instead; that would silently
-    // switch the game to it.
-    if (!logical_layout) {
+    // switch the game to it. A patched executable requests its own chosen size, which is used as is.
+    if (!logical_layout && !game_layout) {
         const auto chosen = sgl::current_game_resolution();
         if (sgl::is_supported_display_size(chosen)) {
             width = chosen.width;
@@ -1416,7 +1432,8 @@ extern "C" int __cdecl sgl_SwitchScreenMode(const std::uint32_t* requested_mode)
         }
     }
     const sgl::DisplaySize requested_size{width, height};
-    if (!logical_layout && !sgl::is_supported_display_size(requested_size)) return 0;
+    if (!logical_layout && (game_layout ? !sgl::is_valid_display_size(requested_size) :
+        !sgl::is_supported_display_size(requested_size))) return 0;
     {
         std::lock_guard<TexturesMutex> lock(textures_mutex);
         if (!screen) return 0;

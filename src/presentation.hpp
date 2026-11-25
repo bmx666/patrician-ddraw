@@ -20,7 +20,9 @@ public:
 
     HRESULT initialize(ID3D11Device* device, HWND window, UINT width, UINT height,
         DisplayMode mode = DisplayMode::Borderless) noexcept;
-    HRESULT initialize_configured(ID3D11Device* device, HWND window, const std::filesystem::path& path, std::string& error);
+    // game_size set: the game owns its layout; any valid render size is accepted (see display_config).
+    HRESULT initialize_configured(ID3D11Device* device, HWND window, const std::filesystem::path& path, std::string& error,
+        std::optional<DisplaySize> game_size = std::nullopt);
     HRESULT set_render_size(UINT width, UINT height) noexcept;
     void close() noexcept;
     HRESULT draw(ID3D11DeviceContext* context, Compositor& compositor, ID3D11ShaderResourceView* source,
@@ -62,6 +64,7 @@ private:
     std::optional<unsigned> max_fps_;
     UINT sync_interval_ = 1;
     bool show_fps_ = false;
+    bool any_render_size_ = false;
     FpsOverlay fps_overlay_;
 };
 
