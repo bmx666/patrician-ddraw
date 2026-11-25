@@ -28,6 +28,7 @@ Comparison screenshots with the original `ddraw_Dll.dll` help a lot with drawing
 - Scaling to any screen size with the aspect ratio kept.
 - Adjustable or unlimited frame rate and an optional on-screen frame counter.
 - Works with the GOG and Steam releases and with the P3Modding modloader.
+- Also renders *Patrician II*, and executables patched to lay out their own screen size, at any size they request.
 - Starts under Wine, including macOS with the Game Porting Toolkit.
 
 ## How it works
@@ -53,6 +54,8 @@ This library provides the same exports. The game calls them with the same argume
 | [P3Modding modloader](https://github.com/P3Modding/p3-lib) (`Patrician3_modloader.exe`) | supported; remove the modloader's `high_res.dll` from `mods\` |
 
 All three contain the same game build. The modloader loads every file in `mods\` regardless of its extension, so `high_res.dll` has to be removed, not renamed; it changes the same code as this renderer. Other P3Modding mods work alongside.
+
+The same `ddraw_Dll.dll` also runs *Patrician II* (`Patrician 2.exe`); the game is recognised by its executable. For *Patrician II*, and for executables patched to lay out wide screens themselves, set `width=0` and `height=0` (see below).
 
 ## Installation
 
@@ -110,7 +113,7 @@ ctest --test-dir build -C Release --output-on-failure
 node tests/test-exports.mjs
 ```
 
-`-DSGL_DIAGNOSTICS=ON` builds the debug variant with the renderer counters and `sgl_readbacks.log` behind `show_fps`; the default `OFF` writes no log files.
+`-DSGL_DIAGNOSTICS=ON` builds the debug variant with the renderer counters and `sgl_readbacks.log` behind `show_fps`; the default `OFF` writes no log files. The same DLL serves *Patrician III* and *Patrician II*.
 
 The DLL is written to `build\Release\ddraw_Dll.dll`. For a working installation, copy the contents of `assets\` into the game's `renderer-assets\` folder.
 

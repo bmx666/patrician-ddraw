@@ -7,6 +7,7 @@ endif()
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # Build variant: SGL_DIAGNOSTICS adds the renderer counters to the show_fps overlay and writes sgl_readbacks.log.
+# One DLL serves Patrician III and Patrician II; the game is identified by its executable at run time.
 option(SGL_DIAGNOSTICS "Show renderer counters with show_fps and write sgl_readbacks.log" OFF)
 if(SGL_DIAGNOSTICS)
     add_compile_definitions(SGL_DIAGNOSTICS)

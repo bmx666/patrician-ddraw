@@ -614,16 +614,16 @@ void remove_aim_map_hook() noexcept {
 }
 
 namespace {
-// FUN_004bd180 runs once per frame: if fewer than 20 ms passed since the previous frame it sleeps for the rest,
-// otherwise Sleep(1). The accumulated timeGetTime delta drives game time, so the limit sets the frame rate only.
-// Bytes: cmp ecx, 20 / jae +0x18 / sub eax, esi / add eax, 20.
-constexpr std::size_t frame_limiter_rva = 0xbd1a9;
+// FUN_004bd180 (Patrician II: FUN_004a93c0) runs once per frame: if fewer than 20 ms passed since the previous frame
+// it sleeps for the rest, otherwise Sleep(1). The accumulated timeGetTime delta drives game time, so the limit sets
+// the frame rate only. Bytes: cmp ecx, 20 / jae +0x18 / sub eax, esi / add eax, 20.
+std::size_t frame_limiter_rva() noexcept { return sgl::game::patrician2() ? 0xa93e9 : 0xbd1a9; }
 constexpr std::array<std::uint8_t, 10> frame_limiter_original{0x83, 0xf9, 0x14, 0x73, 0x18, 0x2b, 0xc6, 0x83, 0xc0, 0x14};
 constexpr std::size_t frame_limiter_compare = 2;
 constexpr std::size_t frame_limiter_sleep = 9;
 
 bool write_frame_limit(std::uint8_t* base, std::uint8_t milliseconds) noexcept {
-    auto* const code = base + frame_limiter_rva;
+    auto* const code = base + frame_limiter_rva();
     std::array<std::uint8_t, 10> current{};
     std::memcpy(current.data(), code, current.size());
     current[frame_limiter_compare] = current[frame_limiter_sleep] = frame_limiter_original[frame_limiter_compare];
@@ -639,13 +639,15 @@ bool write_frame_limit(std::uint8_t* base, std::uint8_t milliseconds) noexcept {
 bool sgl::game_binding_active() noexcept { return game_module != nullptr; }
 
 bool sgl::set_game_frame_limit(std::optional<unsigned> max_fps) noexcept {
-    if (!game_module) return true;
+    // Patrician II has no game binding; write_frame_limit checks the limiter bytes of the running executable.
+    auto* const base = sgl::game::patrician2() ? reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr)) : game_module;
+    if (!base) return true;
     std::uint8_t milliseconds = frame_limiter_original[frame_limiter_compare];
     if (max_fps) {
         if (*max_fps != 0 && (*max_fps < 10 || *max_fps > 1000)) return false;
         milliseconds = *max_fps ? static_cast<std::uint8_t>((1000u + *max_fps / 2) / *max_fps) : 0;
     }
-    return write_frame_limit(game_module, milliseconds);
+    return write_frame_limit(base, milliseconds);
 }
 
 bool sgl::game_owns_layout() noexcept {
@@ -749,6 +751,7 @@ bool sgl::install_game_resolution(DisplaySize size, std::string& error) {
 }
 
 bool sgl::update_game_resolution(DisplaySize size) noexcept {
+    // game_owns_layout, not game_owned_layout: Patrician II never installs the binding that sets the latter.
     if (game_owns_layout() ? !is_valid_display_size(size) : !is_supported_display_size(size)) return false;
     if (game_module) {
         game_width = size.width;
