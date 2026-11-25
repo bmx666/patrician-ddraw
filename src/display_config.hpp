@@ -24,6 +24,9 @@ struct DisplayConfig {
     bool show_fps = false;
 };
 
+// high_res.ini in the directory of the module containing this code: the renderer DLL, which normally sits next to the
+// game executable but may also be loaded from a mods directory. Empty when the module path cannot be determined.
+std::filesystem::path display_config_path();
 bool is_supported_display_size(DisplaySize size) noexcept;
 bool display_config(HWND window, const std::filesystem::path& path, DisplayConfig& config, std::string& error);
 bool save_display_config(const std::filesystem::path& path, DisplaySize size, DisplayMode mode, std::string& error);

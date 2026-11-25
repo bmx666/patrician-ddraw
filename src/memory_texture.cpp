@@ -250,7 +250,7 @@ struct Screen {
     void* display = nullptr;
 };
 std::unique_ptr<Screen> screen;
-std::filesystem::path display_config_path;
+std::filesystem::path display_config_file;
 struct ViewState {
     int logical_width = 640;
     int logical_height = 480;
@@ -856,7 +856,7 @@ sgl::DisplayApplyResult sgl::apply_options_display_resolution(std::string& error
                 return DisplayApplyResult::Failed;
             }
         }
-        if (!save_display_config(display_config_path, size, surface_renderer.display_mode(), error)) {
+        if (!save_display_config(display_config_file, size, surface_renderer.display_mode(), error)) {
             try {
                 error = "The resolution changed for this session, but high_res.ini could not be saved: " + error;
             } catch (...) {
@@ -1272,20 +1272,18 @@ extern "C" void* __cdecl sgl_InitScreen(HWND window, int fullscreen, const char*
     const int logical_width = settings ? static_cast<int>(settings[0]) : 640;
     const int logical_height = settings ? static_cast<int>(settings[1]) : 480;
     try {
-        std::array<wchar_t, 32768> path{};
-        const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-        if (!length || length == path.size()) {
-            report_screen_init_failure("locating game executable", "GetModuleFileNameW failed or truncated the path");
+        const auto config_path = sgl::display_config_path();
+        if (config_path.empty()) {
+            report_screen_init_failure("locating high_res.ini", "GetModuleFileNameW failed or truncated the DLL path");
             return nullptr;
         }
         std::string error;
-        const auto config_path = std::filesystem::path(path.data()).parent_path() / L"high_res.ini";
         const HRESULT hr = surface_renderer.open_screen(window, config_path, error);
         if (FAILED(hr)) {
             report_hresult_failure("opening D3D11 screen", error.empty() ? "window or swap chain setup failed" : error.c_str(), hr);
             return nullptr;
         }
-        display_config_path = config_path;
+        display_config_file = config_path;
         const auto size = surface_renderer.screen_size();
         auto offscreen = make_memory_texture(static_cast<std::uint16_t>(size.width), static_cast<std::uint16_t>(size.height), 0);
         auto display = make_memory_texture(static_cast<std::uint16_t>(size.width), static_cast<std::uint16_t>(size.height), 0);
@@ -1446,7 +1444,7 @@ extern "C" void __cdecl sgl_ShotDown() {
     if (aim_library) FreeLibrary(aim_library);
     archive_library = aim_library = nullptr;
     hardware_initialized = false;
-    display_config_path.clear();
+    display_config_file.clear();
 }
 
 extern "C" int __cdecl sgl_SwapBuffer(std::uint32_t flags) {
