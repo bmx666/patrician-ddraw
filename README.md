@@ -36,6 +36,8 @@ For window and frame-rate settings, open `high_res.ini` in the game folder with 
 | Fill the screen with a borderless window (default) | `mode=borderless` |
 | Use a window you can move and resize | `mode=windowed` |
 | Remove the frame-rate limit | `max_fps=0` |
+| Wait for the screen refresh on every frame for even pacing (default) | `vsync=1` |
+| Stop waiting for the screen refresh, so only `max_fps` limits the frame rate | `vsync=0` |
 | Show the frame counter in the top-left corner | `show_fps=1` |
 | Hide the frame counter | `show_fps=0` |
 
