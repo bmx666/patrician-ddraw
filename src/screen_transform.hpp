@@ -3,7 +3,9 @@
 #include "compositor.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 
 namespace sgl {
 
@@ -64,6 +66,21 @@ struct ScreenTransform {
             clamp_pixel(pixel_edge(offset_y + clip.bottom * scale), output_height)
         };
         return result.left < result.right && result.top < result.bottom;
+    }
+
+    // The output pixels outside the mapped logical screen (pillarbox or letterbox bars), by the pixel rule of map_clip,
+    // so the bars and the mapped screen cover the output exactly once. Returns the number of rectangles (0 to 4).
+    std::size_t border_rectangles(std::array<RECT, 4>& result) const noexcept {
+        RECT inner{};
+        if (!map_clip({0, 0, static_cast<LONG>(logical_width), static_cast<LONG>(logical_height)}, inner)) return 0;
+        const LONG width = static_cast<LONG>(output_width);
+        const LONG height = static_cast<LONG>(output_height);
+        std::size_t count = 0;
+        if (inner.top > 0) result[count++] = {0, 0, width, inner.top};
+        if (inner.bottom < height) result[count++] = {0, inner.bottom, width, height};
+        if (inner.left > 0) result[count++] = {0, inner.top, inner.left, inner.bottom};
+        if (inner.right < width) result[count++] = {inner.right, inner.top, width, inner.bottom};
+        return count;
     }
 
     // First pixel whose center lies at or beyond a mapped edge.

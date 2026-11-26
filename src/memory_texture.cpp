@@ -210,9 +210,6 @@ struct Screen {
 };
 std::unique_ptr<Screen> screen;
 std::filesystem::path display_config_path;
-std::unique_ptr<Texture> wide_menu_background;
-std::string wide_menu_background_name;
-std::unordered_set<std::string> unavailable_wide_menu_backgrounds;
 struct ViewState {
     int logical_width = 640;
     int logical_height = 480;
@@ -403,111 +400,6 @@ std::filesystem::path game_directory() {
     return std::filesystem::path(path.data()).parent_path();
 }
 
-std::string wide_menu_background_filename(const std::string& resource_name) {
-    constexpr std::string_view resource_prefix = "images/background/";
-    constexpr std::array<const char*, 11> filenames{
-        "credits.jpg", "ladescreen.jpg", "mehrspielerhaupt.jpg", "mehrspielersammeln.jpg",
-        "mehrspielerspielsuchen.jpg", "optionen.jpg", "spieleinstellungen.jpg", "spielende.jpg",
-        "spielladen.jpg", "spielspeichern.jpg", "tutorial.jpg"
-    };
-
-    std::string normalized;
-    normalized.reserve(resource_name.size());
-    for (const unsigned char character : resource_name) {
-        normalized.push_back(character == '\\' ? '/' : static_cast<char>(std::tolower(character)));
-    }
-    if (normalized.compare(0, resource_prefix.size(), resource_prefix) != 0) return {};
-    const auto filename = normalized.substr(resource_prefix.size());
-    if (filename.find('/') != std::string::npos ||
-        std::none_of(filenames.begin(), filenames.end(), [&filename](const char* known) {
-            return filename == known;
-        })) return {};
-    return filename;
-}
-
-void report_unavailable_wide_menu_background(const std::string& filename, const char* reason) noexcept {
-    try {
-        if (!unavailable_wide_menu_backgrounds.emplace(filename).second) return;
-        char message[512] = {};
-        std::snprintf(message, sizeof(message),
-            "Wide menu background unavailable; using original: %s (%s)\n", filename.c_str(), reason);
-        OutputDebugStringA(message);
-    } catch (...) {
-    }
-}
-
-Texture* load_wide_menu_background(const Texture& original, const std::string& filename) {
-    if (wide_menu_background && wide_menu_background_name == filename) return wide_menu_background.get();
-    if (unavailable_wide_menu_backgrounds.find(filename) != unavailable_wide_menu_backgrounds.end()) return nullptr;
-
-    try {
-        const auto directory = game_directory();
-        if (directory.empty()) {
-            report_unavailable_wide_menu_background(filename, "cannot locate game directory");
-            return nullptr;
-        }
-        const auto asset_path = directory / L"renderer-assets" / L"wqhd-side-fill" / L"images" /
-            L"Background" / std::filesystem::path(filename);
-        std::error_code error;
-        const auto asset_size = std::filesystem::file_size(asset_path, error);
-        constexpr std::uintmax_t maximum_asset_size = 32u * 1024u * 1024u;
-        if (error || asset_size == 0 || asset_size > maximum_asset_size || asset_size > LONG_MAX) {
-            report_unavailable_wide_menu_background(filename, "missing or invalid file size");
-            return nullptr;
-        }
-
-        std::vector<std::uint8_t> encoded(static_cast<std::size_t>(asset_size));
-        std::ifstream input(asset_path, std::ios::binary);
-        if (!input || !input.read(reinterpret_cast<char*>(encoded.data()), static_cast<std::streamsize>(encoded.size())) ||
-            static_cast<std::size_t>(input.gcount()) != encoded.size()) {
-            report_unavailable_wide_menu_background(filename, "cannot read asset");
-            return nullptr;
-        }
-
-        sgl::ImageDecoder decoder;
-        if (FAILED(decoder.initialize(directory / L"AIM.dll"))) {
-            report_unavailable_wide_menu_background(filename, "cannot initialize AIM decoder");
-            return nullptr;
-        }
-        sgl::DecodedImage image;
-        if (FAILED(decoder.decode(filename.c_str(), encoded, image)) ||
-            FAILED(normalize_loaded_image(image)) || image.width != 4268 || image.height != 2400 ||
-            image.format != sgl::ImageFormat::Bgra32 ||
-            image.pitch < static_cast<std::uint64_t>(image.width) * 4 ||
-            static_cast<std::uint64_t>(image.pitch) * image.height > image.pixels.size()) {
-            report_unavailable_wide_menu_background(filename, "unsupported image data or dimensions");
-            return nullptr;
-        }
-
-        auto replacement = std::make_unique<Texture>();
-        replacement->header = original.header;
-        replacement->image = std::move(image);
-        replacement->name = original.name;
-        replacement->key = original.key;
-        replacement->keyed = original.keyed;
-        set_field(*replacement, 0x08, replacement->key);
-        set_field(*replacement, 0x18, replacement->image.pixels.data());
-        set_field(*replacement, 0x1c, replacement->image.palette.empty()
-            ? nullptr : replacement->image.palette.data());
-        set_field(*replacement, 0x20, static_cast<std::uint16_t>(replacement->image.width));
-        set_field(*replacement, 0x22, static_cast<std::uint16_t>(replacement->image.height));
-        set_field(*replacement, 0x24, static_cast<std::uint8_t>(sgl::bytes_per_pixel(replacement->image.format)));
-        set_field(*replacement, 0x25, static_cast<std::uint8_t>(sgl::bytes_per_pixel(replacement->image.format)));
-        set_field(*replacement, 0x28, replacement->image.pitch);
-
-        if (wide_menu_background) surface_renderer.forget(wide_menu_background->header.data());
-        wide_menu_background = std::move(replacement);
-        wide_menu_background_name = filename;
-        return wide_menu_background.get();
-    } catch (const std::bad_alloc&) {
-        report_unavailable_wide_menu_background(filename, "out of memory");
-    } catch (const std::filesystem::filesystem_error&) {
-        report_unavailable_wide_menu_background(filename, "filesystem error");
-    } catch (const std::length_error&) {
-        report_unavailable_wide_menu_background(filename, "invalid asset length");
-    }
-    return nullptr;
-}
 }
 
 namespace water_effect {
@@ -2318,6 +2210,48 @@ extern "C" void __cdecl sgl_DrawLine(int, int, int, int) {
     // The original SGL backend dispatches this export to a `ret 0x10` stub.
 }
 
+// The main menu background, drawn only while no game runs.
+static bool is_main_menu_background(const std::string& name) noexcept {
+    constexpr std::string_view main_menu = "images/options/hauptmenu.jpg";
+    if (name.size() != main_menu.size()) return false;
+    for (std::size_t i = 0; i < name.size(); ++i) {
+        const char character = name[i] == '\\' ? '/' : static_cast<char>(std::tolower(static_cast<unsigned char>(name[i])));
+        if (character != main_menu[i]) return false;
+    }
+    return true;
+}
+
+// The 800x600 menus fill only the middle of the display; the bars beside (or above and below) it keep the last
+// full-size frame. The in-game menus are meant to show the game there, but after a game ended the main menu and the
+// menus opened from it kept its pictures. The main menu therefore clears the bars to black, as they are after startup.
+static void clear_display_border() {
+    if (!screen) return;
+    const auto entry = textures.find(screen->display);
+    if (entry == textures.end()) return;
+    auto& image = entry->second->image;
+    sgl::ScreenTransform transform;
+    if (!make_screen_transform(screen->display, image, transform)) return;
+    std::array<RECT, 4> bars{};
+    const std::size_t count = transform.border_rectangles(bars);
+    static sgl::DecodedImage black = [] {
+        sgl::DecodedImage pixel;
+        pixel.width = pixel.height = 1;
+        pixel.pitch = 4;
+        pixel.format = sgl::ImageFormat::Bgra32;
+        pixel.pixels = {0, 0, 0, 0xff};
+        return pixel;
+    }();
+    for (std::size_t i = 0; i < count; ++i) {
+        const RECT& bar = bars[i];
+        const sgl::Rect target_rect{static_cast<float>(bar.left), static_cast<float>(bar.top),
+            static_cast<float>(bar.right), static_cast<float>(bar.bottom)};
+        const char* failure_stage = nullptr;
+        if (FAILED(surface_renderer.draw(&black, black, screen->display, image, {0, 0, 1, 1}, target_rect, bar,
+            std::nullopt, sgl::BlendMode::Opaque, &failure_stage)))
+            sgl::unimplemented(failure_stage ? failure_stage : "display border clear");
+    }
+}
+
 static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, int dw, int dh,
     bool smooth_menu_text = false) {
     std::lock_guard<TexturesMutex> lock(textures_mutex);
@@ -2347,7 +2281,7 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
         sy = 0;
     }
     if (dw <= 0 || dh <= 0) return;
-    // Full-surface copies (the fast-forward map and the expanded menu background) ignore the clip region, and the
+    // Full-surface copies (the fast-forward map and full-screen backgrounds) ignore the clip region, and the
     // fast-forward overlay maps destinations differently; every other draw outside the clips draws nothing.
     if (!fast_forward_overlay && !(sx == 0 && sy == 0 && width == dw && height == dh && width >= 800) &&
         draw_outside_clip(*target_texture, dx, dy, dw, dh)) return;
@@ -2411,25 +2345,13 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
     else if (!indexed && filtered_mode && stretched && (flags & 0x10) != 0 && dw >= width && dh >= height)
         sampling = sgl::Sampling::SglBilinear;
 
-    Texture* draw_source = &src;
-    bool expanded_menu_background = false;
-    const auto render_size = sgl::DisplaySize{dst.image.width, dst.image.height};
     if (blend_mode == sgl::BlendMode::Opaque && !src.keyed && is_screen_texture(render_destination) &&
-        view_state.logical_width == 800 && view_state.logical_height == 600 &&
-        src.image.width == 800 && src.image.height == 600 &&
-        sx == 0 && sy == 0 && dx == 0 && dy == 0 && width == 800 && height == 600 && dw == 800 && dh == 600 &&
-        sgl::is_supported_display_size(render_size) &&
-        static_cast<std::uint64_t>(render_size.width) * 9 == static_cast<std::uint64_t>(render_size.height) * 16) {
-        const auto filename = wide_menu_background_filename(src.name);
-        if (!filename.empty()) {
-            if (auto* replacement = load_wide_menu_background(src, filename)) {
-                draw_source = replacement;
-                expanded_menu_background = true;
-            }
-        }
-    }
+        sx == 0 && sy == 0 && dx == 0 && dy == 0 && width == dw && height == dh &&
+        width == view_state.logical_width && height == view_state.logical_height &&
+        is_main_menu_background(src.name))
+        clear_display_border();
 
-    if (full_map) { expanded_menu_background = true; fast_forward_overlay = true; }
+    if (full_map) fast_forward_overlay = true;
     else if (fast_forward_overlay && _stricmp(src.name.c_str(), "images/Banner_klein.tga") == 0) fast_forward_overlay = false;
 
     sgl::ScreenTransform destination_transform;
@@ -2439,23 +2361,22 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
     // Logical destination bounds, widened for the rounding of mapped clips.
     const LONG margin = draw_clip_margin(dst.image);
     const RECT logical_bounds{dx - margin, dy - margin, dx + dw + margin, dy + dh + margin};
-    const auto& clips = expanded_menu_background ? full_clip :
+    const auto& clips = full_map ? full_clip :
         cached_draw_clips(dst.image, destination_mapped, destination_transform,
             fast_forward_overlay ? nullptr : &logical_bounds);
     if (clips.empty()) return;
-    sgl::Rect src_rect = expanded_menu_background
-        ? sgl::Rect{0.0f, 0.0f, static_cast<float>(draw_source->image.width),
-            static_cast<float>(draw_source->image.height)}
+    sgl::Rect src_rect = full_map
+        ? sgl::Rect{0.0f, 0.0f, static_cast<float>(src.image.width), static_cast<float>(src.image.height)}
         : sgl::Rect{static_cast<float>(sx), static_cast<float>(sy),
             static_cast<float>(sx) + width, static_cast<float>(sy) + height};
     const sgl::Rect dst_rect{static_cast<float>(dx), static_cast<float>(dy),
         static_cast<float>(dx) + dw, static_cast<float>(dy) + dh};
     sgl::ScreenTransform transform;
-    if (!expanded_menu_background && make_screen_transform(render_source, src.image, transform))
+    if (!full_map && make_screen_transform(render_source, src.image, transform))
         src_rect = transform.map(src_rect);
     auto mapped_destination = dst_rect;
     const bool destination_is_screen = make_screen_transform(render_destination, dst.image, transform);
-    if (expanded_menu_background) {
+    if (full_map) {
         mapped_destination = {0.0f, 0.0f, static_cast<float>(dst.image.width), static_cast<float>(dst.image.height)};
     } else if (destination_is_screen) {
         mapped_destination = transform.map(dst_rect);
@@ -2466,10 +2387,10 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
         const float y = (static_cast<float>(dy) + dh * 0.5f) * dst.image.height / 1024.0f - dh * 0.5f;
         mapped_destination = {x, y, x + dw, y + dh};
     }
-    if (!lock_texture(*draw_source, nullptr, 1, false, LockIntent::GpuResource))
+    if (!lock_texture(src, nullptr, 1, false, LockIntent::GpuResource))
         sgl::unimplemented("sgl_DrawBitmapRect source lock");
-    const auto key = draw_source->keyed && (keyed_copy || (indexed && blend_mode == sgl::BlendMode::Alpha))
-        ? std::optional<std::uint32_t>(draw_source->key) : std::nullopt;
+    const auto key = src.keyed && (keyed_copy || (indexed && blend_mode == sgl::BlendMode::Alpha))
+        ? std::optional<std::uint32_t>(src.key) : std::nullopt;
     const std::uint32_t modulation = blend_mode == sgl::BlendMode::Opaque ? 0xffffffffu : constant_color;
     for (const RECT& clip : clips) {
         if (mapped_destination.left >= static_cast<float>(clip.right) ||
@@ -2477,11 +2398,11 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
             mapped_destination.right <= static_cast<float>(clip.left) ||
             mapped_destination.bottom <= static_cast<float>(clip.top)) continue;
         const char* failure_stage = nullptr;
-        const HRESULT result = surface_renderer.draw(draw_source->header.data(), draw_source->image, render_destination,
+        const HRESULT result = surface_renderer.draw(src.header.data(), src.image, render_destination,
             dst.image, src_rect, mapped_destination, clip, key, blend_mode, &failure_stage,
             modulation, sampling);
         if (FAILED(result)) {
-            unlock_texture(*draw_source);
+            unlock_texture(src);
             char message[256] = {};
             std::snprintf(message, sizeof(message),
                 "sgl_DrawBitmapRect %s hr=0x%08lx src=%.2f,%.2f-%.2f,%.2f dst=%.2f,%.2f-%.2f,%.2f",
@@ -2491,7 +2412,7 @@ static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, i
             sgl::unimplemented(message);
         }
     }
-    unlock_texture(*draw_source);
+    unlock_texture(src);
 }
 
 extern "C" void __cdecl sgl_DrawBitmapRect(int sx, int sy, int dx, int dy, int width, int height) {

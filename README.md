@@ -23,7 +23,7 @@ Comparison screenshots with the original `ddraw_Dll.dll` help a lot with drawing
 ## Features
 
 - Game resolutions 1280×1024, 1600×900, 1920×1080 and 2560×1440, selectable in the in-game options. The city view, top bar and side panels use the full width.
-- Wide fast-forward map and widened menu backgrounds for 16:9.
+- Wide fast-forward map for 16:9.
 - Borderless mode, or a normal window that can be moved, resized and maximized.
 - Scaling to any screen size with the aspect ratio kept.
 - Adjustable or unlimited frame rate and an optional on-screen frame counter.
@@ -37,7 +37,7 @@ This library provides the same exports. The game calls them with the same argume
 
 **Resolutions.** The renderer adjusts the game's resolution handling in memory so the options menu offers the 16:9 sizes and the game lays out its views for them. Before changing anything it checks the original bytes at each place; if another mod has changed them, it leaves the game unpatched and the game stops with its graphics error.
 
-**Scaling.** The game draws at the render size; the finished frame is scaled to the screen or window. A 1920×1080 game fills a 2560×1440 monitor by a factor of 4/3; at equal sizes the image is shown 1:1. Each screen pixel takes the nearest game pixel and only pixels on the edge between two game pixels are blended, so text and lines stay even at non-integer factors. The 800×600 menus are scaled into the render size and centred.
+**Scaling.** The game draws at the render size; the finished frame is scaled to the screen or window. A 1920×1080 game fills a 2560×1440 monitor by a factor of 4/3; at equal sizes the image is shown 1:1. Each screen pixel takes the nearest game pixel and only pixels on the edge between two game pixels are blended, so text and lines stay even at non-integer factors. The 800×600 menus are scaled into the render size and centred; during a game the bars beside them keep showing the game, in the main menu they are black.
 
 **Frame rate.** The game's timing follows the system clock, so the frame limit affects smoothness only. `max_fps` sets a different limit or removes it. In the busiest city views at 2560×1440 the renderer reaches about 180 fps on a current PC; it skips sprites outside the visible area early, batches draws and transfers only changed regions between CPU and GPU.
 
@@ -65,8 +65,9 @@ All three contain the same game build. The modloader loads every file in `mods\`
      high_res.ini
      renderer-assets\
        fast-forward-map\
-       wqhd-side-fill\
    ```
+
+   When updating from 0.2.x, delete the folder `renderer-assets\wqhd-side-fill\`; it is no longer used.
 
 3. Start the game. `Patrician3.exe /nointro` skips the intro videos.
 
@@ -117,4 +118,4 @@ The image check runs when `--names <file>` names a text file with one archive pa
 
 The source code is licensed under the [Apache License 2.0](LICENSE).
 
-The images in `assets\` are derived from the graphics of *Patrician III* and are not covered by that license; the rights of their owners are unaffected. *Patrician III* is a trademark of its respective owners. This project is not affiliated with them.
+The fast-forward maps in `assets\` are derived from the map of *Patrician III* and are not covered by that license; the rights of their owners are unaffected. *Patrician III* is a trademark of its respective owners. This project is not affiliated with them.

@@ -2,6 +2,8 @@
 
 #include <array>
 #include <cmath>
+#include <cstddef>
+#include <vector>
 
 int main() {
     struct Case { unsigned width, height; double scale, x, y; };
@@ -126,5 +128,39 @@ int main() {
         const double mapped = transform.offset_x + edge * transform.scale;
         if (!(first.right - 0.5 < mapped + 1e-9 && first.right + 0.5 >= mapped - 1e-9)) return 28;
     }
+
+    // The border bars and the mapped screen cover every output pixel exactly once: pillarbox (16:9), letterbox (5:4),
+    // a fractional scale (1366x768) and no border at all (same aspect).
+    struct BorderCase { unsigned width, height; std::size_t bars; };
+    const std::array<BorderCase, 6> border_cases = {{
+        {2560, 1440, 2}, {1920, 1080, 2}, {1600, 900, 2}, {1280, 1024, 2}, {1366, 768, 2}, {1600, 1200, 0}
+    }};
+    for (const auto& item : border_cases) {
+        if (!sgl::ScreenTransform::create(800, 600, item.width, item.height, transform)) return 29;
+        std::array<RECT, 4> bars{};
+        const std::size_t count = transform.border_rectangles(bars);
+        if (count != item.bars) return 30;
+        RECT inner{};
+        if (!transform.map_clip({0, 0, 800, 600}, inner)) return 31;
+        std::vector<unsigned char> covered(static_cast<std::size_t>(item.width) * item.height);
+        const auto cover = [&](const RECT& rect) {
+            for (LONG y = rect.top; y < rect.bottom; ++y)
+                for (LONG x = rect.left; x < rect.right; ++x) ++covered[static_cast<std::size_t>(y) * item.width + x];
+        };
+        cover(inner);
+        for (std::size_t i = 0; i < count; ++i) {
+            if (bars[i].left < 0 || bars[i].top < 0 || bars[i].right > static_cast<LONG>(item.width) ||
+                bars[i].bottom > static_cast<LONG>(item.height) || bars[i].left >= bars[i].right ||
+                bars[i].top >= bars[i].bottom) return 32;
+            cover(bars[i]);
+        }
+        for (const unsigned char hits : covered) if (hits != 1) return 33;
+    }
+    if (!sgl::ScreenTransform::create(800, 600, 2560, 1440, transform)) return 34;
+    std::array<RECT, 4> qhd_bars{};
+    if (transform.border_rectangles(qhd_bars) != 2 ||
+        qhd_bars[0].left != 0 || qhd_bars[0].top != 0 || qhd_bars[0].right != 320 || qhd_bars[0].bottom != 1440 ||
+        qhd_bars[1].left != 2240 || qhd_bars[1].top != 0 || qhd_bars[1].right != 2560 || qhd_bars[1].bottom != 1440)
+        return 35;
     return 0;
 }
