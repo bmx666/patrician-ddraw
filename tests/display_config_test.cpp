@@ -45,6 +45,9 @@ int main() {
     if (config.max_fps || config.show_fps) return 22;
     if (!write("[display]\nwidth=1920\nheight=1080\nshow_fps=1\n") ||
         !sgl::display_config(GetDesktopWindow(), path, config, error) || !config.show_fps) return 25;
+    if (!config.exact_blend) return 28;
+    if (!write("[display]\nwidth=1920\nheight=1080\nexact_blend=0\n") ||
+        !sgl::display_config(GetDesktopWindow(), path, config, error) || config.exact_blend) return 29;
     // Unknown keys are skipped; a repeated key takes its last value.
     if (!write("[display]\nwidth=1280\nwidth=1920\nheight=1080\nextra=1\nmode=windowed\nmode=borderless\n"
             "show_fps=1\nshow_fps=0\nmax_fps=60\nmax_fps=144\n") ||

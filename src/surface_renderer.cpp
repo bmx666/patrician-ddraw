@@ -367,7 +367,9 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
         std::min(bound(target_rect.right, 0, width, true), std::clamp<LONG>(clip.right, 0, width)),
         std::min(bound(target_rect.bottom, 0, height, true), std::clamp<LONG>(clip.bottom, 0, height))};
     const bool writes = written.left < written.right && written.top < written.bottom;
-    if (blend != BlendMode::Opaque) {
+    // Only exact blending reads the target through a background copy; hardware blending reads it in place.
+    const bool copies_background = blend != BlendMode::Opaque && exact_blend_;
+    if (copies_background) {
         if (failure_stage) *failure_stage = "alpha background allocation";
         hr = create_background(*dst);
         if (FAILED(hr)) return hr;
@@ -380,19 +382,19 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
         hr = compositor_.prepare(context_.Get(), dst->target.Get(), source_view,
             src->palette_view.Get(), mask_surface->view.Get(), target.width, target.height,
             source_rect, target_rect, clip, std::nullopt, Sampling::SglFixedPoint,
-            dst->background_view.Get(), modulation_color, BlendMode::AlphaMask, failure_stage, &renderer_source,
-            pending.draw);
+            copies_background ? dst->background_view.Get() : nullptr, modulation_color, BlendMode::AlphaMask,
+            failure_stage, &renderer_source, pending.draw);
     } else {
         hr = compositor_.prepare(context_.Get(), dst->target.Get(), source_view,
             source.format == ImageFormat::Indexed8 ? src->palette_view.Get() : nullptr, nullptr,
             target.width, target.height, source_rect, target_rect, clip, key, sampling,
-            blend != BlendMode::Opaque ? dst->background_view.Get() : nullptr,
+            copies_background ? dst->background_view.Get() : nullptr,
             modulation_color, blend, failure_stage, &renderer_source, pending.draw);
     }
     if (FAILED(hr)) return hr;
     ++counters_.draws;
     if (pending.draw.visible) {
-        if (blend != BlendMode::Opaque && writes) {
+        if (copies_background && writes) {
             pending.background = dst->background.Get();
             pending.copy = {static_cast<UINT>(written.left), static_cast<UINT>(written.top), 0,
                 static_cast<UINT>(written.right), static_cast<UINT>(written.bottom), 1};
@@ -460,6 +462,8 @@ void SurfaceRenderer::flush_pending() noexcept {
             const auto& a = pending_[left].draw;
             const auto& b = pending_[right].draw;
             if (a.pixel_shader != b.pixel_shader) return std::less<>()(a.pixel_shader, b.pixel_shader);
+            if (a.blend_state != b.blend_state) return std::less<>()(a.blend_state, b.blend_state);
+            if (a.blend_factor != b.blend_factor) return a.blend_factor < b.blend_factor;
             if (const int order = std::memcmp(a.resources, b.resources, sizeof(a.resources))) return order < 0;
             if (a.clip_in_shader != b.clip_in_shader) return a.clip_in_shader < b.clip_in_shader;
             if (const int order = std::memcmp(&a.clip, &b.clip, sizeof(a.clip))) return order < 0;
@@ -717,6 +721,7 @@ HRESULT SurfaceRenderer::open_screen(HWND window, const std::filesystem::path& c
     HRESULT hr = initialize();
     if (FAILED(hr)) { error = "Cannot initialize D3D11 device"; return hr; }
     hr = presentation_.initialize_configured(device_.Get(), window, config, error, game_size);
+    if (SUCCEEDED(hr)) set_exact_blend(presentation_.exact_blend());
     readback_sources_.clear();
     readback_window_start_ = 0;
     readback_frames_ = 0;
@@ -730,6 +735,13 @@ HRESULT SurfaceRenderer::open_screen(HWND window, const std::filesystem::path& c
         }
     }
     return hr;
+}
+
+void SurfaceRenderer::set_exact_blend(bool exact) noexcept {
+    // Queued draws were prepared for the current mode; blended ones carry either a background copy or a blend state.
+    if (exact == exact_blend_) return;
+    flush_pending();
+    exact_blend_ = exact;
 }
 
 void SurfaceRenderer::set_readback_site(const char* site, std::uintptr_t caller) noexcept {
