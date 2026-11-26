@@ -32,7 +32,6 @@ For window and frame-rate settings, open `high_res.ini` in the game folder with 
 |---|---|
 | Fill the screen with a borderless window (default) | `mode=borderless` |
 | Use a window you can move and resize | `mode=windowed` |
-| Limit the frame rate to 60 FPS | `max_fps=60` |
 | Remove the frame-rate limit | `max_fps=0` |
 | Show the frame counter in the top-left corner | `show_fps=1` |
 | Hide the frame counter | `show_fps=0` |
