@@ -1,11 +1,8 @@
-<h1 align="center">Patrician III Widescreen Renderer</h1>
+# Patrician III Widescreen Renderer
 
-<p align="center">Play in widescreen up to <strong>2560×1440</strong> on Windows.<br>
-For the GOG and Steam editions of <em>Patrician III</em>.</p>
+Play in widescreen up to **2560×1440** on Windows. For the GOG and Steam editions of *Patrician III*.
 
-<p align="center"><strong><a href="https://github.com/onethree7/patrizier3_d3d11/releases">Download the beta</a></strong></p>
-
-<p align="center"><a href="#install">Install</a> &nbsp;·&nbsp; <a href="#settings">Settings</a> &nbsp;·&nbsp; <a href="#update-or-uninstall">Update or uninstall</a> &nbsp;·&nbsp; <a href="#help">Help</a></p>
+**[Download the beta](https://github.com/onethree7/patrizier3_d3d11/releases)** · [Install](#install) · [Settings](#settings) · [Update or uninstall](#update-or-uninstall) · [Help](#help)
 
 ![Gdańsk in Patrician III at 2560×1440](docs/images/gdansk-2560x1440.jpg)
 
