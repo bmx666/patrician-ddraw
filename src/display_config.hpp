@@ -22,6 +22,9 @@ struct DisplayConfig {
     bool vsync = true;
     // [display] show_fps=1 draws frame rate and frame times into the top-left corner.
     bool show_fps = false;
+    // [display] exact_blend: the default 1 blends translucent draws through a copy of the target with the original
+    // integer formulas; 0 uses hardware blend states, at most one step apart, without the copies.
+    bool exact_blend = true;
 };
 
 // high_res.ini in the directory of the module containing this code: the renderer DLL, which normally sits next to the

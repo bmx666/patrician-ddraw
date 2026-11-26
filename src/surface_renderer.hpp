@@ -56,6 +56,10 @@ public:
     // clears it. In diagnostics builds with show_fps, readbacks are summed per site, caller and surface size into
     // sgl_readbacks.log next to high_res.ini every two seconds.
     void set_readback_site(const char* site, std::uintptr_t caller) noexcept;
+    // Exact blending (the default) copies the target under translucent draws and reproduces the original integer
+    // formulas; otherwise hardware blend states combine the draws with the target without the copies. open_screen
+    // applies the [display] exact_blend setting.
+    void set_exact_blend(bool exact) noexcept;
 
 private:
     struct Surface {
@@ -144,6 +148,7 @@ private:
     std::vector<std::uint32_t> layer_cells_;
     UINT layer_grid_columns_ = 0;
     UINT layer_grid_rows_ = 0;
+    bool exact_blend_ = true;
     const char* readback_site_ = nullptr;
     std::uintptr_t readback_caller_ = 0;
     std::filesystem::path readback_log_;

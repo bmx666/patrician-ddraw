@@ -49,6 +49,8 @@ For window and frame-rate settings, open `high_res.ini` in the game folder with 
 | Stop waiting for the screen refresh, so only `max_fps` limits the frame rate | `vsync=0` |
 | Show the frame counter in the top-left corner | `show_fps=1` |
 | Hide the frame counter | `show_fps=0` |
+| Blend translucent images exactly like the original (default) | `exact_blend=1` |
+| Use faster hardware blending, at most one colour step off, for example on Apple Silicon | `exact_blend=0` |
 
 You can set a frame-rate limit between `10` and `1000`. If the `max_fps` line is missing, the game uses its original 50 FPS limit.
 
