@@ -45,7 +45,12 @@ You can set a frame-rate limit between `10` and `1000`. If the `max_fps` line is
 
 **To update**, close the game and extract the new release ZIP into the same game folder. Keep the backup of your original `ddraw_Dll.dll`. If you’ve changed `high_res.ini`, save a copy before extracting so you can reapply your settings.
 
-**If you’re updating from 0.2.x**, you can delete the old `wqhd-side-fill` folder inside `renderer-assets`. Keep `renderer-assets` itself. The renderer still uses its `fast-forward-map` folder.
+<details>
+<summary>Updating from 0.2.x?</summary>
+
+You can delete the old `wqhd-side-fill` folder inside `renderer-assets`. Keep `renderer-assets` itself. The renderer still uses its `fast-forward-map` folder.
+
+</details>
 
 **To uninstall**, close the game and copy your backed-up original `ddraw_Dll.dll` back into the game folder. Allow Windows to replace the renderer’s DLL.
 
