@@ -24,7 +24,7 @@ Comparison screenshots with the original `ddraw_Dll.dll` help a lot with drawing
 
 - Game resolutions 1280×1024, 1600×900, 1920×1080 and 2560×1440, selectable in the in-game options. The city view, top bar and side panels use the full width.
 - Wide fast-forward map for 16:9.
-- Borderless mode, or a normal window that can be moved, resized and maximized.
+- Borderless mode that other windows can be brought in front of, or a normal window that can be moved, resized and maximized.
 - Scaling to any screen size with the aspect ratio kept.
 - Adjustable or unlimited frame rate and an optional on-screen frame counter.
 - Works with the GOG and Steam releases and with the P3Modding modloader.
@@ -39,7 +39,7 @@ This library provides the same exports. The game calls them with the same argume
 
 **Scaling.** The game draws at the render size; the finished frame is scaled to the screen or window. A 1920×1080 game fills a 2560×1440 monitor by a factor of 4/3; at equal sizes the image is shown 1:1. Each screen pixel takes the nearest game pixel and only pixels on the edge between two game pixels are blended, so text and lines stay even at non-integer factors. The 800×600 menus are scaled into the render size and centred; during a game the bars beside them keep showing the game, in the main menu they are black.
 
-**Frame rate.** The game's timing follows the system clock, so the frame limit affects smoothness only. `max_fps` sets a different limit or removes it. In the busiest city views at 2560×1440 the renderer reaches about 180 fps on a current PC; it skips sprites outside the visible area early, batches draws and transfers only changed regions between CPU and GPU.
+**Frame rate.** The game's timing follows the system clock, so the frame limit affects smoothness only. `max_fps` sets a different limit or removes it. At 2560×1440 the renderer reaches about 190 fps in a busy city view and about 85 fps on a Hanse map with thousands of ships on a current PC. It skips sprites outside the visible area early, sorts draws into layers by overlap and issues each layer as instanced calls, runs the city water effect on the GPU and transfers only changed regions between CPU and GPU.
 
 **Accuracy.** Comparison tests run every drawing function over its parameter space with the original library and the replacement and compare the pixels: all blend modes, colour flags and constant colours, stretching, clipping, fills, text, and every image in the game archive. Where the original reads or writes outside its own buffers or has a defect in its pixel loops, the replacement deliberately differs; these cases are listed with the reason in `tests/sweep-accepted.json`.
 
