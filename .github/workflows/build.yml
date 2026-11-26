@@ -1,0 +1,47 @@
+name: build
+
+on:
+  push:
+    branches: ["unified*"]
+  workflow_dispatch:
+
+jobs:
+  ddraw-dll:
+    name: patrician-ddraw ${{ matrix.name }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release
+            diagnostics: OFF
+          - name: debug
+            diagnostics: ON
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (MSVC x86)
+        run: >-
+          cmake -S . -B build -G "Visual Studio 17 2022" -A Win32 -DBUILD_TESTING=OFF
+          -DSGL_DIAGNOSTICS=${{ matrix.diagnostics }}
+
+      - name: Build ddraw_Dll.dll
+        run: cmake --build build --config Release --target PatricianSGL
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $package = "package"
+          New-Item -ItemType Directory -Force "$package/renderer-assets" | Out-Null
+          Copy-Item build/Release/ddraw_Dll.dll $package
+          $ini = "[display]", "width=1920", "height=1080", "mode=borderless", "max_fps=0", "vsync=0", "show_fps=0", "exact_blend=0", "aim_direct=1"
+          [IO.File]::WriteAllText("$PWD/$package/high_res.ini", ($ini -join "`r`n") + "`r`n")
+          Get-ChildItem -Recurse -File $package | Get-FileHash -Algorithm SHA256 | Format-Table -AutoSize
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: patrician-ddraw-${{ matrix.name }}-${{ github.sha }}
+          path: package/
+          if-no-files-found: error
+          retention-days: 1
+
