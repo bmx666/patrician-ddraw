@@ -204,39 +204,8 @@ LRESULT CALLBACK Presentation::window_subclass_proc(HWND window, UINT message, W
     if (!presentation || window != presentation->window_ || presentation->window_change_in_progress_)
         return DefSubclassProc(window, message, wparam, lparam);
 
-    // Both modes: the game requests HWND_TOPMOST with its fullscreen placement, and it would hold the mouse capture for
-    // good; the window stays a normal window that others can cover, and capture lasts only while a button is held.
-    constexpr WPARAM mouse_buttons = MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2;
-    switch (message) {
-    case WM_WINDOWPOSCHANGED:
-        if (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOPMOST) {
-            presentation->window_change_in_progress_ = true;
-            SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-            presentation->window_change_in_progress_ = false;
-        }
-        break;
-    case WM_LBUTTONDOWN:
-    case WM_RBUTTONDOWN:
-    case WM_MBUTTONDOWN:
-    case WM_XBUTTONDOWN:
-    case WM_LBUTTONDBLCLK:
-    case WM_RBUTTONDBLCLK:
-    case WM_MBUTTONDBLCLK:
-    case WM_XBUTTONDBLCLK:
-        // Drags may leave the client (or, borderless, the monitor) and still end in the game.
-        SetCapture(window);
-        break;
-    case WM_LBUTTONUP:
-    case WM_RBUTTONUP:
-    case WM_MBUTTONUP:
-    case WM_XBUTTONUP:
-        if (!(wparam & mouse_buttons) && GetCapture() == window) ReleaseCapture();
-        break;
-    default:
-        break;
-    }
-
     if (presentation->mode_ == DisplayMode::Windowed) {
+        constexpr WPARAM mouse_buttons = MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2;
         switch (message) {
         case WM_STYLECHANGING:
             // The game strips the caption and frame on every mode change.
@@ -244,6 +213,14 @@ LRESULT CALLBACK Presentation::window_subclass_proc(HWND window, UINT message, W
                 auto* style = reinterpret_cast<STYLESTRUCT*>(lparam);
                 style->styleNew = static_cast<DWORD>((static_cast<LONG_PTR>(style->styleNew) & ~windowed_frame_bits) |
                     windowed_frame_style);
+            }
+            break;
+        case WM_WINDOWPOSCHANGED:
+            // The game requests HWND_TOPMOST together with its fullscreen placement; a window should not stay on top.
+            if (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOPMOST) {
+                presentation->window_change_in_progress_ = true;
+                SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+                presentation->window_change_in_progress_ = false;
             }
             break;
         case WM_GETMINMAXINFO:
@@ -264,6 +241,23 @@ LRESULT CALLBACK Presentation::window_subclass_proc(HWND window, UINT message, W
             } else if (!presentation->revealed_cursor_count_) {
                 do ++presentation->revealed_cursor_count_; while (ShowCursor(TRUE) < 0);
             }
+            break;
+        case WM_LBUTTONDOWN:
+        case WM_RBUTTONDOWN:
+        case WM_MBUTTONDOWN:
+        case WM_XBUTTONDOWN:
+        case WM_LBUTTONDBLCLK:
+        case WM_RBUTTONDBLCLK:
+        case WM_MBUTTONDBLCLK:
+        case WM_XBUTTONDBLCLK:
+            // Capture only while a button is held, so drags may leave the client and the frame stays usable.
+            SetCapture(window);
+            break;
+        case WM_LBUTTONUP:
+        case WM_RBUTTONUP:
+        case WM_MBUTTONUP:
+        case WM_XBUTTONUP:
+            if (!(wparam & mouse_buttons) && GetCapture() == window) ReleaseCapture();
             break;
         default:
             break;
@@ -382,9 +376,6 @@ HRESULT Presentation::initialize(ID3D11Device* device, HWND window, UINT width, 
         return E_FAIL;
     }
     window_subclassed_ = true;
-    // The game may already have made the window topmost (see window_subclass_proc).
-    if (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOPMOST)
-        SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
     device_ = device;
     swap_chain_ = chain;
     back_buffer_ = back_buffer;
