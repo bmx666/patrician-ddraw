@@ -742,7 +742,7 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     ComPtr<ID3D11PixelShader> water_pixel_shaders[4];
     ComPtr<ID3D11BlendState> water_blend_state;
     ComPtr<ID3D11Buffer> water_constants;
-    result = D3DCompile(water_shader, sizeof(water_shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(water_shader, sizeof(water_shader) - 1, nullptr, nullptr, nullptr,
         "water_vertex", "vs_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &water_vertex_code, nullptr);
     if (FAILED(result)) return result;
     result = device->CreateVertexShader(water_vertex_code->GetBufferPointer(), water_vertex_code->GetBufferSize(),
@@ -751,7 +751,7 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     constexpr const char* water_entries[4] = {"water_order", "water_start", "water_jump", "water_finish"};
     for (int index = 0; index < 4; ++index) {
         ComPtr<ID3DBlob> code;
-        result = D3DCompile(water_shader, sizeof(water_shader) - 1, nullptr, nullptr, nullptr,
+        result = compile(water_shader, sizeof(water_shader) - 1, nullptr, nullptr, nullptr,
             water_entries[index], "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &code, nullptr);
         if (FAILED(result)) return result;
         result = device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr,
