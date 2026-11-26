@@ -1,101 +1,76 @@
-# Patrician III D3D11 renderer
+# Patrician III Widescreen Renderer
 
-A replacement for `ddraw_Dll.dll`, the graphics library of *Patrician III*, built on Direct3D 11. It runs the game at 16:9 resolutions up to 2560×1440, in a borderless or normal window, without the original frame limit. The game executable is not modified on disk.
+Play *Patrician III* in widescreen at up to **2560×1440**. See more of your city, play in a borderless or resizable window, and go beyond the original 50 FPS limit.
 
-![Gdańsk at 2560×1440 with the frame counter enabled](docs/images/gdansk-2560x1440.jpg)
+\[ **[Download](https://github.com/onethree7/patrizier3_d3d11/releases)** / [Install](#install) / [Settings](#settings) / [Update or uninstall](#update-or-uninstall) / [Help](#help) \]
 
-*Gdańsk at 2560×1440, frame counter enabled.*
+Works with the **GOG and Steam editions** on Windows. The [P3Modding modloader](https://github.com/P3Modding/p3-lib) is also supported and needs one extra step during installation.
 
-> **Beta, work in progress.** The renderer is playable but not finished. Crashes, error messages and drawing errors are expected, especially in game situations that have not been tested yet. Testers and feedback are very welcome.
+**Playable beta.** Some scenes may still show drawing errors or crashes.
 
-## Testing and feedback
+![Gdańsk in Patrician III at 2560×1440 with the frame counter enabled](docs/images/gdansk-2560x1440.jpg)
 
-If the game stops, shows an error message or draws something wrong, please [open an issue](https://github.com/onethree7/patrizier3_d3d11/issues) with:
+*Gdańsk at 2560×1440, with the frame counter enabled.*
 
-- the exact text of the error message (the window title and the message, for example `sgl_DrawBitmapRect unsupported: ...`), or a screenshot of the drawing error;
-- what you were doing in the game when it happened (city view, sea battle, menu, loading a save, ...);
-- your game version (GOG, Steam or modloader), the renderer release and your `high_res.ini`;
-- your graphics card and screen resolution;
-- if possible, the save game that reproduces it.
+## Install
 
-Comparison screenshots with the original `ddraw_Dll.dll` help a lot with drawing errors.
+1. Open the [Releases page](https://github.com/onethree7/patrizier3_d3d11/releases). Under **Assets**, download **`Patrician3-D3D11.zip`**.
+2. Open your *Patrician III* game folder. You have the right folder when you see `Patrician3.exe`.
+3. Copy the original `ddraw_Dll.dll` somewhere safe. You’ll need that copy if you want to uninstall the renderer.
+4. Extract the **contents** of the ZIP into the game folder. Allow Windows to replace `ddraw_Dll.dll`. When you’re done, `high_res.ini` and the `renderer-assets` folder should sit beside `Patrician3.exe`.
+5. **If you use the P3Modding modloader**, move its `high_res.dll` out of the `mods` folder. Renaming the file inside `mods` still lets the modloader load it.
 
-## Features
+**Start the game and choose your resolution in the game options.** The main menu stays centred, so black bars at its sides are normal. Enter a city to see the wider view.
 
-- Game resolutions 1280×1024, 1600×900, 1920×1080 and 2560×1440, selectable in the in-game options. The city view, top bar and side panels use the full width.
-- Wide fast-forward map for 16:9.
-- Borderless mode that other windows can be brought in front of, or a normal window that can be moved, resized and maximized.
-- Scaling to any screen size with the aspect ratio kept.
-- Adjustable or unlimited frame rate and an optional on-screen frame counter.
-- Works with the GOG and Steam releases and with the P3Modding modloader.
+## Settings
 
-## How it works
+**For resolution changes, use the in-game options.** Choose **1280×1024**, **1600×900**, **1920×1080**, or **2560×1440**. The game saves your choice for the next launch.
 
-*Patrician III* (2003) does all of its drawing through `ddraw_Dll.dll`, the "SGL" library: sprites, map tiles, menus, text and clip regions all go through its 180 exports. The original draws on the CPU into DirectDraw surfaces, supports 4:3 and 5:4 modes up to 1280×1024 and limits the game to 50 frames per second.
+For window and frame-rate settings, open `high_res.ini` in the game folder with Notepad. Find the setting you want to change under `[display]`, edit its value, and save the file.
 
-This library provides the same exports. The game calls them with the same arguments as before; the images are kept in GPU textures, drawn with shaders that use the original blending formulas and presented through a DXGI swap chain.
-
-**Resolutions.** The renderer adjusts the game's resolution handling in memory so the options menu offers the 16:9 sizes and the game lays out its views for them. Before changing anything it checks the original bytes at each place; if another mod has changed them, it leaves the game unpatched and the game stops with its graphics error.
-
-**Scaling.** The game draws at the render size; the finished frame is scaled to the screen or window. A 1920×1080 game fills a 2560×1440 monitor by a factor of 4/3; at equal sizes the image is shown 1:1. Each screen pixel takes the nearest game pixel and only pixels on the edge between two game pixels are blended, so text and lines stay even at non-integer factors. The 800×600 menus are scaled into the render size and centred; during a game the bars beside them keep showing the game, in the main menu they are black.
-
-**Frame rate.** The game's timing follows the system clock, so the frame limit affects smoothness only. `max_fps` sets a different limit or removes it. At 2560×1440 the renderer reaches about 190 fps in a busy city view and about 85 fps on a Hanse map with thousands of ships on a current PC. It skips sprites outside the visible area early, sorts draws into layers by overlap and issues each layer as instanced calls, runs the city water effect on the GPU and transfers only changed regions between CPU and GPU.
-
-**Accuracy.** Comparison tests run every drawing function over its parameter space with the original library and the replacement and compare the pixels: all blend modes, colour flags and constant colours, stretching, clipping, fills, text, and every image in the game archive. Where the original reads or writes outside its own buffers or has a defect in its pixel loops, the replacement deliberately differs; these cases are listed with the reason in `tests/sweep-accepted.json`.
-
-## Supported versions
-
-| Version | Status |
+| What you want | What to put in `high_res.ini` |
 |---|---|
-| GOG | supported |
-| Steam | supported |
-| [P3Modding modloader](https://github.com/P3Modding/p3-lib) (`Patrician3_modloader.exe`) | supported; remove the modloader's `high_res.dll` from `mods\` |
+| Fill the screen with a borderless window (default) | `mode=borderless` |
+| Use a window you can move and resize | `mode=windowed` |
+| Limit the frame rate to 60 FPS | `max_fps=60` |
+| Remove the frame-rate limit | `max_fps=0` |
+| Show the frame counter in the top-left corner | `show_fps=1` |
+| Hide the frame counter | `show_fps=0` |
 
-All three contain the same game build. The modloader loads every file in `mods\` regardless of its extension, so `high_res.dll` has to be removed, not renamed; it changes the same code as this renderer. Other P3Modding mods work alongside. (shipyard-details,town-hall-details, debug-nav are incompatible)
+You can set a frame-rate limit between `10` and `1000`. If the `max_fps` line is missing, the game uses its original 50 FPS limit.
 
-## Installation
+## Update or uninstall
 
-1. Back up the game's original `ddraw_Dll.dll`.
-2. Extract the release zip into the game folder, next to `Patrician3.exe`:
+**To update**, close the game and extract the new release ZIP into the same game folder. Keep the backup of your original `ddraw_Dll.dll`. If you’ve changed `high_res.ini`, save a copy before extracting so you can reapply your settings.
 
-   ```text
-   Patrician III\
-     Patrician3.exe
-     ddraw_Dll.dll
-     high_res.ini
-     renderer-assets\
-       fast-forward-map\
-   ```
+**If you’re updating from 0.2.x**, you can delete the old `wqhd-side-fill` folder inside `renderer-assets`. Keep `renderer-assets` itself. The renderer still uses its `fast-forward-map` folder.
 
-   When updating from 0.2.x, delete the folder `renderer-assets\wqhd-side-fill\`; it is no longer used.
+**To uninstall**, close the game and copy your backed-up original `ddraw_Dll.dll` back into the game folder. Allow Windows to replace the renderer’s DLL.
 
-3. Start the game. `Patrician3.exe /nointro` skips the intro videos.
+## Help
 
-To uninstall, restore the original `ddraw_Dll.dll`.
+**The main menu still has black bars. Is widescreen working?**
 
-## Configuration
+The original menus keep their proportions. Choose a widescreen resolution in the game options, then enter a city. The city view, top bar, and side panels use the full width.
 
-`high_res.ini` next to the game executable:
+**I use the P3Modding modloader. Which mods conflict?**
 
-```ini
-[display]
-width=1920
-height=1080
-mode=borderless
-max_fps=0
-show_fps=0
-```
+Move the modloader’s `high_res.dll` out of `mods` before starting the game. The `shipyard-details`, `town-hall-details`, and `debug-nav` mods are also incompatible with this renderer.
 
-| Key | Values |
-|---|---|
-| `width`, `height` | 1280×1024, 1600×900, 1920×1080 or 2560×1440. Changing the resolution in the game's options updates the file. |
-| `mode` | `borderless` (default) or `windowed` |
-| `max_fps` | `0` removes the limit, `10`–`1000` sets one; without the key the game keeps its own limit of 50 |
-| `show_fps` | `1` shows frame rate, frame times, draw calls and transfers in the top-left corner |
+**The game crashed or something looks wrong. How do I report it?**
 
-## Building
+[Open an issue](https://github.com/onethree7/patrizier3_d3d11/issues) and start with what you were doing when it happened. If an error window appeared, include its title and exact message. For a drawing problem, a screenshot is especially helpful.
 
-Requirements: Windows, CMake 3.25 or newer, Visual Studio 2022 with the C++ desktop workload (x86 tools and a Windows SDK), and Node.js for the test scripts. The library is 32-bit, like the game.
+Include your game edition, renderer version, graphics card, screen resolution, and `high_res.ini` if available. Mention whether you use the modloader. If the problem happens every time you load a particular save, attaching it makes the problem easier to reproduce.
+
+## For developers
+
+The renderer replaces `ddraw_Dll.dll`, the game’s graphics library. It exposes the original 180 SGL entry points and draws through Direct3D 11. Widescreen support adjusts the game’s resolution handling in memory. The executable on disk stays unchanged.
+
+<details>
+<summary><strong>Build and run the tests</strong></summary>
+
+You’ll need Windows, Visual Studio 2022 with the C++ desktop workload, x86 tools and a Windows SDK, CMake 3.25 or newer, and Node.js.
 
 ```powershell
 cmake -S . -B build -G "Visual Studio 17 2022" -A Win32
@@ -104,18 +79,18 @@ ctest --test-dir build -C Release --output-on-failure
 node tests/test-exports.mjs
 ```
 
-The DLL is written to `build\Release\ddraw_Dll.dll`. For a working installation, copy the contents of `assets\` into the game's `renderer-assets\` folder.
+The build produces `build\Release\ddraw_Dll.dll`. For a local installation, copy the DLL into the game folder and the contents of `assets\` into `renderer-assets\`.
 
-The unit tests need no game files. The comparison with the original library needs a game folder that contains the original `ddraw_Dll.dll`, `AIM.dll`, `archiver.dll` and `p2arch0_eng.cpr`:
+The unit tests run without game files. To compare rendering against the original library, point the comparison runner at a game folder containing the original `ddraw_Dll.dll`, `AIM.dll`, `archiver.dll`, and `p2arch0_eng.cpr`.
 
 ```powershell
 node tests/run-sweep.mjs build\Release\sgl_sweep_oracle.exe "<game folder>" build\Release\ddraw_Dll.dll
 ```
 
-The image check runs when `--names <file>` names a text file with one archive path per line, for example `images\sidemenu\frohr_pirat01.bmp`.
+</details>
 
 ## License
 
 The source code is licensed under the [Apache License 2.0](LICENSE).
 
-The fast-forward maps in `assets\` are derived from the map of *Patrician III* and are not covered by that license; the rights of their owners are unaffected. *Patrician III* is a trademark of its respective owners. This project is not affiliated with them.
+The fast-forward maps in `assets\` are derived from the *Patrician III* map and are excluded from that license. *Patrician III* is a trademark of its respective owners. This project is independent of them.
