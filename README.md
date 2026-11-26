@@ -1,26 +1,32 @@
-# Patrician III Widescreen Renderer
+<h1 align="center">Patrician III Widescreen Renderer</h1>
 
-Play *Patrician III* in widescreen at up to **2560×1440**. See more of your city, play in a borderless or resizable window, and go beyond the original 50 FPS limit.
+<p align="center">Play in widescreen up to <strong>2560×1440</strong> on Windows.<br>
+For the GOG and Steam editions of <em>Patrician III</em>.</p>
 
-\[ **[Download](https://github.com/onethree7/patrizier3_d3d11/releases)** / [Install](#install) / [Settings](#settings) / [Update or uninstall](#update-or-uninstall) / [Help](#help) \]
+<p align="center"><strong><a href="https://github.com/onethree7/patrizier3_d3d11/releases">Download the beta</a></strong></p>
 
-Works with the **GOG and Steam editions** on Windows. The [P3Modding modloader](https://github.com/P3Modding/p3-lib) is also supported and needs one extra step during installation.
+<p align="center"><a href="#install">Install</a> &nbsp;·&nbsp; <a href="#settings">Settings</a> &nbsp;·&nbsp; <a href="#update-or-uninstall">Update or uninstall</a> &nbsp;·&nbsp; <a href="#help">Help</a></p>
 
-**Playable beta.** Some scenes may still show drawing errors or crashes.
+![Gdańsk in Patrician III at 2560×1440](docs/images/gdansk-2560x1440.jpg)
 
-![Gdańsk in Patrician III at 2560×1440 with the frame counter enabled](docs/images/gdansk-2560x1440.jpg)
-
-*Gdańsk at 2560×1440, with the frame counter enabled.*
+*Gdańsk at 2560×1440.* Play in a borderless or resizable window and go beyond the original 50 FPS limit. Some scenes in this beta may still show drawing errors or crashes.
 
 ## Install
 
-1. Open the [Releases page](https://github.com/onethree7/patrizier3_d3d11/releases). Under **Assets**, download **`Patrician3-D3D11.zip`**.
-2. Open your *Patrician III* game folder. You have the right folder when you see `Patrician3.exe`.
-3. Copy the original `ddraw_Dll.dll` somewhere safe. You’ll need that copy if you want to uninstall the renderer.
-4. Extract the **contents** of the ZIP into the game folder. Allow Windows to replace `ddraw_Dll.dll`. When you’re done, `high_res.ini` and the `renderer-assets` folder should sit beside `Patrician3.exe`.
-5. **If you use the P3Modding modloader**, move its `high_res.dll` out of the `mods` folder. Renaming the file inside `mods` still lets the modloader load it.
+1. **Download the ZIP.** On the [Releases page](https://github.com/onethree7/patrizier3_d3d11/releases), choose `Patrician3-D3D11.zip` under **Assets**.
 
-**Start the game and choose your resolution in the game options.** The main menu stays centred, so black bars at its sides are normal. Enter a city to see the wider view.
+2. **Back up the original.** Open the folder containing `Patrician3.exe` and copy `ddraw_Dll.dll` somewhere safe.
+
+3. **Extract the ZIP** into that game folder and allow Windows to replace the DLL. You should see `high_res.ini` and `renderer-assets` beside `Patrician3.exe`.
+
+<details>
+<summary>Using the P3Modding modloader?</summary>
+
+Before launching, move the modloader’s `high_res.dll` out of the `mods` folder. The modloader still loads the file if you rename it there.
+
+</details>
+
+Start the game and choose your resolution in the game options. The main menu stays centred. Enter a city to see the wider view.
 
 ## Settings
 
