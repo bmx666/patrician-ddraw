@@ -51,7 +51,7 @@ This library provides the same exports. The game calls them with the same argume
 | Steam | supported |
 | [P3Modding modloader](https://github.com/P3Modding/p3-lib) (`Patrician3_modloader.exe`) | supported; remove the modloader's `high_res.dll` from `mods\` |
 
-All three contain the same game build. The modloader loads every file in `mods\` regardless of its extension, so `high_res.dll` has to be removed, not renamed; it changes the same code as this renderer. Other P3Modding mods work alongside.
+All three contain the same game build. The modloader loads every file in `mods\` regardless of its extension, so `high_res.dll` has to be removed, not renamed; it changes the same code as this renderer. Other P3Modding mods work alongside. (shipyard-details,town-hall-details, debug-nav are incompatible)
 
 ## Installation
 
