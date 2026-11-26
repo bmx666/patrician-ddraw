@@ -204,6 +204,14 @@ LRESULT CALLBACK Presentation::window_subclass_proc(HWND window, UINT message, W
     if (!presentation || window != presentation->window_ || presentation->window_change_in_progress_)
         return DefSubclassProc(window, message, wparam, lparam);
 
+    // Both modes: the game requests HWND_TOPMOST with its fullscreen placement; the window stays a normal window that
+    // others can cover.
+    if (message == WM_WINDOWPOSCHANGED && (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOPMOST)) {
+        presentation->window_change_in_progress_ = true;
+        SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        presentation->window_change_in_progress_ = false;
+    }
+
     if (presentation->mode_ == DisplayMode::Windowed) {
         constexpr WPARAM mouse_buttons = MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2;
         switch (message) {
@@ -213,14 +221,6 @@ LRESULT CALLBACK Presentation::window_subclass_proc(HWND window, UINT message, W
                 auto* style = reinterpret_cast<STYLESTRUCT*>(lparam);
                 style->styleNew = static_cast<DWORD>((static_cast<LONG_PTR>(style->styleNew) & ~windowed_frame_bits) |
                     windowed_frame_style);
-            }
-            break;
-        case WM_WINDOWPOSCHANGED:
-            // The game requests HWND_TOPMOST together with its fullscreen placement; a window should not stay on top.
-            if (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOPMOST) {
-                presentation->window_change_in_progress_ = true;
-                SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-                presentation->window_change_in_progress_ = false;
             }
             break;
         case WM_GETMINMAXINFO:
@@ -262,6 +262,11 @@ LRESULT CALLBACK Presentation::window_subclass_proc(HWND window, UINT message, W
         default:
             break;
         }
+    } else if (presentation->mode_ == DisplayMode::Borderless && message == WM_ACTIVATEAPP && !wparam) {
+        // The game keeps its own capture while it is the foreground window (its menu lists need it); another
+        // application taking the foreground gets the mouse back. The game recaptures only once it is in front again
+        // (game_window_binding).
+        if (GetCapture() == window) ReleaseCapture();
     } else if (presentation->mode_ == DisplayMode::Borderless &&
         message == WM_WINDOWPOSCHANGING && lparam) {
         auto* position = reinterpret_cast<WINDOWPOS*>(lparam);
@@ -376,6 +381,9 @@ HRESULT Presentation::initialize(ID3D11Device* device, HWND window, UINT width, 
         return E_FAIL;
     }
     window_subclassed_ = true;
+    // The game may already have made the window topmost (see window_subclass_proc).
+    if (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOPMOST)
+        SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
     device_ = device;
     swap_chain_ = chain;
     back_buffer_ = back_buffer;
