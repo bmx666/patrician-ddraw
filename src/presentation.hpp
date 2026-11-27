@@ -36,6 +36,7 @@ public:
     void set_show_fps(bool show) noexcept { show_fps_ = show; fps_overlay_.reset(); }
     bool show_fps() const noexcept { return show_fps_; }
     bool exact_blend() const noexcept { return exact_blend_; }
+    bool aim_direct() const noexcept { return aim_direct_; }
     const FpsOverlay& fps_overlay() const noexcept { return fps_overlay_; }
 
 private:
@@ -66,6 +67,7 @@ private:
     UINT sync_interval_ = 1;
     bool show_fps_ = false;
     bool exact_blend_ = true;
+    bool aim_direct_ = true;
     bool any_render_size_ = false;
     FpsOverlay fps_overlay_;
 };

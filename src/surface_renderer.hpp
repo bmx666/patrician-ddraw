@@ -51,6 +51,8 @@ public:
     DisplaySize output_size() const noexcept;
     DisplayMode display_mode() const noexcept;
     std::optional<unsigned> max_fps() const noexcept;
+    // [display] aim_direct of the last open_screen (true before any).
+    bool aim_direct() const noexcept { return presentation_.aim_direct(); }
     HRESULT present(void* id, const DecodedImage& image) noexcept;
     // Names the SGL export and the game address that called it for the readbacks made until the next call; null
     // clears it. In diagnostics builds with show_fps, readbacks are summed per site, caller and surface size into

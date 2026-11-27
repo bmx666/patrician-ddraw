@@ -10,6 +10,9 @@
 namespace sgl {
 
 bool image_decoder_active() noexcept;
+// [display] aim_direct of high_res.ini: false makes every decoder take the AIM_CONVERT_MEMFILE path even when AIM.dll
+// exports AIM_DECODE_DIRECT. Applies to decoders created afterwards and to calls of existing ones.
+void set_aim_direct(bool enabled) noexcept;
 
 enum class ImageFormat { Bgra32, Indexed8, Bgr24 };
 

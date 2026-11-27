@@ -25,6 +25,9 @@ struct DisplayConfig {
     // [display] exact_blend: the default 1 blends translucent draws through a copy of the target with the original
     // integer formulas; 0 uses hardware blend states, at most one step apart, without the copies.
     bool exact_blend = true;
+    // [display] aim_direct: the default 1 decodes pictures through AIM_DECODE_DIRECT when AIM.dll exports it (the
+    // patrician-mods replacement); 0 keeps the original AIM_CONVERT_MEMFILE path, to compare the two or to fall back.
+    bool aim_direct = true;
 };
 
 // high_res.ini in the directory of the module containing this code: the renderer DLL, which normally sits next to the

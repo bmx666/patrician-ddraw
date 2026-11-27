@@ -186,6 +186,7 @@ HRESULT Presentation::initialize_configured(ID3D11Device* device, HWND window, c
         sync_interval_ = config.vsync ? 1 : 0;
         set_show_fps(config.show_fps);
         exact_blend_ = config.exact_blend;
+        aim_direct_ = config.aim_direct;
         any_render_size_ = game_size.has_value();
     }
     if (FAILED(hr)) {
@@ -306,6 +307,7 @@ void Presentation::close() noexcept {
     sync_interval_ = 1;
     show_fps_ = false;
     exact_blend_ = true;
+    aim_direct_ = true;
     any_render_size_ = false;
     fps_overlay_.reset();
 }

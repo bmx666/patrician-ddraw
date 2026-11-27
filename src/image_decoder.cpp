@@ -1,6 +1,7 @@
 #include "image_decoder.hpp"
 
 #include <array>
+#include <atomic>
 #include <climits>
 #include <cstdint>
 #include <mutex>
@@ -11,11 +12,14 @@
 namespace {
 std::mutex aim_mutex;
 thread_local bool decoder_active = false;
+std::atomic<bool> aim_direct{true};
 }
 
 namespace sgl {
 
 bool image_decoder_active() noexcept { return decoder_active; }
+
+void set_aim_direct(bool enabled) noexcept { aim_direct.store(enabled, std::memory_order_relaxed); }
 
 ImageDecoder::~ImageDecoder() {
     if (library_) FreeLibrary(library_);
@@ -108,7 +112,7 @@ HRESULT ImageDecoder::inspect(const char* name, std::vector<std::uint8_t>& encod
 
 HRESULT ImageDecoder::process(const char* name, std::vector<std::uint8_t>& encoded, DecodedImage& output, bool pixels) noexcept {
     if (!library_ || !name || !*name || encoded.empty() || encoded.size() > LONG_MAX) return E_INVALIDARG;
-    if (direct_) return process_direct(name, encoded, output, pixels);
+    if (direct_ && aim_direct.load(std::memory_order_relaxed)) return process_direct(name, encoded, output, pixels);
     std::lock_guard<std::mutex> lock(aim_mutex);
     std::array<std::uint32_t, 23> image = {};
     initialize_(image.data());

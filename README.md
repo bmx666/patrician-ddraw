@@ -51,6 +51,8 @@ For window and frame-rate settings, open `high_res.ini` in the game folder with 
 | Hide the frame counter | `show_fps=0` |
 | Blend translucent images exactly like the original (default) | `exact_blend=1` |
 | Use faster hardware blending, at most one colour step off, for example on Apple Silicon | `exact_blend=0` |
+| Decode pictures in one call with the patrician-mods `AIM.dll` (default) | `aim_direct=1` |
+| Decode pictures through the original `AIM.dll` calls, also with the patrician-mods `AIM.dll` | `aim_direct=0` |
 
 You can set a frame-rate limit between `10` and `1000`. If the `max_fps` line is missing, the game uses its original 50 FPS limit.
 
@@ -87,7 +89,7 @@ Include your game edition, renderer version, graphics card, screen resolution, a
 
 The renderer replaces `ddraw_Dll.dll`, the game’s graphics library. It exposes the original 180 SGL entry points and draws through Direct3D 11. Widescreen support adjusts the game’s resolution handling in memory. The executable on disk stays unchanged.
 
-The renderer also works with the `AIM.dll` replacement of [patrician-mods](https://github.com/bmx666/patrician-mods), which adds two exports that the renderer looks up at load time. With `AIM_DECODE_DIRECT`, pictures are decoded straight into the renderer’s upload layout, 8-bit palette or 32-bit BGRA, in a single call. With `AIM_HOOK_MEMFILE_DECODER`, the renderer swaps in the wide fast-forward map without patching the original library’s code. With the original `AIM.dll`, the renderer keeps its old path.
+The renderer also works with the `AIM.dll` replacement of [patrician-mods](https://github.com/bmx666/patrician-mods), which adds two exports that the renderer looks up at load time. With `AIM_DECODE_DIRECT`, pictures are decoded straight into the renderer’s upload layout, 8-bit palette or 32-bit BGRA, in a single call. With `AIM_HOOK_MEMFILE_DECODER`, the renderer swaps in the wide fast-forward map without patching the original library’s code. With the original `AIM.dll`, the renderer keeps its old path. Set `aim_direct=0` in `high_res.ini` to take the old path with the patrician-mods `AIM.dll` too, for example to compare loading times.
 
 <details>
 <summary><strong>Build and run the tests</strong></summary>

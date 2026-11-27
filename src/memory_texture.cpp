@@ -1307,6 +1307,8 @@ extern "C" void* __cdecl sgl_InitScreen(HWND window, int fullscreen, const char*
             return nullptr;
         }
         display_config_file = config_path;
+        // Pictures loaded before the first sgl_InitScreen keep the default, AIM_DECODE_DIRECT when exported.
+        sgl::set_aim_direct(surface_renderer.aim_direct());
         const auto size = surface_renderer.screen_size();
         auto offscreen = make_memory_texture(static_cast<std::uint16_t>(size.width), static_cast<std::uint16_t>(size.height), 0);
         auto display = make_memory_texture(static_cast<std::uint16_t>(size.width), static_cast<std::uint16_t>(size.height), 0);
