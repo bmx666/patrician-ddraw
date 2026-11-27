@@ -2,6 +2,7 @@
 
 #include <array>
 #include <climits>
+#include <cstdint>
 #include <mutex>
 #include <new>
 #include <stdexcept>
@@ -39,7 +40,62 @@ HRESULT ImageDecoder::initialize(const std::filesystem::path& library_path) noex
     inspect_ = inspect;
     release_ = release;
     convert_ = convert;
+    // Optional: only the patrician-mods AIM.dll has it.
+    direct_ = reinterpret_cast<decltype(direct_)>(GetProcAddress(library, "AIM_DECODE_DIRECT"));
     return S_OK;
+}
+
+namespace {
+struct DirectAllocation {
+    std::vector<std::uint8_t>* pixels;
+    bool failed;
+};
+
+std::uint8_t* __cdecl allocate_direct(void* context, std::uint32_t bytes) noexcept {
+    auto& allocation = *static_cast<DirectAllocation*>(context);
+    try {
+        allocation.pixels->resize(bytes);
+        return allocation.pixels->data();
+    } catch (...) {
+        allocation.failed = true;
+        return nullptr;
+    }
+}
+}
+
+HRESULT ImageDecoder::process_direct(const char* name, const std::vector<std::uint8_t>& encoded, DecodedImage& output,
+    bool pixels) noexcept {
+    std::lock_guard<std::mutex> lock(aim_mutex);
+    try {
+        DecodedImage decoded;
+        std::array<std::uint8_t, 1024> palette{};
+        DirectImage image{0, 0, 0, 0, palette.data()};
+        DirectAllocation allocation{&decoded.pixels, false};
+        decoder_active = true;
+        const int result = direct_(name, encoded.data(), static_cast<std::int32_t>(encoded.size()), pixels ? 1 : 0,
+            &image, &allocate_direct, &allocation);
+        decoder_active = false;
+        last_layout_ = {image.format == 1 ? 1u : 4u, image.format, image.pitch};
+        if (result < 0 || allocation.failed) return E_OUTOFMEMORY;
+        if (result == 0) return E_FAIL;
+        const bool indexed = image.format == 1;
+        if ((!indexed && image.format != 4) || !image.width || !image.height || image.width > 65535 ||
+            image.height > 65535 || image.pitch != (indexed ? (image.width + 3u) & ~3u : image.width * 4u) ||
+            (pixels && decoded.pixels.size() < static_cast<std::size_t>(image.pitch) * image.height)) return E_NOTIMPL;
+        decoded.width = image.width;
+        decoded.height = image.height;
+        decoded.pitch = image.pitch;
+        decoded.format = indexed ? ImageFormat::Indexed8 : ImageFormat::Bgra32;
+        if (pixels && indexed) decoded.palette.assign(palette.begin(), palette.end());
+        output = std::move(decoded);
+        return S_OK;
+    } catch (const std::bad_alloc&) {
+        decoder_active = false;
+        return E_OUTOFMEMORY;
+    } catch (const std::length_error&) {
+        decoder_active = false;
+        return E_OUTOFMEMORY;
+    }
 }
 
 HRESULT ImageDecoder::decode(const char* name, std::vector<std::uint8_t>& encoded, DecodedImage& output) noexcept {
@@ -52,6 +108,7 @@ HRESULT ImageDecoder::inspect(const char* name, std::vector<std::uint8_t>& encod
 
 HRESULT ImageDecoder::process(const char* name, std::vector<std::uint8_t>& encoded, DecodedImage& output, bool pixels) noexcept {
     if (!library_ || !name || !*name || encoded.empty() || encoded.size() > LONG_MAX) return E_INVALIDARG;
+    if (direct_) return process_direct(name, encoded, output, pixels);
     std::lock_guard<std::mutex> lock(aim_mutex);
     std::array<std::uint32_t, 23> image = {};
     initialize_(image.data());

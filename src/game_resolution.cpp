@@ -29,6 +29,11 @@ sgl::DisplaySize accelerated_map_layout_size{};
 HMODULE aim_map_module = nullptr;
 std::uint8_t* original_aim_map_decoder = nullptr;
 bool aim_map_hook_installed = false;
+// AIM_HOOK_MEMFILE_DECODER of the patrician-mods AIM.dll: swaps the decoder that AIM_CONVERT_MEMFILE calls and returns
+// the previous one, in place of the patch of the call at aim_map_decode_call_rva in the original.
+using HookMemfileDecoder = void* (__cdecl*)(void* decoder);
+constexpr char aim_hook_export[] = "AIM_HOOK_MEMFILE_DECODER";
+HookMemfileDecoder aim_map_hook_export = nullptr;
 std::array<std::vector<std::uint8_t>, 4> accelerated_map_assets;
 void* after_options = nullptr;
 void* before_scene = nullptr;
@@ -525,7 +530,21 @@ bool load_accelerated_map_assets(const std::filesystem::path& executable, std::s
 
 bool install_aim_map_hook(const std::filesystem::path& executable, std::string& error) {
     const auto module = GetModuleHandleW(L"AIM.dll");
-    if (!module) { error = "Fast-forward map requires the original AIM.dll to be loaded"; return false; }
+    if (!module) { error = "Fast-forward map requires AIM.dll to be loaded"; return false; }
+    if (const auto hook = reinterpret_cast<HookMemfileDecoder>(GetProcAddress(module, aim_hook_export))) {
+        if (!load_accelerated_map_assets(executable, error)) return false;
+        original_aim_map_decoder = static_cast<std::uint8_t*>(hook(reinterpret_cast<void*>(&decode_accelerated_map)));
+        if (!original_aim_map_decoder) {
+            hook(nullptr);
+            accelerated_map_assets = {};
+            error = "Fast-forward map: AIM_HOOK_MEMFILE_DECODER returned no decoder";
+            return false;
+        }
+        aim_map_hook_export = hook;
+        aim_map_module = module;
+        aim_map_hook_installed = true;
+        return true;
+    }
     std::array<wchar_t, 32768> module_path{};
     const auto path_length = GetModuleFileNameW(module, module_path.data(), static_cast<DWORD>(module_path.size()));
     if (!path_length || path_length == module_path.size()) {
@@ -596,7 +615,9 @@ bool install_aim_map_hook(const std::filesystem::path& executable, std::string& 
 }
 
 void remove_aim_map_hook() noexcept {
-    if (aim_map_hook_installed && aim_map_module) {
+    if (aim_map_hook_installed && aim_map_hook_export) {
+        aim_map_hook_export(original_aim_map_decoder);
+    } else if (aim_map_hook_installed && aim_map_module) {
         auto* const call_site = reinterpret_cast<std::uint8_t*>(aim_map_module) + aim_map_decode_call_rva;
         DWORD protection = 0, discarded = 0;
         if (!VirtualProtect(call_site, aim_map_decode_call_original.size(), PAGE_EXECUTE_READWRITE, &protection))
@@ -607,6 +628,7 @@ void remove_aim_map_hook() noexcept {
             sgl::unimplemented("fast-forward map: cannot finalize restored AIM.dll decoder call");
     }
     aim_map_hook_installed = false;
+    aim_map_hook_export = nullptr;
     aim_map_module = nullptr;
     original_aim_map_decoder = nullptr;
     accelerated_map_assets = {};
@@ -707,7 +729,8 @@ bool sgl::install_game_resolution(DisplaySize size, std::string& error) {
     const bool accelerated_map_available = install_aim_map_hook(executable, accelerated_map_error);
     if (!accelerated_map_available) {
         const auto aim_module = GetModuleHandleW(L"AIM.dll");
-        if (aim_module && std::memcmp(
+        // The export swaps a function pointer and never leaves a half-made patch behind.
+        if (aim_module && !GetProcAddress(aim_module, aim_hook_export) && std::memcmp(
             reinterpret_cast<std::uint8_t*>(aim_module) + aim_map_decode_call_rva,
             aim_map_decode_call_original.data(), aim_map_decode_call_original.size()) != 0) {
             error = "Fast-forward map hook could not be installed or safely restored: " + accelerated_map_error;

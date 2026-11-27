@@ -87,6 +87,8 @@ Include your game edition, renderer version, graphics card, screen resolution, a
 
 The renderer replaces `ddraw_Dll.dll`, the game’s graphics library. It exposes the original 180 SGL entry points and draws through Direct3D 11. Widescreen support adjusts the game’s resolution handling in memory. The executable on disk stays unchanged.
 
+The renderer also works with the `AIM.dll` replacement of [patrician-mods](https://github.com/bmx666/patrician-mods), which adds two exports that the renderer looks up at load time. With `AIM_DECODE_DIRECT`, pictures are decoded straight into the renderer’s upload layout, 8-bit palette or 32-bit BGRA, in a single call. With `AIM_HOOK_MEMFILE_DECODER`, the renderer swaps in the wide fast-forward map without patching the original library’s code. With the original `AIM.dll`, the renderer keeps its old path.
+
 <details>
 <summary><strong>Build and run the tests</strong></summary>
 

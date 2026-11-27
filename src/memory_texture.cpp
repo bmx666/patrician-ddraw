@@ -398,11 +398,13 @@ bool decode_wide_fast_forward_map(const char* name, sgl::ImageDecoder& decoder,
             static_cast<std::size_t>(input.gcount()) != encoded.size()) return false;
 
         const auto result = pixels ? decoder.decode(name, encoded, image) : decoder.inspect(name, encoded, image);
-        const auto expected_format = wqhd ? (pixels ? sgl::ImageFormat::Bgr24 : sgl::ImageFormat::Bgra32) : sgl::ImageFormat::Indexed8;
+        // The 2560 map is a 24-bit BMP: the original AIM.dll returns its pixels as BGR, AIM_DECODE_DIRECT as BGRA.
+        const bool expected_format = wqhd ? image.format == sgl::ImageFormat::Bgra32 ||
+            (pixels && image.format == sgl::ImageFormat::Bgr24) : image.format == sgl::ImageFormat::Indexed8;
         const auto source_width = size.width;
         const auto source_height = size.height;
         if (FAILED(result) || image.width != source_width || image.height != source_height ||
-            image.format != expected_format ||
+            !expected_format ||
             (!image.palette.empty() && image.palette.size() != 1024)) return false;
 
         const auto pixel_size = sgl::bytes_per_pixel(image.format);
