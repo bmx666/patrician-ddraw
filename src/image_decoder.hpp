@@ -46,6 +46,8 @@ public:
     HRESULT decode(const char* name, std::vector<std::uint8_t>& encoded, DecodedImage& output) noexcept;
     // AIM's pixel layout fields (bytes per pixel, format and pitch) of the last image, for failure messages.
     const std::array<std::uint32_t, 3>& last_layout() const noexcept { return last_layout_; }
+    // Whether decode and inspect take AIM_DECODE_DIRECT now: exported by AIM.dll and not turned off by aim_direct=0.
+    bool direct_path() const noexcept;
 
 private:
     HRESULT process(const char* name, std::vector<std::uint8_t>& encoded, DecodedImage& output, bool pixels) noexcept;

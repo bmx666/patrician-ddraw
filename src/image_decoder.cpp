@@ -110,9 +110,13 @@ HRESULT ImageDecoder::inspect(const char* name, std::vector<std::uint8_t>& encod
     return process(name, encoded, output, false);
 }
 
+bool ImageDecoder::direct_path() const noexcept {
+    return direct_ && aim_direct.load(std::memory_order_relaxed);
+}
+
 HRESULT ImageDecoder::process(const char* name, std::vector<std::uint8_t>& encoded, DecodedImage& output, bool pixels) noexcept {
     if (!library_ || !name || !*name || encoded.empty() || encoded.size() > LONG_MAX) return E_INVALIDARG;
-    if (direct_ && aim_direct.load(std::memory_order_relaxed)) return process_direct(name, encoded, output, pixels);
+    if (direct_path()) return process_direct(name, encoded, output, pixels);
     std::lock_guard<std::mutex> lock(aim_mutex);
     std::array<std::uint32_t, 23> image = {};
     initialize_(image.data());

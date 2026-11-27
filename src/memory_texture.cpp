@@ -446,6 +446,98 @@ std::filesystem::path game_directory() {
     return std::filesystem::path(path.data()).parent_path();
 }
 
+// SGL_DIAGNOSTICS builds write sgl_textures.log next to high_res.ini: one line per picture that sgl_LoadMemoryTexture
+// decodes or inspects and per deferred decode in sgl_LockTexture, with the AIM path and the time of each step, to
+// compare aim_direct=1 with aim_direct=0. The first line of the process starts the file fresh; sgl_InitScreen and
+// sgl_ShotDown add running totals. Other builds write nothing and read no clock.
+namespace texture_log {
+long long ticks() noexcept {
+    if constexpr (sgl::build::diagnostics) {
+        LARGE_INTEGER counter;
+        QueryPerformanceCounter(&counter);
+        return counter.QuadPart;
+    } else {
+        return 0;
+    }
+}
+double milliseconds(long long elapsed) noexcept {
+    static const long long frequency = [] {
+        LARGE_INTEGER value;
+        QueryPerformanceFrequency(&value);
+        return value.QuadPart;
+    }();
+    return static_cast<double>(elapsed) * 1000.0 / static_cast<double>(frequency);
+}
+std::mutex log_mutex;
+bool started = false;
+long long start = 0;
+unsigned pictures = 0;
+long long init_total = 0;
+long long read_total = 0;
+long long decode_total = 0;
+// Appends text, creating the file on the first call of the process. Called with log_mutex held.
+void append(const char* text) noexcept {
+    std::FILE* log = nullptr;
+    try {
+        const auto config = sgl::display_config_path();
+        if (config.empty()) return;
+        if (_wfopen_s(&log, (config.parent_path() / L"sgl_textures.log").c_str(), started ? L"a" : L"w") || !log)
+            return;
+    } catch (...) {
+        return;
+    }
+    std::fputs(text, log);
+    std::fclose(log);
+}
+// Called with log_mutex held: the header on the first line of the process, timed from the start of its picture.
+void begin(long long first) noexcept {
+    if (started) return;
+    start = first;
+    append("# time: ms since the first picture; site: load (sgl_LoadMemoryTexture) or lock (deferred decode in\n"
+        "# sgl_LockTexture); path: direct (AIM_DECODE_DIRECT), memfile (AIM_CONVERT_MEMFILE) or widemap (mods map);\n"
+        "# init: archiver.dll and AIM.dll setup; read: archive read; decode: AIM call with its input copy; sum: all decodes\n"
+        "#    time ms site path    op           KiB  width x height  init ms  read ms decode ms     sum ms  name\n");
+    started = true;
+}
+// site, path: see the header. init, read and decode are QueryPerformanceCounter ticks.
+void record(const char* site, const char* path, bool pixels, const char* name, std::size_t bytes,
+    const sgl::DecodedImage& image, long long init, long long read, long long decode, HRESULT result) noexcept {
+    if constexpr (sgl::build::diagnostics) {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        const long long now = ticks();
+        begin(now - init - read - decode);
+        ++pictures;
+        init_total += init;
+        read_total += read;
+        decode_total += decode;
+        char failure[32] = "";
+        if (FAILED(result)) std::snprintf(failure, sizeof(failure), " FAILED hr=0x%08lx", static_cast<unsigned long>(result));
+        char line[768];
+        std::snprintf(line, sizeof(line), "%10.1f %-4s %-7s %-7s %9.1f %6u x %-6u %8.3f %8.3f %9.3f %10.1f  %s%s\n",
+            milliseconds(now - start), site, path, pixels ? "decode" : "inspect", static_cast<double>(bytes) / 1024.0,
+            image.width, image.height, milliseconds(init), milliseconds(read), milliseconds(decode),
+            milliseconds(decode_total), name, failure);
+        append(line);
+    }
+}
+// A line with the running totals, at sgl_InitScreen and sgl_ShotDown.
+void mark(const char* event) noexcept {
+    if constexpr (sgl::build::diagnostics) {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        const long long now = ticks();
+        begin(now);
+        char line[256];
+        std::snprintf(line, sizeof(line),
+            "---------- %s at %.1f ms: %u pictures, init %.1f ms, read %.1f ms, decode %.1f ms\n", event,
+            milliseconds(now - start), pictures, milliseconds(init_total), milliseconds(read_total),
+            milliseconds(decode_total));
+        append(line);
+    } else {
+        static_cast<void>(event);
+    }
+}
+}
+
 }
 
 namespace water_effect {
@@ -456,6 +548,7 @@ void remove() noexcept;
 extern "C" void* __cdecl sgl_LoadMemoryTexture(const char* name, std::uint32_t flags) {
     if (!name || !*name) return nullptr;
     try {
+        const long long init_start = texture_log::ticks();
         const auto directory = game_directory();
         if (directory.empty()) sgl::unimplemented("sgl_LoadMemoryTexture archiver");
         sgl::ArchiveReader archive;
@@ -465,7 +558,9 @@ extern "C" void* __cdecl sgl_LoadMemoryTexture(const char* name, std::uint32_t f
         }
         auto texture = std::make_unique<Texture>();
         void* archive_handle = sgl::active_archive();
+        const long long read_start = texture_log::ticks();
         if (FAILED(archive.read(archive_handle, name, texture->encoded))) return nullptr;
+        const long long decode_start = texture_log::ticks();
         texture->name = name;
         const bool load_pixels = (flags & 0x00010040u) != 0;
         const bool replaced_map = decode_wide_fast_forward_map(name, decoder,
@@ -477,6 +572,9 @@ extern "C" void* __cdecl sgl_LoadMemoryTexture(const char* name, std::uint32_t f
             result = load_pixels ? decoder.decode(name, decoder_input, texture->image)
                 : decoder.inspect(name, decoder_input, texture->image);
         }
+        texture_log::record("load", replaced_map ? "widemap" : decoder.direct_path() ? "direct" : "memfile", load_pixels,
+            name, texture->encoded.size(), texture->image, read_start - init_start, decode_start - read_start,
+            texture_log::ticks() - decode_start, result);
         if (FAILED(result)) {
             char message[512];
             std::snprintf(message, sizeof(message),
@@ -588,8 +686,10 @@ static int lock_texture(Texture& texture, LockOutput* output, int flags, bool ex
         try {
             const auto directory = game_directory();
             if (directory.empty()) sgl::unimplemented("sgl_LockTexture archiver");
+            const long long init_start = texture_log::ticks();
             sgl::ImageDecoder decoder;
             if (FAILED(decoder.initialize(directory / L"AIM.dll"))) sgl::unimplemented("sgl_LockTexture dependencies");
+            const long long decode_start = texture_log::ticks();
             sgl::DecodedImage decoded;
             const bool replaced_map = decode_wide_fast_forward_map(texture.name.c_str(), decoder,
                 sgl::current_game_resolution(), true, decoded);
@@ -599,6 +699,9 @@ static int lock_texture(Texture& texture, LockOutput* output, int flags, bool ex
                 auto decoder_input = texture.encoded;
                 result = decoder.decode(texture.name.c_str(), decoder_input, decoded);
             }
+            texture_log::record("lock", replaced_map ? "widemap" : decoder.direct_path() ? "direct" : "memfile", true,
+                texture.name.c_str(), texture.encoded.size(), decoded, decode_start - init_start, 0,
+                texture_log::ticks() - decode_start, result);
             if (result == E_NOTIMPL) {
                 char message[512];
                 std::snprintf(message, sizeof(message), "sgl_LockTexture format: resource=%s layout=%u,%u,%u",
@@ -1309,6 +1412,7 @@ extern "C" void* __cdecl sgl_InitScreen(HWND window, int fullscreen, const char*
         display_config_file = config_path;
         // Pictures loaded before the first sgl_InitScreen keep the default, AIM_DECODE_DIRECT when exported.
         sgl::set_aim_direct(surface_renderer.aim_direct());
+        texture_log::mark(surface_renderer.aim_direct() ? "sgl_InitScreen aim_direct=1" : "sgl_InitScreen aim_direct=0");
         const auto size = surface_renderer.screen_size();
         auto offscreen = make_memory_texture(static_cast<std::uint16_t>(size.width), static_cast<std::uint16_t>(size.height), 0);
         auto display = make_memory_texture(static_cast<std::uint16_t>(size.width), static_cast<std::uint16_t>(size.height), 0);
@@ -1468,6 +1572,7 @@ extern "C" void __cdecl sgl_CleanUp() {
 
 extern "C" void __cdecl sgl_ShotDown() {
     std::lock_guard<TexturesMutex> lock(textures_mutex);
+    texture_log::mark("sgl_ShotDown");
     destroy_screen();
     water_effect::remove();
     sgl::remove_game_resolution();

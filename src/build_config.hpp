@@ -1,7 +1,7 @@
 #pragma once
 
 // The build variant, chosen by CMake: SGL_DIAGNOSTICS=ON adds the renderer counters to the FPS overlay and writes
-// sgl_readbacks.log.
+// sgl_readbacks.log and sgl_textures.log (picture load times).
 namespace sgl::build {
 
 #ifdef SGL_DIAGNOSTICS
