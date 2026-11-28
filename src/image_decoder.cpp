@@ -102,6 +102,44 @@ HRESULT ImageDecoder::process_direct(const char* name, const std::vector<std::ui
     }
 }
 
+HRESULT qol_picture(const char* name, void* container, bool pixels, DecodedImage& output) noexcept {
+    // The layout of AIM_DECODE_DIRECT's picture.
+    struct Picture {
+        std::uint32_t width, height, pitch, format;
+        std::uint8_t* palette;
+    };
+    using Make = int (__cdecl*)(const char*, void*, std::int32_t, Picture*, std::uint8_t* (__cdecl*)(void*, std::uint32_t),
+        void*);
+    if (!name || !*name) return S_FALSE;
+    const HMODULE qol = GetModuleHandleW(L"qol.dll");
+    if (!qol) return S_FALSE;
+    const auto make = reinterpret_cast<Make>(GetProcAddress(qol, "QOL_PICTURE"));
+    if (!make) return S_FALSE;
+    try {
+        DecodedImage decoded;
+        std::array<std::uint8_t, 1024> palette{};
+        Picture image{0, 0, 0, 0, palette.data()};
+        DirectAllocation allocation{&decoded.pixels, false};
+        const int result = make(name, container, pixels ? 1 : 0, &image, &allocate_direct, &allocation);
+        if (result < 0 || allocation.failed) return E_OUTOFMEMORY;
+        if (result == 0) return S_FALSE;
+        if (image.format != 1 || !image.width || !image.height || image.width > 65535 || image.height > 65535 ||
+            image.pitch != ((image.width + 3u) & ~3u) ||
+            (pixels && decoded.pixels.size() < static_cast<std::size_t>(image.pitch) * image.height)) return E_NOTIMPL;
+        decoded.width = image.width;
+        decoded.height = image.height;
+        decoded.pitch = image.pitch;
+        decoded.format = ImageFormat::Indexed8;
+        if (pixels) decoded.palette.assign(palette.begin(), palette.end());
+        output = std::move(decoded);
+        return S_OK;
+    } catch (const std::bad_alloc&) {
+        return E_OUTOFMEMORY;
+    } catch (const std::length_error&) {
+        return E_OUTOFMEMORY;
+    }
+}
+
 HRESULT ImageDecoder::decode(const char* name, std::vector<std::uint8_t>& encoded, DecodedImage& output) noexcept {
     return process(name, encoded, output, true);
 }

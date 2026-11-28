@@ -39,6 +39,10 @@ struct Texture {
     sgl::DecodedImage image;
     std::string name;
     std::vector<std::uint8_t> encoded;
+    // Made by qol.dll (sgl::qol_picture): no encoded file; the pixels are made at the first lock from the base
+    // pictures of `qol_container`.
+    bool qol = false;
+    void* qol_container = nullptr;
     std::vector<std::uint8_t> locked_palette;
     unsigned locks = 0;
     unsigned external_locks = 0;
@@ -494,8 +498,9 @@ void begin(long long first) noexcept {
     if (started) return;
     start = first;
     append("# time: ms since the first picture; site: load (sgl_LoadMemoryTexture) or lock (deferred decode in\n"
-        "# sgl_LockTexture); path: direct (AIM_DECODE_DIRECT), memfile (AIM_CONVERT_MEMFILE) or widemap (mods map);\n"
-        "# init: archiver.dll and AIM.dll setup; read: archive read; decode: AIM call with its input copy; sum: all decodes\n"
+        "# sgl_LockTexture); path: direct (AIM_DECODE_DIRECT), memfile (AIM_CONVERT_MEMFILE), widemap (mods map) or\n"
+        "# qol (made by qol.dll, no file); init: archiver.dll and AIM.dll setup; read: archive read (qol: its whole call\n"
+        "# at load); decode: AIM call with its input copy (qol: its whole call at lock); sum: all decodes\n"
         "#    time ms site path    op           KiB  width x height  init ms  read ms decode ms     sum ms  name\n");
     started = true;
 }
@@ -558,21 +563,25 @@ extern "C" void* __cdecl sgl_LoadMemoryTexture(const char* name, std::uint32_t f
         }
         auto texture = std::make_unique<Texture>();
         void* archive_handle = sgl::active_archive();
+        const bool load_pixels = (flags & 0x00010040u) != 0;
         const long long read_start = texture_log::ticks();
-        if (FAILED(archive.read(archive_handle, name, texture->encoded))) return nullptr;
+        // A widescreen picture of qol.dll comes without a file; with only its size asked, it is made at the first lock.
+        texture->qol = sgl::qol_picture(name, archive_handle, load_pixels, texture->image) == S_OK;
+        if (texture->qol) texture->qol_container = archive_handle;
+        else if (FAILED(archive.read(archive_handle, name, texture->encoded))) return nullptr;
         const long long decode_start = texture_log::ticks();
         texture->name = name;
-        const bool load_pixels = (flags & 0x00010040u) != 0;
-        const bool replaced_map = decode_wide_fast_forward_map(name, decoder,
+        const bool replaced_map = !texture->qol && decode_wide_fast_forward_map(name, decoder,
             sgl::current_game_resolution(), load_pixels, texture->image);
         HRESULT result = S_OK;
-        if (!replaced_map) {
+        if (!texture->qol && !replaced_map) {
             texture->image = {};
             auto decoder_input = texture->encoded;
             result = load_pixels ? decoder.decode(name, decoder_input, texture->image)
                 : decoder.inspect(name, decoder_input, texture->image);
         }
-        texture_log::record("load", replaced_map ? "widemap" : decoder.direct_path() ? "direct" : "memfile", load_pixels,
+        const char* path = texture->qol ? "qol" : replaced_map ? "widemap" : decoder.direct_path() ? "direct" : "memfile";
+        texture_log::record("load", path, load_pixels,
             name, texture->encoded.size(), texture->image, read_start - init_start, decode_start - read_start,
             texture_log::ticks() - decode_start, result);
         if (FAILED(result)) {
@@ -691,15 +700,25 @@ static int lock_texture(Texture& texture, LockOutput* output, int flags, bool ex
             if (FAILED(decoder.initialize(directory / L"AIM.dll"))) sgl::unimplemented("sgl_LockTexture dependencies");
             const long long decode_start = texture_log::ticks();
             sgl::DecodedImage decoded;
-            const bool replaced_map = decode_wide_fast_forward_map(texture.name.c_str(), decoder,
+            const bool made = texture.qol &&
+                sgl::qol_picture(texture.name.c_str(), texture.qol_container, true, decoded) == S_OK;
+            if (texture.qol && !made) {
+                // qol.dll did not make it now: the file it serves through the archiver (made on disk) instead.
+                sgl::ArchiveReader archive;
+                if (FAILED(archive.initialize(directory / L"archiver.dll")) ||
+                    FAILED(archive.read(texture.qol_container, texture.name.c_str(), texture.encoded))) return 0;
+                texture.qol = false;
+            }
+            const bool replaced_map = !made && decode_wide_fast_forward_map(texture.name.c_str(), decoder,
                 sgl::current_game_resolution(), true, decoded);
             HRESULT result = S_OK;
-            if (!replaced_map) {
+            if (!made && !replaced_map) {
                 decoded = {};
                 auto decoder_input = texture.encoded;
                 result = decoder.decode(texture.name.c_str(), decoder_input, decoded);
             }
-            texture_log::record("lock", replaced_map ? "widemap" : decoder.direct_path() ? "direct" : "memfile", true,
+            const char* path = made ? "qol" : replaced_map ? "widemap" : decoder.direct_path() ? "direct" : "memfile";
+            texture_log::record("lock", path, true,
                 texture.name.c_str(), texture.encoded.size(), decoded, decode_start - init_start, 0,
                 texture_log::ticks() - decode_start, result);
             if (result == E_NOTIMPL) {

@@ -34,6 +34,13 @@ struct DecodedImage {
     std::vector<std::uint8_t> palette;
 };
 
+// QOL_PICTURE of the patrician-mods qol.dll: a widescreen picture (top bar, carving, overview map) that qol.dll makes
+// at run time, as 8-bit palette rows padded to 4 bytes and 256 BGRA palette entries, without a file. `container` is
+// the archiver container the base pictures are read from. With `pixels` false only the size and format are filled.
+// S_FALSE when qol.dll is not loaded, lacks the export or does not make `name`: the caller reads the file through the
+// archiver then. `output` is changed only on S_OK.
+HRESULT qol_picture(const char* name, void* container, bool pixels, DecodedImage& output) noexcept;
+
 class ImageDecoder {
 public:
     ImageDecoder() = default;
