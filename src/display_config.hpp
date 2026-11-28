@@ -28,6 +28,9 @@ struct DisplayConfig {
     // [display] aim_direct: the default 1 decodes pictures through AIM_DECODE_DIRECT when AIM.dll exports it (the
     // patrician-mods replacement); 0 keeps the original AIM_CONVERT_MEMFILE path, to compare the two or to fall back.
     bool aim_direct = true;
+    // [display] texture_cache_mb: memory in MiB for decoded pictures kept after their textures are freed, so that the
+    // next load of the same picture takes no decode (the least recently used ones go first); 0 turns the cache off.
+    unsigned texture_cache_mb = 64;
 };
 
 // high_res.ini in the directory of the module containing this code: the renderer DLL, which normally sits next to the

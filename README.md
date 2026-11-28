@@ -53,6 +53,8 @@ For window and frame-rate settings, open `high_res.ini` in the game folder with 
 | Use faster hardware blending, at most one colour step off, for example on Apple Silicon | `exact_blend=0` |
 | Decode pictures in one call with the patrician-mods `AIM.dll` (default) | `aim_direct=1` |
 | Decode pictures through the original `AIM.dll` calls, also with the patrician-mods `AIM.dll` | `aim_direct=0` |
+| Keep up to 64 MiB of decoded pictures, so pictures shown again load without decoding (default) | `texture_cache_mb=64` |
+| Turn the picture cache off | `texture_cache_mb=0` |
 
 You can set a frame-rate limit between `10` and `1000`. If the `max_fps` line is missing, the game uses its original 50 FPS limit.
 

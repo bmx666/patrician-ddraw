@@ -155,6 +155,16 @@ bool sgl::display_config(HWND window, const std::filesystem::path& path, Display
                 if (value != "0" && value != "1") { error = "high_res.ini line " + std::to_string(line_number) + ": aim_direct must be 0 or 1"; return false; }
                 selected.aim_direct = value == "1";
                 continue;
+            } else if (equal_ascii(key, "texture_cache_mb")) {
+                unsigned megabytes = 0;
+                const auto parsed = std::from_chars(value.data(), value.data() + value.size(), megabytes);
+                if (value.empty() || parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+                    megabytes > 1024) {
+                    error = "high_res.ini line " + std::to_string(line_number) + ": texture_cache_mb must be 0 to 1024";
+                    return false;
+                }
+                selected.texture_cache_mb = megabytes;
+                continue;
             } else if (equal_ascii(key, "max_fps")) {
                 unsigned fps = 0;
                 const auto parsed = std::from_chars(value.data(), value.data() + value.size(), fps);

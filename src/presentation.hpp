@@ -37,6 +37,7 @@ public:
     bool show_fps() const noexcept { return show_fps_; }
     bool exact_blend() const noexcept { return exact_blend_; }
     bool aim_direct() const noexcept { return aim_direct_; }
+    unsigned texture_cache_mb() const noexcept { return texture_cache_mb_; }
     const FpsOverlay& fps_overlay() const noexcept { return fps_overlay_; }
 
 private:
@@ -68,6 +69,7 @@ private:
     bool show_fps_ = false;
     bool exact_blend_ = true;
     bool aim_direct_ = true;
+    unsigned texture_cache_mb_ = DisplayConfig{}.texture_cache_mb;
     bool any_render_size_ = false;
     FpsOverlay fps_overlay_;
 };

@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <fstream>
 #include <filesystem>
+#include <list>
 #include <memory>
 #include <atomic>
 #include <mutex>
@@ -38,7 +39,10 @@ struct Texture {
     std::array<std::uint8_t, 0x48> header{};
     sgl::DecodedImage image;
     std::string name;
+    // The file, read at the load; empty until the first lock when the load took the size from picture_cache.
     std::vector<std::uint8_t> encoded;
+    // The archive container the picture was loaded from (picture_cache key, read_encoded).
+    void* container = nullptr;
     // Made by qol.dll (sgl::qol_picture): no encoded file; the pixels are made at the first lock from the base
     // pictures of `qol_container`.
     bool qol = false;
@@ -498,8 +502,8 @@ void begin(long long first) noexcept {
     if (started) return;
     start = first;
     append("# time: ms since the first picture; site: load (sgl_LoadMemoryTexture) or lock (deferred decode in\n"
-        "# sgl_LockTexture); path: direct (AIM_DECODE_DIRECT), memfile (AIM_CONVERT_MEMFILE), widemap (mods map) or\n"
-        "# qol (made by qol.dll, no file); init: archiver.dll and AIM.dll setup; read: archive read (qol: its whole call\n"
+        "# sgl_LockTexture); path: direct (AIM_DECODE_DIRECT), memfile (AIM_CONVERT_MEMFILE), widemap (mods map),\n"
+        "# qol (made by qol.dll, no file) or cache (copied from the picture cache, no file read); init: archiver.dll and AIM.dll setup; read: archive read (qol: its whole call\n"
         "# at load); decode: AIM call with its input copy (qol: its whole call at lock); sum: all decodes\n"
         "#    time ms site path    op           KiB  width x height  init ms  read ms decode ms     sum ms  name\n");
     started = true;
@@ -543,6 +547,138 @@ void mark(const char* event) noexcept {
 }
 }
 
+// Decoded pictures by archive and name, kept after their textures are freed ([display] texture_cache_mb): the next
+// load or first lock of the same picture copies them instead of reading and decoding the file again. An archive does
+// not change while the game runs (a language change restarts it), so the archive handle and the name identify the
+// pixels. Pictures that depend on the screen (made by qol.dll, the wide fast-forward map) are not kept; the copies are
+// taken after the format normalization and before the colour key and the screen-size adaptation, which every use
+// applies again. The sizes of loads that ask only the size are kept too, without a limit worth counting (a few dozen
+// bytes each): such a load then reads no file, and the first lock reads it when the pixels are not kept by then.
+namespace picture_cache {
+struct Key {
+    void* container;
+    std::string name;
+    bool operator==(const Key& other) const noexcept { return container == other.container && name == other.name; }
+};
+struct KeyHash {
+    std::size_t operator()(const Key& key) const noexcept {
+        return std::hash<std::string>{}(key.name) ^ (std::hash<void*>{}(key.container) * 31u);
+    }
+};
+struct Size {
+    std::uint32_t width, height, pitch;
+    sgl::ImageFormat format;
+};
+std::mutex mutex;
+std::size_t limit = std::size_t{sgl::DisplayConfig{}.texture_cache_mb} << 20;
+std::size_t used = 0;
+// Most recently used first.
+std::list<std::pair<Key, sgl::DecodedImage>> recent;
+std::unordered_map<Key, std::list<std::pair<Key, sgl::DecodedImage>>::iterator, KeyHash> pictures;
+std::unordered_map<Key, Size, KeyHash> sizes;
+// The sizes are dropped all at once past this count (thousands of distinct pictures in a long game).
+constexpr std::size_t max_sizes = 16384;
+
+std::size_t bytes(const sgl::DecodedImage& image) noexcept { return image.pixels.size() + image.palette.size(); }
+
+// Called with mutex held.
+void trim() noexcept {
+    while (used > limit && !recent.empty()) {
+        used -= bytes(recent.back().second);
+        pictures.erase(recent.back().first);
+        recent.pop_back();
+    }
+}
+
+void set_limit(unsigned megabytes) noexcept {
+    std::lock_guard<std::mutex> lock(mutex);
+    limit = std::size_t{megabytes} << 20;
+    trim();
+}
+
+// Whether the pixels of `name` may be kept: not made by qol.dll (checked by the caller) and not the screen-sized map.
+bool cacheable(const char* name) noexcept { return !is_fast_forward_map(name); }
+
+// A copy of the kept picture `name` of `container` into `image`; false when it is not kept.
+bool find(void* container, const std::string& name, sgl::DecodedImage& image) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto found = pictures.find(Key{container, name});
+        if (found == pictures.end()) return false;
+        recent.splice(recent.begin(), recent, found->second);
+        image = found->second->second;
+        return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
+}
+
+// Size and format of `name` of `container` into `image` (no pixels), from a kept picture or size; false when unknown.
+bool find_size(void* container, const std::string& name, sgl::DecodedImage& image) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex);
+        const Key key{container, name};
+        Size size{};
+        if (const auto picture = pictures.find(key); picture != pictures.end()) {
+            const auto& kept = picture->second->second;
+            size = {kept.width, kept.height, kept.pitch, kept.format};
+        } else if (const auto known = sizes.find(key); known != sizes.end()) {
+            size = known->second;
+        } else {
+            return false;
+        }
+        image = {};
+        image.width = size.width;
+        image.height = size.height;
+        image.pitch = size.pitch;
+        image.format = size.format;
+        return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
+}
+
+// Keeps a copy of the decoded `image` of `name` of `container` (only its size when it has no pixels). A picture larger
+// than a quarter of the limit is not kept, so that one map does not push out everything else.
+void put(void* container, const std::string& name, const sgl::DecodedImage& image) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex);
+        Key key{container, name};
+        if (sizes.size() >= max_sizes) sizes.clear();
+        sizes[key] = Size{image.width, image.height, image.pitch, image.format};
+        const auto size = bytes(image);
+        if (image.pixels.empty() || size > limit / 4 || pictures.count(key)) return;
+        recent.emplace_front(key, image);
+        pictures.emplace(std::move(key), recent.begin());
+        used += size;
+        trim();
+    } catch (const std::bad_alloc&) {
+    } catch (const std::length_error&) {
+    }
+}
+}
+
+// The file of `texture` into its `encoded` when the load did not read it (the size came from picture_cache); true
+// when it is there.
+bool read_encoded(Texture& texture) noexcept {
+    if (!texture.encoded.empty()) return true;
+    try {
+        const auto directory = game_directory();
+        if (directory.empty()) return false;
+        sgl::ArchiveReader archive;
+        return SUCCEEDED(archive.initialize(directory / L"archiver.dll")) &&
+            SUCCEEDED(archive.read(texture.container, texture.name.c_str(), texture.encoded));
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::filesystem::filesystem_error&) {
+        return false;
+    }
+}
+
 }
 
 namespace water_effect {
@@ -567,20 +703,26 @@ extern "C" void* __cdecl sgl_LoadMemoryTexture(const char* name, std::uint32_t f
         const long long read_start = texture_log::ticks();
         // A widescreen picture of qol.dll comes without a file; with only its size asked, it is made at the first lock.
         texture->qol = sgl::qol_picture(name, archive_handle, load_pixels, texture->image) == S_OK;
-        if (texture->qol) texture->qol_container = archive_handle;
-        else if (FAILED(archive.read(archive_handle, name, texture->encoded))) return nullptr;
-        const long long decode_start = texture_log::ticks();
         texture->name = name;
-        const bool replaced_map = !texture->qol && decode_wide_fast_forward_map(name, decoder,
+        texture->container = archive_handle;
+        // A kept picture (or size) needs no file now; a size-only load reads it at the first lock if needed then.
+        const bool cacheable = !texture->qol && picture_cache::cacheable(name);
+        const bool cached = cacheable && (load_pixels ? picture_cache::find(archive_handle, texture->name, texture->image)
+            : picture_cache::find_size(archive_handle, texture->name, texture->image));
+        if (texture->qol) texture->qol_container = archive_handle;
+        else if (!cached && FAILED(archive.read(archive_handle, name, texture->encoded))) return nullptr;
+        const long long decode_start = texture_log::ticks();
+        const bool replaced_map = !texture->qol && !cached && decode_wide_fast_forward_map(name, decoder,
             sgl::current_game_resolution(), load_pixels, texture->image);
         HRESULT result = S_OK;
-        if (!texture->qol && !replaced_map) {
+        if (!texture->qol && !replaced_map && !cached) {
             texture->image = {};
             auto decoder_input = texture->encoded;
             result = load_pixels ? decoder.decode(name, decoder_input, texture->image)
                 : decoder.inspect(name, decoder_input, texture->image);
         }
-        const char* path = texture->qol ? "qol" : replaced_map ? "widemap" : decoder.direct_path() ? "direct" : "memfile";
+        const char* path = texture->qol ? "qol" : cached ? "cache" : replaced_map ? "widemap" :
+            decoder.direct_path() ? "direct" : "memfile";
         texture_log::record("load", path, load_pixels,
             name, texture->encoded.size(), texture->image, read_start - init_start, decode_start - read_start,
             texture_log::ticks() - decode_start, result);
@@ -596,6 +738,7 @@ extern "C" void* __cdecl sgl_LoadMemoryTexture(const char* name, std::uint32_t f
             return nullptr;
         }
         if (FAILED(normalize_loaded_image(texture->image))) sgl::unimplemented("sgl_LoadMemoryTexture pixel format conversion");
+        if (cacheable && !cached && !replaced_map) picture_cache::put(archive_handle, texture->name, texture->image);
         if (is_fast_forward_map(name)) {
             if (load_pixels) reserve_fast_forward_map_capacity(texture->image);
             sgl::set_fast_forward_map_source_size({texture->image.width, texture->image.height});
@@ -697,9 +840,11 @@ static int lock_texture(Texture& texture, LockOutput* output, int flags, bool ex
             if (directory.empty()) sgl::unimplemented("sgl_LockTexture archiver");
             const long long init_start = texture_log::ticks();
             sgl::ImageDecoder decoder;
-            if (FAILED(decoder.initialize(directory / L"AIM.dll"))) sgl::unimplemented("sgl_LockTexture dependencies");
-            const long long decode_start = texture_log::ticks();
+            const bool cacheable = !texture.qol && picture_cache::cacheable(texture.name.c_str());
             sgl::DecodedImage decoded;
+            const bool cached = cacheable && picture_cache::find(texture.container, texture.name, decoded);
+            if (!cached && FAILED(decoder.initialize(directory / L"AIM.dll"))) sgl::unimplemented("sgl_LockTexture dependencies");
+            const long long decode_start = texture_log::ticks();
             const bool made = texture.qol &&
                 sgl::qol_picture(texture.name.c_str(), texture.qol_container, true, decoded) == S_OK;
             if (texture.qol && !made) {
@@ -709,15 +854,18 @@ static int lock_texture(Texture& texture, LockOutput* output, int flags, bool ex
                     FAILED(archive.read(texture.qol_container, texture.name.c_str(), texture.encoded))) return 0;
                 texture.qol = false;
             }
-            const bool replaced_map = !made && decode_wide_fast_forward_map(texture.name.c_str(), decoder,
+            // The load took the size from picture_cache and the pixels are no longer kept: the file now.
+            if (!cached && !made && !read_encoded(texture)) return 0;
+            const bool replaced_map = !cached && !made && decode_wide_fast_forward_map(texture.name.c_str(), decoder,
                 sgl::current_game_resolution(), true, decoded);
             HRESULT result = S_OK;
-            if (!made && !replaced_map) {
+            if (!cached && !made && !replaced_map) {
                 decoded = {};
                 auto decoder_input = texture.encoded;
                 result = decoder.decode(texture.name.c_str(), decoder_input, decoded);
             }
-            const char* path = made ? "qol" : replaced_map ? "widemap" : decoder.direct_path() ? "direct" : "memfile";
+            const char* path = cached ? "cache" : made ? "qol" : replaced_map ? "widemap" :
+                decoder.direct_path() ? "direct" : "memfile";
             texture_log::record("lock", path, true,
                 texture.name.c_str(), texture.encoded.size(), decoded, decode_start - init_start, 0,
                 texture_log::ticks() - decode_start, result);
@@ -729,6 +877,7 @@ static int lock_texture(Texture& texture, LockOutput* output, int flags, bool ex
             }
             if (FAILED(result)) return 0;
             if (FAILED(normalize_loaded_image(decoded))) sgl::unimplemented("sgl_LockTexture pixel format conversion");
+            if (cacheable && !cached && !replaced_map) picture_cache::put(texture.container, texture.name, decoded);
             if (is_fast_forward_map(texture.name.c_str())) {
                 reserve_fast_forward_map_capacity(decoded);
                 sgl::set_fast_forward_map_source_size({decoded.width, decoded.height});
@@ -854,6 +1003,7 @@ bool stage_resolution_textures(sgl::DisplaySize size,
             HRESULT decoded = S_OK;
             if (!replaced_map) {
                 image = {};
+                if (!texture.qol && !read_encoded(texture)) return false;
                 auto encoded = texture.encoded;
                 decoded = pixels ? decoder.decode(texture.name.c_str(), encoded, image)
                     : decoder.inspect(texture.name.c_str(), encoded, image);
@@ -1431,6 +1581,7 @@ extern "C" void* __cdecl sgl_InitScreen(HWND window, int fullscreen, const char*
         display_config_file = config_path;
         // Pictures loaded before the first sgl_InitScreen keep the default, AIM_DECODE_DIRECT when exported.
         sgl::set_aim_direct(surface_renderer.aim_direct());
+        picture_cache::set_limit(surface_renderer.texture_cache_mb());
         texture_log::mark(surface_renderer.aim_direct() ? "sgl_InitScreen aim_direct=1" : "sgl_InitScreen aim_direct=0");
         const auto size = surface_renderer.screen_size();
         auto offscreen = make_memory_texture(static_cast<std::uint16_t>(size.width), static_cast<std::uint16_t>(size.height), 0);

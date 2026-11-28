@@ -48,6 +48,18 @@ int main() {
     if (!config.exact_blend) return 28;
     if (!write("[display]\nwidth=1920\nheight=1080\nexact_blend=0\n") ||
         !sgl::display_config(GetDesktopWindow(), path, config, error) || config.exact_blend) return 29;
+    if (config.texture_cache_mb != 64) return 30;
+    for (const auto& [text, expected] : std::array<std::pair<const char*, unsigned>, 3>{{
+        {"[display]\nwidth=1920\nheight=1080\ntexture_cache_mb=0\n", 0u},
+        {"[display]\nwidth=1920\nheight=1080\ntexture_cache_mb=128\n", 128u},
+        {"[display]\nwidth=1920\nheight=1080\ntexture_cache_mb=1024\n", 1024u}}}) {
+        if (!write(text) || !sgl::display_config(GetDesktopWindow(), path, config, error) ||
+            config.texture_cache_mb != expected) return 31;
+    }
+    for (const char* invalid : {"[display]\nwidth=1920\nheight=1080\ntexture_cache_mb=1025\n",
+        "[display]\nwidth=1920\nheight=1080\ntexture_cache_mb=\n", "[display]\nwidth=1920\nheight=1080\ntexture_cache_mb=-1\n"}) {
+        if (!write(invalid) || sgl::display_config(GetDesktopWindow(), path, config, error) || error.empty()) return 32;
+    }
     // Unknown keys are skipped; a repeated key takes its last value.
     if (!write("[display]\nwidth=1280\nwidth=1920\nheight=1080\nextra=1\nmode=windowed\nmode=borderless\n"
             "show_fps=1\nshow_fps=0\nmax_fps=60\nmax_fps=144\n") ||

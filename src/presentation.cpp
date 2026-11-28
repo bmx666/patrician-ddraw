@@ -187,6 +187,7 @@ HRESULT Presentation::initialize_configured(ID3D11Device* device, HWND window, c
         set_show_fps(config.show_fps);
         exact_blend_ = config.exact_blend;
         aim_direct_ = config.aim_direct;
+        texture_cache_mb_ = config.texture_cache_mb;
         any_render_size_ = game_size.has_value();
     }
     if (FAILED(hr)) {
@@ -308,6 +309,7 @@ void Presentation::close() noexcept {
     show_fps_ = false;
     exact_blend_ = true;
     aim_direct_ = true;
+    texture_cache_mb_ = DisplayConfig{}.texture_cache_mb;
     any_render_size_ = false;
     fps_overlay_.reset();
 }
